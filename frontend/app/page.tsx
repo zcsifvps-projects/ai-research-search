@@ -164,11 +164,15 @@ export default function Home() {
   const [activePolicyModal, setActivePolicyModal] = useState<
     "privacy" | "terms" | "cookie_policy" | "cookie_prefs" | null
   >(null);
+  // Strictly necessary storage is always on. "preferences" covers the optional, non-essential storage
+  // (currently only the remembered light/dark theme). There are no analytics or advertising cookies.
   const [cookiePrefs, setCookiePrefs] = useState({
     essential: true,
-    analytics: true,
-    personalization: false,
+    preferences: false,
   });
+  // True once the visitor has made a choice; the banner shows until then.
+  // Starts true so the banner never flashes on the server render or for returning visitors.
+  const [cookieDecided, setCookieDecided] = useState(true);
 
   // Authentication
   const [user, setUser] = useState<User | null>(null);
@@ -220,6 +224,20 @@ export default function Home() {
   // ============================================================
 
   useEffect(() => {
+    // 0. Cookie consent: show the banner until a choice has been stored
+    try {
+      const rawConsent = localStorage.getItem("scholarpulse-cookie-consent");
+      if (rawConsent) {
+        const stored = JSON.parse(rawConsent);
+        setCookiePrefs({ essential: true, preferences: Boolean(stored?.preferences) });
+        setCookieDecided(true);
+      } else {
+        setCookieDecided(false);
+      }
+    } catch {
+      setCookieDecided(false);
+    }
+
     // 1. Load Theme
     const savedTheme = localStorage.getItem("researchai-theme") as "light" | "dark" | null;
     if (savedTheme) {
@@ -297,10 +315,31 @@ export default function Home() {
     setSidebarOpen(nextState);
   }
 
+  function saveCookieConsent(preferences: boolean) {
+    setCookiePrefs({ essential: true, preferences });
+    setCookieDecided(true);
+    setActivePolicyModal(null);
+    try {
+      localStorage.setItem(
+        "scholarpulse-cookie-consent",
+        JSON.stringify({ essential: true, preferences, decidedAt: new Date().toISOString() }),
+      );
+      if (preferences) {
+        localStorage.setItem("researchai-theme", theme);
+      } else {
+        localStorage.removeItem("researchai-theme");
+      }
+    } catch {
+      // storage unavailable (private mode): the choice simply applies to this visit
+    }
+  }
+
   function toggleTheme() {
     const nextTheme = theme === "light" ? "dark" : "light";
     setTheme(nextTheme);
-    localStorage.setItem("researchai-theme", nextTheme);
+    if (cookiePrefs.preferences) {
+      localStorage.setItem("researchai-theme", nextTheme); // optional storage: only with consent
+    }
     document.documentElement.setAttribute("data-theme", nextTheme);
     if (nextTheme === "dark") {
       document.documentElement.classList.add("dark");
@@ -1565,8 +1604,12 @@ export default function Home() {
               </div>
 
               {/* Logged-Out Landing Footer (Disappears When User Is Signed In) */}
-              {!user && (
-                <footer className="mt-16 pt-10 border-t border-[var(--border-color)] max-w-4xl mx-auto w-full">
+              <footer
+                className={`mt-16 max-w-4xl mx-auto w-full ${
+                  !user ? "pt-10 border-t border-[var(--border-color)]" : ""
+                }`}
+              >
+                {!user && (
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-8 mb-8 text-xs text-[var(--text-secondary)]">
                     {/* Compliance Column */}
                     <div>
@@ -1630,13 +1673,24 @@ export default function Home() {
                       </p>
                     </div>
                   </div>
+                )}
 
-                  <div className="pt-6 border-t border-[var(--border-subtle)] flex flex-col sm:flex-row items-center justify-between text-[11px] text-[var(--text-muted)] gap-2">
-                    <div>© 2026 ScholarPulse Inc. All rights reserved.</div>
-                    <div>Federated academic discovery across five academic databases.</div>
+                <div className="pt-6 pb-6 border-t border-[var(--border-subtle)] flex flex-col sm:flex-row items-center justify-between text-[11px] text-[var(--text-muted)] gap-2">
+                  <div>© 2026 ScholarPulse Inc. All rights reserved.</div>
+                  <div>Federated academic discovery across five academic databases.</div>
+                  <div>
+                    Developed by{" "}
+                    <a
+                      href="https://zcsi-foundation.org"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="font-medium text-[var(--text-secondary)] underline-offset-2 hover:text-[var(--accent)] hover:underline transition"
+                    >
+                      Zambia Cybersecurity Initiative Foundation
+                    </a>
                   </div>
-                </footer>
-              )}
+                </div>
+              </footer>
             </div>
           ) : (
             /* ======================================================== */
@@ -2406,7 +2460,16 @@ export default function Home() {
                 <>
                   <p className="font-semibold text-[var(--text-primary)]">Last updated: September 2026</p>
                   <p>
-                    We use secure httpOnly and SameSite cookies exclusively to manage authenticated sessions and prevent cross-site request forgery.
+                    <span className="font-semibold text-[var(--text-primary)]">Strictly necessary (always on).</span>{" "}
+                    A secure, httpOnly, SameSite session cookie that keeps you signed in, plus a random anonymous session ID and a
+                    guest search counter stored in your browser so guest history and usage limits work.
+                  </p>
+                  <p>
+                    <span className="font-semibold text-[var(--text-primary)]">Preferences (optional).</span>{" "}
+                    Remembers your light/dark theme and your cookie choice. If you decline, the theme resets on your next visit.
+                  </p>
+                  <p>
+                    We do not use advertising, tracking or analytics cookies. You can change your choice at any time from Cookie Preferences in the footer.
                   </p>
                 </>
               )}
@@ -2423,42 +2486,76 @@ export default function Home() {
 
                   <div className="flex items-center justify-between p-3 rounded-xl bg-[var(--bg-primary)] border border-[var(--border-color)]">
                     <div>
-                      <div className="font-semibold text-[var(--text-primary)]">Performance & Analytics</div>
-                      <div className="text-[11px] text-[var(--text-muted)]">Helps optimize latency and search re-ranking.</div>
+                      <div className="font-semibold text-[var(--text-primary)]">Preferences</div>
+                      <div className="text-[11px] text-[var(--text-muted)]">Remembers your light/dark theme between visits.</div>
                     </div>
                     <input
                       type="checkbox"
-                      checked={cookiePrefs.analytics}
+                      checked={cookiePrefs.preferences}
                       onChange={(e) =>
-                        setCookiePrefs((prev) => ({ ...prev, analytics: e.target.checked }))
+                        setCookiePrefs((prev) => ({ ...prev, preferences: e.target.checked }))
                       }
+                      aria-label="Allow preference storage"
                       className="w-4 h-4 accent-[var(--accent)] rounded"
                     />
                   </div>
 
-                  <div className="flex items-center justify-between p-3 rounded-xl bg-[var(--bg-primary)] border border-[var(--border-color)]">
-                    <div>
-                      <div className="font-semibold text-[var(--text-primary)]">Personalization Preferences</div>
-                      <div className="text-[11px] text-[var(--text-muted)]">Remembers your filter preferences.</div>
-                    </div>
-                    <input
-                      type="checkbox"
-                      checked={cookiePrefs.personalization}
-                      onChange={(e) =>
-                        setCookiePrefs((prev) => ({ ...prev, personalization: e.target.checked }))
-                      }
-                      className="w-4 h-4 accent-[var(--accent)] rounded"
-                    />
-                  </div>
+                  <p className="text-[11px] text-[var(--text-muted)]">
+                    ScholarPulse does not use analytics or advertising cookies.
+                  </p>
 
                   <button
-                    onClick={() => setActivePolicyModal(null)}
+                    onClick={() => saveCookieConsent(cookiePrefs.preferences)}
                     className="w-full py-2 bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white font-medium rounded-lg transition"
                   >
                     Save Preferences
                   </button>
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ======================================================== */}
+      {/* 4b. COOKIE CONSENT BANNER (until a choice is stored) */}
+      {/* ======================================================== */}
+      {!cookieDecided && activePolicyModal !== "cookie_prefs" && (
+        <div
+          role="dialog"
+          aria-label="Cookie consent"
+          className="fixed bottom-4 left-4 right-4 sm:left-auto sm:right-6 sm:bottom-6 sm:max-w-md z-[60] rounded-2xl border border-[var(--border-color)] bg-[var(--bg-surface)] shadow-2xl p-4 text-xs text-[var(--text-secondary)]"
+        >
+          <div className="flex items-start gap-3">
+            <Cookie className="w-5 h-5 text-[var(--accent)] shrink-0 mt-0.5" />
+            <div className="space-y-3">
+              <div>
+                <div className="font-semibold text-[var(--text-primary)] text-sm">We use cookies</div>
+                <p className="mt-1 leading-relaxed">
+                  Essential cookies keep you signed in and the site secure. Optional preference storage remembers your
+                  theme. We do not use advertising or tracking cookies.
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  onClick={() => saveCookieConsent(true)}
+                  className="px-3 py-1.5 rounded-lg bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white font-medium transition"
+                >
+                  Allow all
+                </button>
+                <button
+                  onClick={() => saveCookieConsent(false)}
+                  className="px-3 py-1.5 rounded-lg border border-[var(--border-color)] bg-[var(--bg-surface)] hover:bg-[var(--bg-surface-elevated)] text-[var(--text-primary)] font-medium transition"
+                >
+                  Necessary only
+                </button>
+                <button
+                  onClick={() => setActivePolicyModal("cookie_prefs")}
+                  className="px-2 py-1.5 underline underline-offset-2 hover:text-[var(--accent)] transition"
+                >
+                  Customize
+                </button>
+              </div>
             </div>
           </div>
         </div>
