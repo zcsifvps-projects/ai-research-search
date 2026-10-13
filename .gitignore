@@ -1,0 +1,25 @@
+# Environment files (real secrets never get committed; the examples do)
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+frontend/.env.local
+frontend/.env.*.local
+
+# Python
+backend/venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Node / Next.js
+frontend/node_modules/
+frontend/.next/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
