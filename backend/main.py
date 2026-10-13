@@ -1271,29 +1271,17 @@ def normalize_result(
     year=None,
     source="Unknown source",
     doi=None,
+    is_open_access=None,
 ):
-
+    """Common paper shape. is_open_access is True/False when the source states it, None when unknown."""
     return {
-
-        "title": (
-            (title or "Untitled").strip()
-        ),
-
+        "title": (title or "Untitled").strip(),
         "authors": authors or [],
-
-        "abstract": (
-            abstract.strip()
-            if abstract
-            else None
-        ),
-
+        "abstract": abstract.strip() if abstract else None,
         "publication_year": year,
-
-        "description": (
-            source or "Unknown source"
-        ),
-
+        "description": source or "Unknown source",
         "doi": doi,
+        "is_open_access": is_open_access,
     }
 
 
@@ -1389,16 +1377,23 @@ def get_abstract(work):
 # OPENALEX
 # ============================================================
 
-async def search_openalex(
-    client,
-    q,
-):
+async def search_openalex(client, q, year_min=None, year_max=None, oa_only=False):
     url = "https://api.openalex.org/works"
     params = {
         "search": q.rstrip("?"),
         "per-page": 15,
         "mailto": "scholarpulse@research.org",
     }
+    # Filters are applied by OpenAlex itself, so the result slots are not wasted on papers we then discard.
+    filters = []
+    if year_min is not None:
+        filters.append(f"publication_year:>{year_min - 1}")
+    if year_max is not None:
+        filters.append(f"publication_year:<{year_max + 1}")
+    if oa_only:
+        filters.append("is_oa:true")
+    if filters:
+        params["filter"] = ",".join(filters)
     headers = {
         "User-Agent": "ScholarPulse/1.0 (mailto:scholarpulse@research.org)"
     }
@@ -1420,10 +1415,8 @@ async def search_openalex(
                 for a in work.get("authorships", [])
                 if a.get("author", {}).get("display_name")
             ]
+            # No abstract means None. Never invent one: the AI must only be given real evidence.
             abstract = get_abstract(work)
-            if not abstract:
-                # If abstract is missing in inverted index, construct brief snippet from title
-                abstract = f"Scholarly research paper titled '{work.get('title', 'Untitled')}' published in {work.get('publication_year', 'recent literature')}."
 
             results.append(
                 normalize_result(
@@ -1433,6 +1426,7 @@ async def search_openalex(
                     year=work.get("publication_year"),
                     source=source.get("display_name") or "OpenAlex",
                     doi=work.get("doi"),
+                    is_open_access=bool((work.get("open_access") or {}).get("is_oa")),
                 )
             )
 
@@ -1441,151 +1435,76 @@ async def search_openalex(
         print("OpenAlex search note:", error)
         return []
 
+
 # ============================================================
 # SEMANTIC SCHOLAR
 # ============================================================
 
-async def search_semantic_scholar(
-    client,
-    q,
-):
-
-    url = (
-        "https://api.semanticscholar.org/"
-        "graph/v1/paper/search"
-    )
-
+async def search_semantic_scholar(client, q, year_min=None, year_max=None, oa_only=False):
+    url = "https://api.semanticscholar.org/graph/v1/paper/search"
     params = {
-
         "query": q.rstrip("?"),
-
         "limit": 10,
-
-        "fields": (
-            "title,authors,abstract,"
-            "year,externalIds,venue"
-        ),
+        "fields": "title,authors,abstract,year,externalIds,venue,isOpenAccess,openAccessPdf",
     }
+    if year_min is not None or year_max is not None:
+        # Semantic Scholar range syntax: "2023-", "-2020", "2020-2023"
+        params["year"] = f"{year_min if year_min is not None else ''}-{year_max if year_max is not None else ''}"
+    if oa_only:
+        params["openAccessPdf"] = ""  # flag parameter: only papers with a public PDF
 
     headers = {}
-
     if SEMANTIC_SCHOLAR_API_KEY:
-
-        headers["x-api-key"] = (
-            SEMANTIC_SCHOLAR_API_KEY
-        )
+        headers["x-api-key"] = SEMANTIC_SCHOLAR_API_KEY
 
     try:
-
-        response = await client.get(
-            url,
-            params=params,
-            headers=headers,
-        )
-
+        response = await client.get(url, params=params, headers=headers)
         if response.status_code == 429:
-
-            print(
-                "Semantic Scholar rate limit "
-                "reached (429). Skipping."
-            )
-
+            print("Semantic Scholar rate limit reached (429). Skipping.")
             return []
-
         response.raise_for_status()
-
         data = response.json()
-
         results = []
 
-        for paper in data.get(
-            "data",
-            [],
-        ):
-
-            external_ids = (
-                paper.get(
-                    "externalIds"
-                )
-                or {}
-            )
-
-            authors = []
-
-            for author in (
-                paper.get("authors")
-                or []
-            ):
-
-                name = author.get(
-                    "name"
-                )
-
-                if name:
-
-                    authors.append(
-                        name
-                    )
-
-            abstract = paper.get(
-                "abstract"
-            )
-
+        for paper in data.get("data", []):
+            external_ids = paper.get("externalIds") or {}
+            authors = [a.get("name") for a in (paper.get("authors") or []) if a.get("name")]
+            abstract = paper.get("abstract")
             if not abstract:
-
                 continue
 
             results.append(
                 normalize_result(
-
-                    title=paper.get(
-                        "title"
-                    ),
-
+                    title=paper.get("title"),
                     authors=authors,
-
                     abstract=abstract,
-
-                    year=paper.get(
-                        "year"
-                    ),
-
-                    source=(
-                        paper.get(
-                            "venue"
-                        )
-                        or "Semantic Scholar"
-                    ),
-
-                    doi=external_ids.get(
-                        "DOI"
-                    ),
+                    year=paper.get("year"),
+                    source=paper.get("venue") or "Semantic Scholar",
+                    doi=external_ids.get("DOI"),
+                    is_open_access=bool(paper.get("isOpenAccess") or paper.get("openAccessPdf")),
                 )
             )
 
         return results
 
     except Exception as error:
-
-        print(
-            "Semantic Scholar "
-            f"search failed: {error}"
-        )
-
+        print(f"Semantic Scholar search failed: {error}")
         return []
 
 
 # ============================================================
-# ARXIV
+# ARXIV (every arXiv paper is open access)
 # ============================================================
 
-async def search_arxiv(
-    client,
-    q,
-):
+async def search_arxiv(client, q, year_min=None, year_max=None, oa_only=False):
     url = "https://export.arxiv.org/api/query"
+    search_query = f"all:{q.rstrip('?')}"
+    if year_min is not None or year_max is not None:
+        start = f"{year_min if year_min is not None else 1991}01010000"
+        end = f"{year_max if year_max is not None else 2100}12312359"
+        search_query += f" AND submittedDate:[{start} TO {end}]"
     params = {
-        "search_query": f"all:{q.rstrip('?')}",
+        "search_query": search_query,
         "start": 0,
         "max_results": 10,
     }
@@ -1593,22 +1512,18 @@ async def search_arxiv(
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/atom+xml,application/xml,text/xml",
     }
-
     try:
         response = await client.get(url, params=params, headers=headers, timeout=8.0)
         if response.status_code != 200:
             return []
-
         root = ET.fromstring(response.text)
         namespace = {"atom": "http://www.w3.org/2005/Atom"}
         results = []
-
         for entry in root.findall("atom:entry", namespace):
             title = (entry.findtext("atom:title", default="Untitled", namespaces=namespace) or "Untitled").strip()
             abstract = (entry.findtext("atom:summary", default="", namespaces=namespace) or "").strip()
             if not abstract:
                 continue
-
             published = entry.findtext("atom:published", default="", namespaces=namespace) or ""
             year = int(published[:4]) if len(published) >= 4 and published[:4].isdigit() else None
             authors = [
@@ -1622,7 +1537,6 @@ async def search_arxiv(
                 if "doi.org" in href.lower():
                     doi = href
                     break
-
             results.append(
                 normalize_result(
                     title=title,
@@ -1631,342 +1545,125 @@ async def search_arxiv(
                     year=year,
                     source="arXiv",
                     doi=doi,
+                    is_open_access=True,
                 )
             )
-
         return results
     except Exception as error:
         print("arXiv search note:", error)
         return []
 
+
 # ============================================================
-# CROSSREF
+# CROSSREF (does not say whether a paper is open access: is_open_access stays None)
 # ============================================================
 
-async def search_crossref(
-    client,
-    q,
-):
-
-    url = (
-        "https://api.crossref.org/works"
-    )
-
+async def search_crossref(client, q, year_min=None, year_max=None, oa_only=False):
+    url = "https://api.crossref.org/works"
     params = {
-
         "query": q.rstrip("?"),
-
         "rows": 10,
-
-        "select": (
-            "title,author,abstract,"
-            "published-print,published-online,"
-            "DOI,container-title"
-        ),
+        "select": "title,author,abstract,published-print,published-online,DOI,container-title",
     }
-
+    date_filters = []
+    if year_min is not None:
+        date_filters.append(f"from-pub-date:{year_min}-01-01")
+    if year_max is not None:
+        date_filters.append(f"until-pub-date:{year_max}-12-31")
+    if date_filters:
+        params["filter"] = ",".join(date_filters)
     try:
-
-        response = await client.get(
-            url,
-            params=params,
-        )
-
+        response = await client.get(url, params=params)
         if response.status_code == 429:
-
-            print(
-                "Crossref rate limit reached "
-                "(429). Skipping."
-            )
-
+            print("Crossref rate limit reached (429). Skipping.")
             return []
-
         response.raise_for_status()
-
         data = response.json()
-
-        items = (
-            data.get(
-                "message",
-                {}
-            )
-            .get(
-                "items",
-                []
-            )
-        )
-
+        items = data.get("message", {}).get("items", [])
         results = []
-
         for work in items:
-
-            titles = (
-                work.get(
-                    "title"
-                )
-                or []
-            )
-
-            title = (
-                titles[0]
-                if titles
-                else "Untitled"
-            )
-
+            titles = work.get("title") or []
+            title = titles[0] if titles else "Untitled"
             authors = []
-
-            for author in (
-                work.get("author")
-                or []
-            ):
-
-                given = (
-                    author.get(
-                        "given",
-                        "",
-                    )
-                    or ""
-                )
-
-                family = (
-                    author.get(
-                        "family",
-                        "",
-                    )
-                    or ""
-                )
-
-                name = (
-                    f"{given} {family}"
-                ).strip()
-
+            for author in (work.get("author") or []):
+                name = f"{author.get('given', '') or ''} {author.get('family', '') or ''}".strip()
                 if name:
-
-                    authors.append(
-                        name
-                    )
-
-            abstract = work.get(
-                "abstract"
-            )
-
+                    authors.append(name)
+            abstract = work.get("abstract")
             if not abstract:
-
                 continue
-
-            abstract = re.sub(
-                r"<[^>]+>",
-                "",
-                abstract,
-            ).strip()
-
+            abstract = re.sub(r"<[^>]+>", "", abstract).strip()
             if not abstract:
-
                 continue
-
             year = None
-
-            for date_field in (
-                "published-print",
-                "published-online",
-            ):
-
-                date_data = (
-                    work.get(
-                        date_field
-                    )
-                    or {}
-                )
-
-                date_parts = (
-                    date_data.get(
-                        "date-parts"
-                    )
-                    or []
-                )
-
-                if date_parts:
-
-                    first_part = (
-                        date_parts[0]
-                    )
-
-                    if first_part:
-
-                        year = (
-                            first_part[0]
-                        )
-
-                        break
-
-            container_titles = (
-                work.get(
-                    "container-title"
-                )
-                or []
-            )
-
-            source = (
-                container_titles[0]
-                if container_titles
-                else "Crossref"
-            )
-
+            for date_field in ("published-print", "published-online"):
+                date_parts = (work.get(date_field) or {}).get("date-parts") or []
+                if date_parts and date_parts[0]:
+                    year = date_parts[0][0]
+                    break
+            container_titles = work.get("container-title") or []
+            source = container_titles[0] if container_titles else "Crossref"
             results.append(
                 normalize_result(
-
                     title=title,
-
                     authors=authors,
-
                     abstract=abstract,
-
                     year=year,
-
                     source=source,
-
-                    doi=work.get(
-                        "DOI"
-                    ),
+                    doi=work.get("DOI"),
+                    is_open_access=None,
                 )
             )
-
         return results
-
     except Exception as error:
-
-        print(
-            f"Crossref search failed: "
-            f"{error}"
-        )
-
+        print(f"Crossref search failed: {error}")
         return []
 
 
 # ============================================================
-# CORE
+# CORE (an aggregator of open-access repositories: every record is open access)
 # ============================================================
 
-async def search_core(
-    client,
-    q,
-):
-
+async def search_core(client, q, year_min=None, year_max=None, oa_only=False):
     if not CORE_API_KEY:
-
-        print(
-            "CORE_API_KEY not configured. "
-            "Skipping CORE."
-        )
-
+        print("CORE_API_KEY not configured. Skipping CORE.")
         return []
-
-    url = (
-        "https://api.core.ac.uk/v3/"
-        "search/works"
-    )
-
-    headers = {
-
-        "Authorization": (
-            f"Bearer {CORE_API_KEY}"
-        )
-    }
-
-    params = {
-
-        "q": q.rstrip("?"),
-
-        "limit": 10,
-    }
-
+    url = "https://api.core.ac.uk/v3/search/works"
+    headers = {"Authorization": f"Bearer {CORE_API_KEY}"}
+    query = q.rstrip("?")
+    if year_min is not None:
+        query = f"({query}) AND yearPublished>={year_min}"
+    if year_max is not None:
+        query = f"({query}) AND yearPublished<={year_max}"
+    params = {"q": query, "limit": 10}
     try:
-
-        response = await client.get(
-            url,
-            params=params,
-            headers=headers,
-        )
-
+        response = await client.get(url, params=params, headers=headers)
         response.raise_for_status()
-
         data = response.json()
-
         results = []
-
-        for work in (
-            data.get("results")
-            or []
-        ):
-
+        for work in (data.get("results") or []):
             authors = []
-
-            for author in (
-                work.get("authors")
-                or []
-            ):
-
-                if isinstance(
-                    author,
-                    dict,
-                ):
-
-                    name = author.get(
-                        "name"
-                    )
-
-                else:
-
-                    name = str(
-                        author
-                    )
-
+            for author in (work.get("authors") or []):
+                name = author.get("name") if isinstance(author, dict) else str(author)
                 if name:
-
-                    authors.append(
-                        name
-                    )
-
-            abstract = work.get(
-                "abstract"
-            )
-
+                    authors.append(name)
+            abstract = work.get("abstract")
             if not abstract:
-
                 continue
-
             results.append(
                 normalize_result(
-
-                    title=work.get(
-                        "title"
-                    ),
-
+                    title=work.get("title"),
                     authors=authors,
-
                     abstract=abstract,
-
-                    year=work.get(
-                        "yearPublished"
-                    ),
-
+                    year=work.get("yearPublished"),
                     source="CORE",
-
-                    doi=work.get(
-                        "doi"
-                    ),
+                    doi=work.get("doi"),
+                    is_open_access=True,
                 )
             )
-
         return results
-
     except Exception as error:
-
-        print(
-            f"CORE search failed: "
-            f"{error}"
-        )
-
+        print(f"CORE search failed: {error}")
         return []
 
 
@@ -1974,51 +1671,32 @@ async def search_core(
 # DOI / TITLE DEDUPLICATION
 # ============================================================
 
-def deduplicate_results(
-    results
-):
-
+def deduplicate_results(results):
+    """Drop duplicates (same DOI, else same title) but merge what each source knows: if any source says
+    the paper is open access it is, and a missing abstract/year is filled from the duplicate."""
     unique_results = []
-
-    seen_dois = set()
-
-    seen_titles = set()
-
+    by_doi = {}
+    by_title = {}
     for result in results:
-
-        doi = normalize_doi(
-            result.get("doi")
-        )
-
-        title = (
-            result.get("title")
-            or ""
-        ).strip().lower()
-
+        doi = normalize_doi(result.get("doi"))
+        title = (result.get("title") or "").strip().lower()
+        # Same rule as before: a paper with a DOI is a duplicate only by DOI; one without by title.
+        kept = by_doi.get(doi) if doi else (by_title.get(title) if title else None)
+        if kept is not None:
+            if result.get("is_open_access") is True:
+                kept["is_open_access"] = True
+            elif kept.get("is_open_access") is None and result.get("is_open_access") is False:
+                kept["is_open_access"] = False
+            if not kept.get("abstract") and result.get("abstract"):
+                kept["abstract"] = result["abstract"]
+            if kept.get("publication_year") is None and result.get("publication_year") is not None:
+                kept["publication_year"] = result["publication_year"]
+            continue
+        unique_results.append(result)
         if doi:
-
-            if doi in seen_dois:
-
-                continue
-
-            seen_dois.add(
-                doi
-            )
-
+            by_doi[doi] = result
         elif title:
-
-            if title in seen_titles:
-
-                continue
-
-            seen_titles.add(
-                title
-            )
-
-        unique_results.append(
-            result
-        )
-
+            by_title[title] = result
     return unique_results
 
 
@@ -2175,21 +1853,24 @@ async def search(
             },
         ) as client:
 
-            # Search with academic keywords
+            # Year and open-access filters are sent to each source so its result slots go to matching papers.
+            f = {"year_min": year_min, "year_max": year_max, "oa_only": open_access_only}
             tasks = [
-                search_openalex(client, academic_keyword),
-                search_semantic_scholar(client, academic_keyword),
-                search_arxiv(client, academic_keyword),
-                search_crossref(client, academic_keyword),
-                search_core(client, academic_keyword),
+                search_openalex(client, academic_keyword, **f),
+                search_semantic_scholar(client, academic_keyword, **f),
+                search_arxiv(client, academic_keyword, **f),
+                search_core(client, academic_keyword, **f),
             ]
+            if not open_access_only:
+                # Crossref cannot tell us whether a paper is open access, so it is skipped for OA-only searches.
+                tasks.append(search_crossref(client, academic_keyword, **f))
 
             # If user query has distinct keywords, also search raw query
             if academic_keyword != query:
                 tasks.extend([
-                    search_semantic_scholar(client, query),
-                    search_openalex(client, query),
-                    search_arxiv(client, query),
+                    search_semantic_scholar(client, query, **f),
+                    search_openalex(client, query, **f),
+                    search_arxiv(client, query, **f),
                 ])
 
             gathered = await asyncio.gather(*tasks, return_exceptions=True)
@@ -2212,20 +1893,17 @@ async def search(
     # --------------------------------------------------------
     # Filters (Year and Open Access)
     # --------------------------------------------------------
+    # Safety net: enforce the filters again on the merged list (sources can be loose about dates).
     if year_min is not None or year_max is not None or open_access_only:
         filtered = []
         for r in results:
             y = r.get("publication_year")
-            if year_min is not None:
-                if y is None or y < year_min:
-                    continue
-            if year_max is not None:
-                if y is None or y > year_max:
-                    continue
-            if open_access_only:
-                # Must have a DOI or direct link
-                if not r.get("doi"):
-                    continue
+            if year_min is not None and (y is None or y < year_min):
+                continue
+            if year_max is not None and (y is None or y > year_max):
+                continue
+            if open_access_only and r.get("is_open_access") is not True:
+                continue  # only papers a source confirmed as open access
             filtered.append(r)
         results = filtered
 

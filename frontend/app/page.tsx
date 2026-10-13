@@ -864,9 +864,9 @@ export default function Home() {
     try {
       const currentYear = new Date().getFullYear();
       let yearMin: number | undefined;
-      if (yearFilter === "3") yearMin = currentYear - 3;
-      if (yearFilter === "5") yearMin = currentYear - 5;
-      if (yearFilter === "10") yearMin = currentYear - 10;
+      if (yearFilter === "3") yearMin = currentYear - 2;
+      if (yearFilter === "5") yearMin = currentYear - 4;
+      if (yearFilter === "10") yearMin = currentYear - 9;
 
       const searchParams = new URLSearchParams({
         q: searchQuery,
@@ -1558,7 +1558,7 @@ export default function Home() {
                       }`}
                     >
                       <Check className={`w-3 h-3 ${openAccessOnly ? "opacity-100" : "opacity-0"}`} />
-                      <span>Open Access (DOI)</span>
+                      <span>Open Access</span>
                     </button>
                   </div>
                 </form>
