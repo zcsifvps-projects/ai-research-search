@@ -352,11 +352,16 @@ export default function Home() {
     if (typeof window === "undefined") return "anonymous";
     const key = "researchai-session-id";
     const existing = window.localStorage.getItem(key);
-    if (existing) return existing;
-    const created =
-      typeof window.crypto?.randomUUID === "function"
-        ? window.crypto.randomUUID()
-        : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    if (existing && /^[A-Za-z0-9_-]{16,128}$/.test(existing)) return existing;
+    let created: string;
+    if (typeof window.crypto?.randomUUID === "function") {
+      created = window.crypto.randomUUID();
+    } else {
+      // cryptographically random even where randomUUID is unavailable (plain-http contexts)
+      const bytes = new Uint8Array(16);
+      window.crypto.getRandomValues(bytes);
+      created = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    }
     window.localStorage.setItem(key, created);
     return created;
   }
@@ -425,6 +430,16 @@ export default function Home() {
           message: "Your email has been verified! Welcome to ScholarPulse.",
         });
         if (data.user) setUser(data.user);
+        // Now that the account is verified: claim this browser's guest history and load saved data
+        fetch(`${apiBaseUrl}/history/sync`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ session_id: getSessionId() }),
+        }).catch(() => {});
+        loadBookmarks();
+        loadHistory();
+        setAuthModalOpen(false);
         // Clean URL
         window.history.replaceState({}, document.title, window.location.pathname);
       } else {
@@ -494,6 +509,17 @@ export default function Home() {
         return;
       }
 
+      if (authMode === "register") {
+        // Registration does not sign you in: the emailed link verifies the address and signs you in.
+        // The API answers identically whether or not the address was already registered.
+        setAuthSuccess(
+          data.message ||
+            "Check your email. We have sent a link to verify your address and finish creating your account.",
+        );
+        setAuthPassword("");
+        return;
+      }
+
       setUser(data.user);
 
       // Sync guest search history to user account
@@ -508,23 +534,11 @@ export default function Home() {
       loadBookmarks();
       loadHistory();
 
-      if (authMode === "register") {
-        setAuthSuccess("Account created! A verification email has been sent.");
-        setTimeout(() => {
-          setAuthModalOpen(false);
-          setSoftGateModalOpen(false);
-          setAuthEmail("");
-          setAuthPassword("");
-          setAuthFullName("");
-          setAuthSuccess("");
-        }, 2000);
-      } else {
-        setAuthModalOpen(false);
-        setSoftGateModalOpen(false);
-        setAuthEmail("");
-        setAuthPassword("");
-        setAuthFullName("");
-      }
+      setAuthModalOpen(false);
+      setSoftGateModalOpen(false);
+      setAuthEmail("");
+      setAuthPassword("");
+      setAuthFullName("");
     } catch {
       setAuthError("Network error. Please check your connection.");
     } finally {

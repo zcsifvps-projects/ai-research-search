@@ -40,15 +40,16 @@ In practice you pass the `results` array from `/search` straight into `/ask`.
 
 ## 2. Authentication
 
-Sign-in uses an `HttpOnly` session cookie named `access_token` (valid 30 days). There is no API key.
+Sign-in uses an `HttpOnly` session cookie named `access_token` (valid 14 days by default). There is no API key.
 
 ```bash
-# Register (sets the cookie; a verification email is sent)
-curl -s -c jar.txt -X POST "$API/auth/register" -H "Content-Type: application/json" \
+# Register: emails a verification link. It does NOT sign you in, and the response is identical whether or not
+# the address is already registered (an existing owner gets a notice email instead), so accounts cannot be discovered.
+curl -s -X POST "$API/auth/register" -H "Content-Type: application/json" \
   -d '{"email":"jane.doe@university.test","password":"a-long-passphrase","full_name":"Jane Doe"}'
 
-# Verify: paste the token from the email link (?token=...)
-curl -s -c jar.txt -b jar.txt -X POST "$API/auth/verify-email" -H "Content-Type: application/json" -d '{"token":"<token from email>"}'
+# Verify: paste the token from the email link (?verify_token=...). This verifies the address AND signs you in.
+curl -s -c jar.txt -X POST "$API/auth/verify-email" -H "Content-Type: application/json" -d '{"token":"<token from email>"}'
 
 # Later: sign in again
 curl -s -c jar.txt -X POST "$API/auth/login" -H "Content-Type: application/json" \
@@ -69,7 +70,15 @@ Scripts can instead send `Authorization: Bearer <value of the token field>`.
 
 Identity is always taken from the cookie/token. A `user_id` in a request body is ignored.
 
-Changing or resetting a password signs out every other session. Deleting an account requires the password.
+Sessions:
+
+- `POST /auth/logout` revokes **this** session on the server (a copied token stops working at once).
+- `POST /auth/logout-all` revokes **every** session.
+- Changing or resetting a password also signs out every other session. Deleting an account requires the password.
+- Verification and reset links are single-use; verification links expire after 48 hours, reset links after 1 hour. They are stored only as hashes.
+
+Guest `session_id`: a random value you generate once per client, 16 to 128 characters of letters, digits, `_` or `-` (a UUID works).
+Shorter or guessable values are rejected with `422`, because the `session_id` is the only thing protecting a guest's history.
 
 ## 3. Endpoints
 
@@ -84,7 +93,9 @@ Changing or resetting a password signs out every other session. Deleting an acco
 | `DELETE /history/{session_id}` | optional | Clear history |
 | `POST /history/sync` | verified | Attach a guest `session_id`'s history to your account |
 | `GET/POST /bookmarks`, `DELETE /bookmarks/{id}` | verified | Saved papers |
-| `POST /auth/register`, `/auth/login`, `/auth/logout` | none | Account and session |
+| `POST /auth/register` | none | Start sign-up; emails a link (never signs in, never reveals existing accounts) |
+| `POST /auth/login`, `/auth/logout` | none | Sign in; sign out (revokes this session) |
+| `POST /auth/logout-all` | signed in | Revoke every session |
 | `GET /auth/me` | signed in | Current user |
 | `POST /auth/verify-email`, `/auth/resend-verification` | none | Email verification |
 | `POST /auth/forgot-password`, `/auth/reset-password` | none | Password reset |
@@ -119,14 +130,25 @@ messages or stack traces.
 | 404 | Not found, or not yours |
 | 413 | Body larger than 1 MB (configurable) |
 | 422 | A field is missing, too long or the wrong type |
-| 429 | Rate limited: wait `Retry-After` seconds |
+| 429 | Rate limited, account temporarily locked, or a daily AI cap reached: wait `Retry-After` seconds |
 | 502 / 503 | AI step failed / no AI provider configured |
 
 ## 5. Rate limits
 
 Per client IP, per minute (fixed window): `/ask` 30, `/deep-dive` 20, `/search` 60, `/auth/login` 10, `/auth/register` 10, `/auth/forgot-password` 5,
 `/auth/resend-verification` 5, `/auth/reset-password` 10, `/auth/verify-email` 10, other `/auth/*` 30, `/bookmarks` 60, everything else 150.
-Behind a reverse proxy set `TRUSTED_PROXY_COUNT=1`, otherwise all users share the proxy's IP. The limiter is per process: run one worker.
+Behind a reverse proxy set `TRUSTED_PROXY_COUNT=1`, otherwise all users share the proxy's IP. The per-minute limiter is per process: run one worker
+(the account lockout, email caps and daily AI caps use Redis when `REDIS_URL` is reachable, so they are shared across workers).
+
+Additional protections, all configurable in `backend/.env.example`:
+
+| Protection | Default |
+|---|---|
+| Failed sign-ins per account | 5 in 15 minutes, then locked until the window ends (a password reset clears it) |
+| Emails per address | 3 per hour (extra requests get the same response; no email is sent) |
+| AI calls per UTC day | guests 30 per IP, signed-in accounts 200, everyone 3000 (cached answers are free) |
+
+Over a daily AI cap the API answers `429` with `Retry-After` set to the seconds until midnight UTC.
 
 ## 6. Examples
 

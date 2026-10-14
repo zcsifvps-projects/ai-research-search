@@ -11,7 +11,7 @@ os.environ.update(
         "ENV_FILE": os.path.join(_TMP, "no-such.env"),
         "AUTH_SECRET": "t" * 48,
         "CORS_ORIGINS": "http://localhost:3000",
-        "DATABASE_URL": f"sqlite:///{_TMP}/test.db",
+        "DATABASE_URL": os.environ.get("TEST_DATABASE_URL") or f"sqlite:///{_TMP}/test.db",  # set TEST_DATABASE_URL to run against Postgres
         "APP_URL": "http://localhost:3000",
         "COOKIE_SECURE": "false",  # the test client talks plain http
         "DEV_MODE": "false",

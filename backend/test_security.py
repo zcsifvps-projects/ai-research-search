@@ -64,12 +64,30 @@ def limiter():
     return layer
 
 
+OUTBOX = []
+
+
 @pytest.fixture(autouse=True)
-def clean_state():
+def clean_state(monkeypatch):
+    """Fresh limiter, caches and counters per test; emails are captured instead of sent."""
     limiter().request_history.clear()
     main.IN_MEMORY_CACHE.clear()
+    main._COUNTERS.clear()
+    OUTBOX.clear()
+    monkeypatch.setattr(main, "send_verification_email", lambda to, token, name=None: OUTBOX.append({"kind": "verify", "to": to, "token": token}) or True)
+    monkeypatch.setattr(main, "send_password_reset_email", lambda to, token, name=None: OUTBOX.append({"kind": "reset", "to": to, "token": token}) or True)
+    monkeypatch.setattr(main, "send_account_exists_email", lambda to, name=None: OUTBOX.append({"kind": "exists", "to": to}) or True)
+    monkeypatch.setattr(main, "send_welcome_email", lambda to, name=None: OUTBOX.append({"kind": "welcome", "to": to}) or True)
     yield
     limiter().request_history.clear()
+
+
+def emailed_token(kind, email):
+    return [m["token"] for m in OUTBOX if m["kind"] == kind and m["to"] == email][-1]
+
+
+def kinds(email=None):
+    return [m["kind"] for m in OUTBOX if email is None or m["to"] == email]
 
 
 @pytest.fixture()
@@ -89,16 +107,13 @@ def make_user(verified=True, password=PASSWORD):
     limiter().request_history.clear()
     r = c.post("/auth/register", json={"email": email, "password": password})
     assert r.status_code == 200, r.text
-    uid = r.json()["user"]["id"]
+    assert "set-cookie" not in r.headers  # registration never signs you in
     if verified:
-        db = main.SessionLocal()
-        try:
-            user = db.query(main.User).filter(main.User.id == uid).first()
-            token = user.verification_token
-        finally:
-            db.close()
-        r = c.post("/auth/verify-email", json={"token": token})
-        assert r.status_code == 200, r.text
+        r = c.post("/auth/verify-email", json={"token": emailed_token("verify", email)})  # the emailed link signs you in
+    else:
+        r = c.post("/auth/login", json={"email": email, "password": password})
+    assert r.status_code == 200, r.text
+    uid = r.json()["user"]["id"]
     limiter().request_history.clear()
     return c, uid, email
 
@@ -109,7 +124,7 @@ def use_fake_ai(monkeypatch, gemini=None, groq=None):
 
 
 def ask_body(question="Does sleep affect memory?", **extra):
-    return {"question": question, "results": PAPERS, "session_id": "sess-" + question[:8], **extra}
+    return {"question": question, "results": PAPERS, "session_id": "guest-" + __import__("hashlib").sha1(question.encode()).hexdigest()[:24], **extra}
 
 
 # ---------------------------------------------------------------- authentication on every protected route
@@ -118,7 +133,7 @@ PROTECTED = [
     ("get", "/auth/me", None),
     ("post", "/auth/change-password", {"current_password": "x" * 8, "new_password": "y" * 8}),
     ("delete", "/auth/delete-account", {"password": "whatever1"}),
-    ("post", "/history/sync", {"session_id": "abc"}),
+    ("post", "/history/sync", {"session_id": "a" * 16}),
     ("get", "/bookmarks", None),
     ("post", "/bookmarks", {"title": "T"}),
     ("delete", "/bookmarks/1", None),
@@ -153,7 +168,7 @@ def test_unverified_account_gets_403_on_library_and_sync():
     assert c.get("/bookmarks").status_code == 403
     assert c.post("/bookmarks", json={"title": "T"}).status_code == 403
     assert c.delete("/bookmarks/1").status_code == 403
-    assert c.post("/history/sync", json={"session_id": "abc"}).status_code == 403
+    assert c.post("/history/sync", json={"session_id": "a" * 16}).status_code == 403
 
 
 def test_verified_account_can_use_library():
@@ -257,7 +272,7 @@ def test_ask_drops_invented_citations(monkeypatch):
 
 def test_ask_without_abstracts_is_rejected_not_hallucinated(monkeypatch):
     use_fake_ai(monkeypatch, gemini=FakeGemini(text=GOOD_JSON))
-    body = {"question": "Anything?", "results": [{"title": "No abstract", "description": "OpenAlex"}], "session_id": "s1"}
+    body = {"question": "Anything?", "results": [{"title": "No abstract", "description": "OpenAlex"}], "session_id": "guest-session-0001-abcd"}
     assert TestClient(main.app).post("/ask", json=body).status_code == 400
 
 
@@ -378,7 +393,8 @@ def test_oversized_body_is_rejected(client):
 
 def test_rate_limiter_blocks_after_limit(client):
     limit = limiter().limits["/auth/login"][0]
-    codes = [client.post("/auth/login", json={"email": "x@example.com", "password": "nope-nope"}).status_code for _ in range(limit + 1)]
+    # a different address each time, so the per-account lockout does not trigger before the per-IP limit
+    codes = [client.post("/auth/login", json={"email": f"x{i}@example.com", "password": "nope-nope"}).status_code for i in range(limit + 1)]
     assert codes[:limit] == [401] * limit
     assert codes[-1] == 429
 
@@ -388,7 +404,7 @@ def test_rate_limiter_cannot_be_dodged_with_fake_forwarded_for(client):
     limit = limiter().limits["/auth/login"][0]
     codes = []
     for i in range(limit + 3):
-        r = client.post("/auth/login", json={"email": "x@example.com", "password": "nope-nope"},
+        r = client.post("/auth/login", json={"email": f"x{i}@example.com", "password": "nope-nope"},
                         headers={"X-Forwarded-For": f"10.0.{i}.{i}"})
         codes.append(r.status_code)
     assert 429 in codes
@@ -403,8 +419,8 @@ def test_rate_limit_buckets_do_not_multiply_with_path_variants(client):
 def test_429_still_carries_cors_headers(client):
     limit = limiter().limits["/auth/login"][0]
     r = None
-    for _ in range(limit + 1):
-        r = client.post("/auth/login", json={"email": "x@example.com", "password": "nope-nope"},
+    for i in range(limit + 1):
+        r = client.post("/auth/login", json={"email": f"x{i}@example.com", "password": "nope-nope"},
                         headers={"Origin": "http://localhost:3000"})
     assert r.status_code == 429
     assert r.headers.get("access-control-allow-origin") == "http://localhost:3000"
@@ -449,11 +465,7 @@ def test_password_reset_invalidates_existing_sessions():
     c, uid, email = make_user()
     limiter().request_history.clear()
     TestClient(main.app).post("/auth/forgot-password", json={"email": email})
-    db = main.SessionLocal()
-    try:
-        token = db.query(main.User).filter(main.User.id == uid).first().reset_token
-    finally:
-        db.close()
+    token = emailed_token("reset", email)
     r = TestClient(main.app).post("/auth/reset-password", json={"token": token, "new_password": "reset-password-1"})
     assert r.status_code == 200
     assert c.get("/auth/me").status_code == 401
@@ -475,8 +487,13 @@ def test_delete_account_requires_password_and_kills_the_session():
 
 
 def test_deleted_users_old_token_is_dead_everywhere(monkeypatch):
-    c, uid, _ = make_user()
-    stale = main.create_access_token(uid, "gone@example.com", "whatever")
+    c, uid, email = make_user()
+    db = main.SessionLocal()
+    try:
+        pw_hash = db.query(main.User).filter(main.User.id == uid).first().hashed_password
+    finally:
+        db.close()
+    stale = main.create_access_token(uid, email, pw_hash)  # valid until the account disappears
     c.request("DELETE", "/auth/delete-account", json={"password": PASSWORD})
     ghost = TestClient(main.app)
     ghost.cookies.set("access_token", stale)
@@ -484,8 +501,8 @@ def test_deleted_users_old_token_is_dead_everywhere(monkeypatch):
 
 
 def test_auth_cookie_is_httponly_and_samesite():
-    c = TestClient(main.app)
-    r = c.post("/auth/register", json={"email": "cookieflags@example.com", "password": PASSWORD})
+    _, _, email = make_user()
+    r = TestClient(main.app).post("/auth/login", json={"email": email, "password": PASSWORD})
     cookie = r.headers["set-cookie"].lower()
     assert "httponly" in cookie and "samesite=lax" in cookie
 
@@ -518,11 +535,11 @@ def test_login_and_register_validation():
     assert c.post("/auth/login", json={"email": "nobody@example.com", "password": PASSWORD}).status_code == 401
 
 
-def test_register_never_returns_sensitive_fields():
+def test_register_never_returns_sensitive_fields_or_a_session():
     r = TestClient(main.app).post("/auth/register", json={"email": "fields@example.com", "password": PASSWORD})
-    user = r.json()["user"]
-    assert set(user) == {"id", "email", "full_name", "is_verified"}
-    assert "hashed_password" not in r.text and "verification_token" not in r.text
+    assert r.status_code == 200 and list(r.json()) == ["message"]
+    assert "set-cookie" not in r.headers
+    assert "hashed_password" not in r.text and "token" not in r.text
 
 
 # ---------------------------------------------------------------- startup configuration (fresh interpreter)
@@ -645,7 +662,7 @@ def test_rate_limited_and_ai_routes_document_their_errors():
 
 
 def test_documented_error_examples_never_leak_paths_or_secrets():
-    text = str(main.app.openapi()).lower()
+    text = str(main.app.openapi()).lower().replace(".env.example", "")  # naming the example file is fine
     for banned in (".env", "traceback", "gemini_api_key", "groq_api_key", "/home/", "uvicorn"):
         assert banned not in text, banned
 
@@ -668,3 +685,275 @@ def test_interactive_docs_are_served_when_enabled():
                          "(lambda c: (c.get('/docs').status_code, c.get('/redoc').status_code, c.get('/openapi.json').status_code))"
                          "(__import__('fastapi.testclient', fromlist=['x']).TestClient(main.app))")
     assert out == "(200, 200, 200)"
+
+
+# ================================================================ closing the remaining gaps
+
+# ---- 4. registration does not reveal whether an address is registered
+
+def test_register_response_is_identical_for_new_and_existing_addresses():
+    c = TestClient(main.app)
+    new = c.post("/auth/register", json={"email": "enum-test@example.com", "password": PASSWORD})
+    limiter().request_history.clear()
+    again = c.post("/auth/register", json={"email": "enum-test@example.com", "password": "another-password"})
+    assert (new.status_code, new.json(), "set-cookie" in new.headers) == (again.status_code, again.json(), "set-cookie" in again.headers)
+    assert kinds("enum-test@example.com") == ["verify", "exists"]  # the owner is told; the caller learns nothing
+
+
+def test_registering_an_existing_address_never_changes_the_account():
+    c, uid, email = make_user()
+    TestClient(main.app).post("/auth/register", json={"email": email, "password": "attacker-password-1"})
+    assert TestClient(main.app).post("/auth/login", json={"email": email, "password": PASSWORD}).status_code == 200
+    assert TestClient(main.app).post("/auth/login", json={"email": email, "password": "attacker-password-1"}).status_code == 401
+
+
+# ---- 7. verification and reset tokens are stored hashed, single-use and time-limited
+
+def test_tokens_are_stored_hashed_not_raw():
+    c = TestClient(main.app)
+    c.post("/auth/register", json={"email": "hashed@example.com", "password": PASSWORD})
+    raw = emailed_token("verify", "hashed@example.com")
+    db = main.SessionLocal()
+    try:
+        user = db.query(main.User).filter(main.User.email == "hashed@example.com").first()
+        assert user.verification_token == main.hash_token(raw) and raw not in user.verification_token
+    finally:
+        db.close()
+    c.post("/auth/forgot-password", json={"email": "hashed@example.com"})
+    raw_reset = emailed_token("reset", "hashed@example.com")
+    db = main.SessionLocal()
+    try:
+        user = db.query(main.User).filter(main.User.email == "hashed@example.com").first()
+        assert user.reset_token == main.hash_token(raw_reset) and user.reset_token != raw_reset
+    finally:
+        db.close()
+
+
+def test_a_leaked_database_hash_cannot_be_used_as_a_token():
+    c = TestClient(main.app)
+    c.post("/auth/register", json={"email": "leak@example.com", "password": PASSWORD})
+    db = main.SessionLocal()
+    try:
+        stored = db.query(main.User).filter(main.User.email == "leak@example.com").first().verification_token
+    finally:
+        db.close()
+    assert c.post("/auth/verify-email", json={"token": stored}).status_code == 400
+
+
+def test_verification_token_is_single_use_and_expires():
+    c = TestClient(main.app)
+    c.post("/auth/register", json={"email": "expiry@example.com", "password": PASSWORD})
+    raw = emailed_token("verify", "expiry@example.com")
+    db = main.SessionLocal()
+    try:
+        user = db.query(main.User).filter(main.User.email == "expiry@example.com").first()
+        user.verification_token_expires_at = main._utcnow() - main.timedelta(minutes=1)
+        db.commit()
+    finally:
+        db.close()
+    assert c.post("/auth/verify-email", json={"token": raw}).status_code == 400  # expired
+    c.post("/auth/resend-verification", json={"email": "expiry@example.com"})
+    fresh = emailed_token("verify", "expiry@example.com")
+    assert fresh != raw
+    assert c.post("/auth/verify-email", json={"token": fresh}).status_code == 200
+    assert c.post("/auth/verify-email", json={"token": fresh}).status_code == 400  # single use
+
+
+def test_reset_token_is_single_use():
+    c, uid, email = make_user()
+    TestClient(main.app).post("/auth/forgot-password", json={"email": email})
+    token = emailed_token("reset", email)
+    anon = TestClient(main.app)
+    assert anon.post("/auth/reset-password", json={"token": token, "new_password": "first-new-password"}).status_code == 200
+    assert anon.post("/auth/reset-password", json={"token": token, "new_password": "second-new-password"}).status_code == 400
+
+
+def test_email_cap_per_address_per_hour_with_identical_responses():
+    c = TestClient(main.app)
+    _, _, email = make_user()
+    OUTBOX.clear()
+    responses = []
+    for _ in range(main.EMAIL_MAX_PER_HOUR + 2):
+        limiter().request_history.clear()
+        r = c.post("/auth/forgot-password", json={"email": email})
+        responses.append((r.status_code, r.json()))
+    assert len(set(map(str, responses))) == 1
+    assert kinds(email).count("reset") == main.EMAIL_MAX_PER_HOUR
+
+
+# ---- 2. per-account lockout
+
+def _bad_login(email, password="wrong-password-1"):
+    limiter().request_history.clear()
+    return TestClient(main.app).post("/auth/login", json={"email": email, "password": password})
+
+
+def test_account_locks_after_repeated_failures_even_for_the_right_password():
+    _, _, email = make_user()
+    for _ in range(main.LOGIN_MAX_FAILURES):
+        assert _bad_login(email).status_code == 401
+    locked = _bad_login(email, PASSWORD)
+    assert locked.status_code == 429 and int(locked.headers["retry-after"]) > 0
+    assert "password" in locked.json()["detail"].lower() and email not in locked.text
+
+
+def test_lockout_is_identical_for_unknown_addresses():
+    for _ in range(main.LOGIN_MAX_FAILURES):
+        _bad_login("ghost@example.com")
+    assert _bad_login("ghost@example.com").status_code == 429
+
+
+def test_lockout_is_per_account_and_cleared_by_success_or_reset():
+    _, _, a = make_user()
+    _, _, b = make_user()
+    for _ in range(main.LOGIN_MAX_FAILURES - 1):
+        _bad_login(a)
+    assert _bad_login(b).status_code == 401                                   # another account is unaffected
+    assert _bad_login(a, PASSWORD).status_code == 200                         # success resets the counter
+    for _ in range(main.LOGIN_MAX_FAILURES):
+        _bad_login(a)
+    assert _bad_login(a, PASSWORD).status_code == 429
+    TestClient(main.app).post("/auth/forgot-password", json={"email": a})
+    r = TestClient(main.app).post("/auth/reset-password", json={"token": emailed_token("reset", a), "new_password": "brand-new-password-1"})
+    assert r.status_code == 200
+    assert _bad_login(a, "brand-new-password-1").status_code == 200           # the owner is back in
+
+
+# ---- 3. server-side logout
+
+def test_logout_revokes_a_copied_token():
+    c, _, email = make_user()
+    stolen = c.cookies.get("access_token")
+    assert TestClient(main.app, cookies={"access_token": stolen}).get("/auth/me").status_code == 200
+    assert c.post("/auth/logout").status_code == 200
+    thief = TestClient(main.app)
+    thief.cookies.set("access_token", stolen)
+    assert thief.get("/auth/me").status_code == 401
+    assert thief.get("/bookmarks").status_code == 401
+    assert TestClient(main.app).post("/auth/login", json={"email": email, "password": PASSWORD}).status_code == 200
+
+
+def test_logout_revokes_the_bearer_token_too():
+    c, _, _ = make_user()
+    token = c.cookies.get("access_token")
+    c2 = TestClient(main.app)
+    assert c2.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).status_code == 200
+    c2.post("/auth/logout", headers={"Authorization": f"Bearer {token}"})
+    assert c2.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).status_code == 401
+
+
+def test_logout_all_signs_out_every_device():
+    c, _, email = make_user()
+    other = TestClient(main.app)
+    other.post("/auth/login", json={"email": email, "password": PASSWORD})
+    assert other.get("/auth/me").status_code == 200
+    assert c.post("/auth/logout-all").status_code == 200
+    assert c.get("/auth/me").status_code == 401 and other.get("/auth/me").status_code == 401
+    fresh = TestClient(main.app)
+    assert fresh.post("/auth/login", json={"email": email, "password": PASSWORD}).status_code == 200
+    assert fresh.get("/auth/me").status_code == 200          # sessions created afterwards work
+    assert TestClient(main.app).post("/auth/logout-all").status_code == 401
+
+
+def test_session_lifetime_is_configurable_and_shorter_by_default():
+    assert main.SESSION_DAYS == 14
+    payload = main.verify_access_token(main.create_access_token(1, "a@b.c"))
+    assert abs(payload["exp"] - (main.time.time() + 14 * 86400)) < 60 and payload["jti"] and payload["iat"] <= main.time.time()
+
+
+def test_revoked_token_rows_are_purged_after_expiry():
+    c, _, _ = make_user()
+    db = main.SessionLocal()
+    try:
+        db.add(main.RevokedToken(jti="old" * 8, expires_at=main._utcnow() - main.timedelta(days=1)))
+        db.commit()
+    finally:
+        db.close()
+    c.post("/auth/logout")
+    db = main.SessionLocal()
+    try:
+        assert db.query(main.RevokedToken).filter(main.RevokedToken.jti == "old" * 8).count() == 0
+    finally:
+        db.close()
+
+
+# ---- 1. daily AI spend limits
+
+def test_guest_ai_quota_per_ip(monkeypatch):
+    use_fake_ai(monkeypatch, gemini=FakeGemini(text=GOOD_JSON))
+    monkeypatch.setattr(main, "AI_DAILY_LIMIT_GUEST", 2)
+    c = TestClient(main.app)
+    codes = [c.post("/ask", json=ask_body(f"Quota question number {i}")).status_code for i in range(3)]
+    assert codes == [200, 200, 429]
+    r = c.post("/ask", json=ask_body("Quota question number 99"))
+    assert r.status_code == 429 and int(r.headers["retry-after"]) > 0 and "tomorrow" in r.json()["detail"].lower()
+    assert c.post("/deep-dive", json={"title": "T", "abstract": "Some abstract."}).status_code == 429  # shared bucket
+
+
+def test_cache_hits_do_not_use_quota(monkeypatch):
+    use_fake_ai(monkeypatch, gemini=FakeGemini(text=GOOD_JSON))
+    monkeypatch.setattr(main, "AI_DAILY_LIMIT_GUEST", 1)
+    c = TestClient(main.app)
+    body = ask_body("Same question again and again")
+    assert [c.post("/ask", json=body).status_code for _ in range(4)] == [200, 200, 200, 200]
+
+
+def test_signed_in_users_have_their_own_higher_quota(monkeypatch):
+    use_fake_ai(monkeypatch, gemini=FakeGemini(text=GOOD_JSON))
+    monkeypatch.setattr(main, "AI_DAILY_LIMIT_GUEST", 1)
+    monkeypatch.setattr(main, "AI_DAILY_LIMIT_USER", 3)
+    user, _, _ = make_user()
+    guest = TestClient(main.app)
+    assert guest.post("/ask", json=ask_body("guest one question")).status_code == 200
+    assert guest.post("/ask", json=ask_body("guest two question")).status_code == 429
+    assert [user.post("/ask", json=ask_body(f"member question {i}")).status_code for i in range(4)] == [200, 200, 200, 429]
+
+
+def test_global_ai_quota_protects_the_budget(monkeypatch):
+    use_fake_ai(monkeypatch, gemini=FakeGemini(text=GOOD_JSON))
+    monkeypatch.setattr(main, "AI_DAILY_LIMIT_GLOBAL", 2)
+    a, b = TestClient(main.app), TestClient(main.app)
+    assert a.post("/ask", json=ask_body("global one")).status_code == 200
+    assert b.post("/ask", json=ask_body("global two")).status_code == 200
+    r = a.post("/ask", json=ask_body("global three"))
+    assert r.status_code == 429 and "busy" in r.json()["detail"].lower()
+
+
+def test_quota_zero_means_unlimited(monkeypatch):
+    use_fake_ai(monkeypatch, gemini=FakeGemini(text=GOOD_JSON))
+    monkeypatch.setattr(main, "AI_DAILY_LIMIT_GUEST", 0)
+    monkeypatch.setattr(main, "AI_DAILY_LIMIT_GLOBAL", 0)
+    c = TestClient(main.app)
+    assert all(c.post("/ask", json=ask_body(f"unlimited {i}")).status_code == 200 for i in range(5))
+
+
+# ---- 6. unguessable guest session ids
+
+@pytest.mark.parametrize("bad", ["short", "a" * 15, "has spaces in it 123", "semi;colon-0123456789", "x" * 129, ""])
+def test_weak_or_malformed_session_ids_are_rejected(monkeypatch, bad):
+    use_fake_ai(monkeypatch, gemini=FakeGemini(text=GOOD_JSON))
+    r = TestClient(main.app).post("/ask", json={**ask_body("Session id check"), "session_id": bad})
+    assert r.status_code == 422
+    assert TestClient(main.app).get(f"/history/{bad or 'x'}").json() == {"history": []}
+
+
+def test_uuid_and_hex_session_ids_are_accepted(monkeypatch):
+    use_fake_ai(monkeypatch, gemini=FakeGemini(text=GOOD_JSON))
+    import uuid
+    for i, sid in enumerate([str(uuid.uuid4()), uuid.uuid4().hex, "A" * 16]):
+        assert TestClient(main.app).post("/ask", json={**ask_body(f"Session ok {i}"), "session_id": sid}).status_code == 200
+
+
+def test_guest_history_cannot_be_read_with_a_guessed_short_id(monkeypatch):
+    use_fake_ai(monkeypatch, gemini=FakeGemini(text=GOOD_JSON))
+    TestClient(main.app).post("/ask", json=ask_body("Anonymous bucket check"))  # filed under the real id
+    for guess in ("anonymous", "test", "123", "default", "admin"):
+        assert TestClient(main.app).get(f"/history/{guess}").json() == {"history": []}
+
+
+# ---- 5. headers on API responses
+
+def test_api_responses_carry_a_locked_down_csp(client):
+    r = client.get("/")
+    assert r.headers["content-security-policy"] == "default-src 'none'; frame-ancestors 'none'"
+    assert r.headers["cache-control"] == "no-store"

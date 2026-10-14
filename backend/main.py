@@ -1,6 +1,6 @@
 import asyncio
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 import re
 import secrets
 import smtplib
+import threading
 import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -28,9 +29,10 @@ from sqlalchemy import (
     create_engine,
     text,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-from fastapi import FastAPI, HTTPException, Header, Query, Request, Response, status
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Header, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
@@ -47,6 +49,11 @@ from starlette.responses import JSONResponse
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.getenv("ENV_FILE") or os.path.join(BASE_DIR, ".env")  # override is used by the tests
 load_dotenv(dotenv_path=ENV_FILE, override=False)
+
+def _utcnow() -> datetime:
+    """Naive UTC 'now' (what the DateTime columns store); replaces the deprecated datetime.utcnow()."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
@@ -113,6 +120,16 @@ ENABLE_RERANKING = _env_bool("ENABLE_RERANKING", True)
 # It makes the interactive docs call the right URLs. Leave empty when the API is served at the domain root.
 API_ROOT_PATH = os.getenv("API_ROOT_PATH", "").strip().rstrip("/")
 
+# Sessions, abuse protection and AI spend limits (0 disables a limit)
+SESSION_DAYS = int(os.getenv("SESSION_DAYS", "14"))
+LOGIN_MAX_FAILURES = int(os.getenv("LOGIN_MAX_FAILURES", "5"))          # failed sign-ins per account ...
+LOGIN_LOCK_SECONDS = int(os.getenv("LOGIN_LOCK_SECONDS", "900"))        # ... within this window, then locked until it ends
+EMAIL_MAX_PER_HOUR = int(os.getenv("EMAIL_MAX_PER_HOUR", "3"))          # verification/reset/notice emails per address
+VERIFICATION_TOKEN_HOURS = int(os.getenv("VERIFICATION_TOKEN_HOURS", "48"))
+AI_DAILY_LIMIT_GUEST = int(os.getenv("AI_DAILY_LIMIT_GUEST", "30"))     # AI calls per guest IP per UTC day
+AI_DAILY_LIMIT_USER = int(os.getenv("AI_DAILY_LIMIT_USER", "200"))      # per signed-in account per UTC day
+AI_DAILY_LIMIT_GLOBAL = int(os.getenv("AI_DAILY_LIMIT_GLOBAL", "3000")) # all callers together per UTC day
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
@@ -163,11 +180,23 @@ class User(Base):
     verification_token = Column(String(255), nullable=True, index=True)
     reset_token = Column(String(255), nullable=True, index=True)
     reset_token_expires_at = Column(DateTime, nullable=True)
+    # verification/reset tokens are stored as SHA-256 hashes; only the emailed link holds the raw value
+    verification_token_expires_at = Column(DateTime, nullable=True)
+    # sessions issued before this moment are rejected ("sign out everywhere")
+    tokens_valid_after = Column(DateTime, nullable=True)
     created_at = Column(
         DateTime,
         nullable=False,
         server_default=text("CURRENT_TIMESTAMP"),
     )
+
+
+class RevokedToken(Base):
+    """Session tokens that were signed out before their natural expiry."""
+    __tablename__ = "revoked_tokens"
+
+    jti = Column(String(64), primary_key=True)
+    expires_at = Column(DateTime, nullable=False, index=True)
 
 
 class SearchHistory(Base):
@@ -218,6 +247,8 @@ def init_db():
             conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_token VARCHAR(255);"))
             conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token VARCHAR(255);"))
             conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires_at TIMESTAMP;"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_token_expires_at TIMESTAMP;"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS tokens_valid_after TIMESTAMP;"))
             conn.commit()
     except Exception as e:
         print("Schema migration note:", e)
@@ -293,7 +324,9 @@ def create_access_token(user_id: int, email: str, pw_hash: str | None = None) ->
     payload = {
         "user_id": user_id,
         "email": email,
-        "exp": int(time.time()) + 30 * 24 * 3600,  # 30 days
+        "iat": time.time(),
+        "exp": int(time.time()) + SESSION_DAYS * 24 * 3600,
+        "jti": secrets.token_hex(16),  # lets a single session be revoked on logout
     }
     if pw_hash is not None:
         payload["pv"] = password_version(pw_hash)
@@ -357,6 +390,12 @@ def _load_session_user(payload: dict | None) -> "User | None":
             return None
         if "pv" in payload and payload["pv"] != password_version(user.hashed_password):
             return None
+        valid_after = user.tokens_valid_after
+        if valid_after is not None and float(payload.get("iat", 0)) < valid_after.replace(tzinfo=timezone.utc).timestamp():
+            return None  # signed out everywhere after this token was issued
+        jti = payload.get("jti")
+        if jti and db.query(RevokedToken).filter(RevokedToken.jti == jti).first():
+            return None  # this session was signed out
         db.expunge(user)
         return user
     finally:
@@ -399,7 +438,7 @@ def set_auth_cookie(response: Response, token: str):
         "httponly": True,
         "samesite": COOKIE_SAMESITE,
         "secure": COOKIE_SECURE,
-        "max_age": 30 * 24 * 3600,
+        "max_age": SESSION_DAYS * 24 * 3600,
         "path": "/",
     }
     if COOKIE_DOMAIN:
@@ -496,6 +535,19 @@ def send_welcome_email(to_email: str, full_name: str | None = None):
     """
     text = f"{greeting}\n\nYour account is active. Explore research at {APP_URL}\n"
     return send_email(to_email, "Welcome to ScholarPulse Research Engine", html, text)
+
+
+def send_account_exists_email(to_email: str, full_name: str | None = None):
+    greeting = f"Hello {full_name}," if full_name else "Hello,"
+    html = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #E4DCCB; border-radius: 12px; background-color: #FAF6EF;">
+      <h2 style="color: #7C2A2A; margin-top: 0;">ScholarPulse — You already have an account</h2>
+      <p style="color: #221D18; font-size: 14px; line-height: 1.6;">{greeting}</p>
+      <p style="color: #221D18; font-size: 14px; line-height: 1.6;">Someone tried to create a ScholarPulse account with this email address, which is already registered. If that was you, just <a href="{APP_URL}" style="color: #7C2A2A;">sign in</a> (or use "Forgot password" on the sign-in form). If it wasn't you, you can ignore this message; nothing was changed.</p>
+    </div>
+    """
+    text = f"{greeting}\n\nSomeone tried to create a ScholarPulse account with this email, which is already registered. If that was you, sign in at {APP_URL} (or use Forgot password). If not, ignore this message.\n"
+    return send_email(to_email, "You already have a ScholarPulse account", html, text)
 
 
 def send_password_reset_email(to_email: str, token: str, full_name: str | None = None):
@@ -614,6 +666,8 @@ class RequestGuardMiddleware(BaseHTTPMiddleware):
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
         response.headers.setdefault("Cache-Control", "no-store")
+        if not request.url.path.startswith(("/docs", "/redoc", "/openapi.json")):
+            response.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
         if COOKIE_SECURE:
             response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
         return response
@@ -673,8 +727,9 @@ writes a short answer **only from the abstracts of the papers it found**, with c
 
 ## Authentication
 
-Sign-in uses a **signed, `HttpOnly` session cookie** named `access_token` (30 days). `POST /auth/login`,
-`/auth/register` and `/auth/verify-email` set it; `POST /auth/logout` clears it. Browsers and HTTP clients with a
+Sign-in uses a **signed, `HttpOnly` session cookie** named `access_token` (14 days by default). `POST /auth/login` and
+`/auth/verify-email` set it (registration does not sign you in; the emailed link does); `POST /auth/logout` revokes this session
+and `POST /auth/logout-all` every session. Browsers and HTTP clients with a
 cookie jar (`curl -c jar.txt -b jar.txt`) send it automatically. A `Authorization: Bearer <token>` header with the same
 token value is also accepted for scripts. Identity is **only** ever taken from the cookie/token, never from a request body.
 
@@ -706,6 +761,10 @@ Per client IP, per minute, in a fixed window: `/ask` 30, `/deep-dive` 20, `/sear
 `/auth/forgot-password` 5, `/auth/resend-verification` 5, `/auth/reset-password` 10, `/auth/verify-email` 10, other `/auth/*` 30,
 `/bookmarks` 60, everything else 150.
 
+Additional protections: **5 failed sign-ins per account in 15 minutes** locks that account for the rest of the window (a password reset
+clears it); **3 emails per address per hour**; and **daily AI caps** per UTC day (guests 30 per IP, signed-in accounts 200, everyone 3000).
+Over a cap you get `429` with `Retry-After`. All limits are configurable (see `.env.example`).
+
 ## Filters
 
 `/search` accepts `year_min`, `year_max` and `open_access_only`. They are sent to each source so results are not wasted.
@@ -725,7 +784,7 @@ TAGS_METADATA = [
 ]
 
 PROTECTED_OPERATIONS = {
-    ("get", "/auth/me"), ("post", "/auth/change-password"), ("delete", "/auth/delete-account"),
+    ("get", "/auth/me"), ("post", "/auth/change-password"), ("delete", "/auth/delete-account"), ("post", "/auth/logout-all"),
     ("post", "/history/sync"), ("post", "/bookmarks"), ("get", "/bookmarks"), ("delete", "/bookmarks/{bookmark_id}"),
 }
 
@@ -861,7 +920,13 @@ class DeleteAccountRequest(BaseModel):
 
 
 class SyncHistoryRequest(BaseModel):
-    session_id: str = Field(max_length=255)
+    session_id: str = Field(max_length=128, pattern=r"^[A-Za-z0-9_-]{16,128}$")
+
+
+# Guest history is protected only by its session id, so the server insists on an unguessable one
+# (a UUID or 32 hex characters qualifies; "anonymous" means "do not keep a retrievable history").
+SESSION_ID_PATTERN = r"^[A-Za-z0-9_-]{16,128}$"
+SESSION_ID_RE = re.compile(SESSION_ID_PATTERN)
 
 
 class ConversationTurn(BaseModel):
@@ -878,8 +943,9 @@ class AskRequest(BaseModel):
         examples=[[EXAMPLE_PAPER]],
     )
     session_id: str = Field(
-        default="anonymous", max_length=255,
-        description="A random id you generate once per browser/client (e.g. a UUID). Guest history is stored under it.",
+        default="anonymous", max_length=128, pattern=r"^(anonymous|[A-Za-z0-9_-]{16,128})$",
+        description="A random id you generate once per browser/client: 16 to 128 characters of letters, digits, '_' or '-' (a UUID works). "
+                    "Guest history is stored under it, so make it unguessable.",
         examples=["3f9c2f0e-8c1a-4b7e-9a55-0d6d2f5c1a11"],
     )
     conversation_history: list[ConversationTurn] = Field(default_factory=list, max_length=20)
@@ -943,22 +1009,166 @@ def health():
 
 
 # ============================================================
+# ABUSE PROTECTION: counters, login lockout, email limits, AI spend limits
+# ============================================================
+
+_COUNTERS: dict[str, tuple[int, float]] = {}
+_COUNTER_LOCK = threading.Lock()
+
+
+def counter_incr(key: str, ttl: int) -> int:
+    """Increment a counter that expires `ttl` seconds after its first increment. Uses Redis when it is
+    available (shared by all workers), otherwise process memory."""
+    if redis_client is not None:
+        try:
+            full_key = f"ctr:{key}"
+            count = int(redis_client.incr(full_key))
+            if count == 1 or redis_client.ttl(full_key) < 0:
+                redis_client.expire(full_key, max(1, ttl))
+            return count
+        except Exception as error:
+            print("Counter store (Redis) note, using memory:", error)
+    now = time.time()
+    with _COUNTER_LOCK:
+        count, expires_at = _COUNTERS.get(key, (0, 0.0))
+        if expires_at <= now:
+            count, expires_at = 0, now + ttl
+        count += 1
+        _COUNTERS[key] = (count, expires_at)
+        if len(_COUNTERS) > 50000:
+            for k in [k for k, (_, exp) in _COUNTERS.items() if exp <= now]:
+                _COUNTERS.pop(k, None)
+        return count
+
+
+def counter_get(key: str) -> int:
+    if redis_client is not None:
+        try:
+            return int(redis_client.get(f"ctr:{key}") or 0)
+        except Exception:
+            pass
+    with _COUNTER_LOCK:
+        count, expires_at = _COUNTERS.get(key, (0, 0.0))
+        return count if expires_at > time.time() else 0
+
+
+def counter_ttl(key: str) -> int:
+    if redis_client is not None:
+        try:
+            ttl = int(redis_client.ttl(f"ctr:{key}"))
+            if ttl > 0:
+                return ttl
+        except Exception:
+            pass
+    with _COUNTER_LOCK:
+        _, expires_at = _COUNTERS.get(key, (0, 0.0))
+        return max(1, int(expires_at - time.time()) + 1)
+
+
+def counter_reset(key: str):
+    if redis_client is not None:
+        try:
+            redis_client.delete(f"ctr:{key}")
+        except Exception:
+            pass
+    with _COUNTER_LOCK:
+        _COUNTERS.pop(key, None)
+
+
+def hash_token(raw: str) -> str:
+    """Verification/reset tokens are random, so an unsalted SHA-256 is enough: a database leak does not
+    reveal usable links."""
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _subject_key(value: str) -> str:
+    return hashlib.sha256(value.strip().lower().encode("utf-8")).hexdigest()[:32]
+
+
+def login_lock_key(email: str) -> str:
+    return f"lf:{_subject_key(email)}"
+
+
+def check_login_not_locked(email: str):
+    """Per-ACCOUNT lockout, on top of the per-IP rate limit: stops a distributed password-guessing attack.
+    The same counter runs for unknown emails, so the behaviour never reveals whether an account exists."""
+    key = login_lock_key(email)
+    if LOGIN_MAX_FAILURES > 0 and counter_get(key) >= LOGIN_MAX_FAILURES:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed sign-in attempts. Please wait a few minutes, or reset your password.",
+            headers={"Retry-After": str(counter_ttl(key))},
+        )
+
+
+def record_login_failure(email: str):
+    if LOGIN_MAX_FAILURES > 0:
+        counter_incr(login_lock_key(email), LOGIN_LOCK_SECONDS)
+
+
+def email_allowed(kind: str, email: str) -> bool:
+    """Caps how many emails one address can be sent per hour (stops email bombing). When over the cap the
+    email is silently skipped; the API response stays identical."""
+    if EMAIL_MAX_PER_HOUR <= 0:
+        return True
+    return counter_incr(f"em:{kind}:{_subject_key(email)}", 3600) <= EMAIL_MAX_PER_HOUR
+
+
+def _seconds_until_utc_midnight() -> int:
+    now = _utcnow()
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return max(1, int((tomorrow - now).total_seconds()))
+
+
+def enforce_ai_quota(request: Request, user_id: int | None):
+    """Daily caps on AI calls (they cost money): per signed-in account or per guest IP, plus a global cap.
+    Counted when a provider call is about to happen; cache hits are free."""
+    day = _utcnow().strftime("%Y%m%d")
+    ttl = _seconds_until_utc_midnight()
+    if user_id is not None:
+        subject_key, limit = f"ai:u:{user_id}:{day}", AI_DAILY_LIMIT_USER
+    else:
+        subject_key, limit = f"ai:ip:{_subject_key(get_client_ip(request))}:{day}", AI_DAILY_LIMIT_GUEST
+    if limit > 0 and counter_incr(subject_key, ttl) > limit:
+        raise HTTPException(
+            status_code=429,
+            detail="Daily AI usage limit reached. Please try again tomorrow." + (
+                "" if user_id is not None else " Signing in raises the limit."),
+            headers={"Retry-After": str(ttl)},
+        )
+    if AI_DAILY_LIMIT_GLOBAL > 0 and counter_incr(f"ai:g:{day}", ttl) > AI_DAILY_LIMIT_GLOBAL:
+        raise HTTPException(
+            status_code=429,
+            detail="The AI service is very busy right now. Please try again later.",
+            headers={"Retry-After": str(min(ttl, 3600))},
+        )
+
+
+# ============================================================
 # AUTHENTICATION ENDPOINTS
 # ============================================================
+
+REGISTER_MESSAGE = (
+    "Check your email. If this address can be registered, we have sent a link to verify it and finish creating your account."
+)
+
 
 @app.post(
     "/auth/register",
     tags=["Auth"],
     summary="Create an account",
-    description="Creates the account, sends a verification email, and signs you in (sets the `access_token` cookie). "
-                "Library and history sync stay locked (403) until the email is verified. Password: 8 to 128 characters.",
+    description="Starts account creation and emails a verification link (valid 48 hours). **It does not sign you in**: opening the link "
+                "(`POST /auth/verify-email`) verifies the address and signs you in. The response is identical whether or not the address "
+                "is already registered, so accounts cannot be discovered; an already-registered address receives a notice email instead. "
+                "Password: 8 to 128 characters. At most 3 emails per address per hour.",
     responses={
-        **_ok({"token": "<same value as the cookie>", "user": EXAMPLE_USER, "message": "Account created. A verification email has been sent."}, "Account created and signed in"),
-        **_err(400, "Invalid email, password too short/long, or the email is already registered.", "Password must be at least 8 characters."),
+        **_ok({"message": "Check your email. If this address can be registered, we have sent a link to verify it and finish creating your account."},
+              "Always the same message"),
+        **_err(400, "Invalid email, or password too short/long.", "Password must be at least 8 characters."),
         **E_RATE,
     },
 )
-def register(req: RegisterRequest, response: Response):
+def register(req: RegisterRequest, background_tasks: BackgroundTasks):
     email = req.email.strip().lower()
     if not EMAIL_RE.match(email) or len(email) > 255:
         raise HTTPException(status_code=400, detail="Invalid email address.")
@@ -969,36 +1179,31 @@ def register(req: RegisterRequest, response: Response):
     db = SessionLocal()
     try:
         existing = db.query(User).filter(User.email == email).first()
+        created = None
+        if not existing:
+            raw_token = secrets.token_urlsafe(32)
+            user = User(
+                email=email,
+                hashed_password=hash_password(req.password),
+                full_name=full_name,
+                is_verified=False,
+                verification_token=hash_token(raw_token),
+                verification_token_expires_at=_utcnow() + timedelta(hours=VERIFICATION_TOKEN_HOURS),
+            )
+            db.add(user)
+            try:
+                db.commit()
+                created = (user.email, raw_token, user.full_name)
+            except IntegrityError:  # two simultaneous sign-ups: the other one won
+                db.rollback()
+                existing = db.query(User).filter(User.email == email).first()
         if existing:
-            raise HTTPException(status_code=400, detail="An account with this email already exists.")
-
-        verification_token = secrets.token_urlsafe(32)
-        user = User(
-            email=email,
-            hashed_password=hash_password(req.password),
-            full_name=full_name,
-            is_verified=False,
-            verification_token=verification_token,
-        )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-
-        send_verification_email(user.email, verification_token, user.full_name)
-
-        token = create_access_token(user.id, user.email, user.hashed_password)
-        set_auth_cookie(response, token)
-
-        return {
-            "token": token,
-            "user": {
-                "id": user.id,
-                "email": user.email,
-                "full_name": user.full_name,
-                "is_verified": user.is_verified,
-            },
-            "message": "Account created. A verification email has been sent.",
-        }
+            hash_password(req.password)  # same work as creating an account, so timing does not reveal it
+            if email_allowed("register", email):
+                background_tasks.add_task(send_account_exists_email, existing.email, existing.full_name)
+        elif created and email_allowed("register", email):
+            background_tasks.add_task(send_verification_email, *created)
+        return {"message": REGISTER_MESSAGE}
     finally:
         db.close()
 
@@ -1007,23 +1212,30 @@ def register(req: RegisterRequest, response: Response):
     "/auth/login",
     tags=["Auth"],
     summary="Sign in",
-    description="Sets the `access_token` cookie. Wrong email and wrong password return the same 401 so accounts cannot be enumerated.",
+    description="Sets the `access_token` cookie (valid 14 days by default). Wrong email and wrong password return the same 401 so accounts "
+                "cannot be enumerated. After 5 failed attempts for one account within 15 minutes, further attempts get 429 until the window "
+                "ends (resetting the password clears it).",
     responses={
         **_ok({"token": "<same value as the cookie>", "user": {**EXAMPLE_USER, "is_verified": True}}, "Signed in"),
         **_err(401, "Invalid email or password.", "Invalid email or password."),
-        **E_RATE,
+        **_err(429, "Per-IP rate limit, or the account is temporarily locked after repeated failures. See Retry-After.",
+               "Too many failed sign-in attempts. Please wait a few minutes, or reset your password."),
     },
 )
 def login(req: LoginRequest, response: Response):
     email = req.email.strip().lower()
+    check_login_not_locked(email)
     db = SessionLocal()
     try:
         user = db.query(User).filter(User.email == email).first()
         if not user:
             verify_password(req.password, _DUMMY_HASH)  # same work as a real check: no timing oracle
+            record_login_failure(email)
             raise HTTPException(status_code=401, detail="Invalid email or password.")
         if not verify_password(req.password, user.hashed_password):
+            record_login_failure(email)
             raise HTTPException(status_code=401, detail="Invalid email or password.")
+        counter_reset(login_lock_key(email))
 
         if password_needs_rehash(user.hashed_password):
             user.hashed_password = hash_password(req.password)
@@ -1049,12 +1261,49 @@ def login(req: LoginRequest, response: Response):
     "/auth/logout",
     tags=["Auth"],
     summary="Sign out",
-    description="Clears the session cookie in this browser. Always succeeds, even if you were not signed in.",
+    description="Clears the cookie **and revokes this session on the server**, so a copied token stops working immediately. "
+                "Always succeeds, even if you were not signed in.",
     responses=_ok({"message": "Logged out successfully."}),
 )
-def logout(response: Response):
+def logout(request: Request, response: Response, authorization: str | None = Header(None)):
+    token = extract_token_from_request(request, authorization)
+    payload = verify_access_token(token) if token else None
+    if payload and payload.get("jti"):
+        db = SessionLocal()
+        try:
+            if not db.query(RevokedToken).filter(RevokedToken.jti == payload["jti"]).first():
+                expires = datetime.fromtimestamp(int(payload["exp"]), timezone.utc).replace(tzinfo=None)
+                db.add(RevokedToken(jti=payload["jti"], expires_at=expires))
+            db.query(RevokedToken).filter(RevokedToken.expires_at < _utcnow()).delete(synchronize_session=False)
+            db.commit()
+        except Exception as error:
+            db.rollback()
+            print("Session revocation note:", error)
+        finally:
+            db.close()
     clear_auth_cookie(response)
     return {"message": "Logged out successfully."}
+
+
+@app.post(
+    "/auth/logout-all",
+    tags=["Auth"],
+    summary="Sign out on every device",
+    description="Invalidates every session issued so far (including this one) and clears the cookie. Use it if a device was lost.",
+    responses={**_ok({"message": "Signed out on all devices."}), **E_401},
+)
+def logout_all(request: Request, response: Response, authorization: str | None = Header(None)):
+    uid = resolve_user_id(request, authorization, require_verified=False)
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == uid).first()
+        if user:
+            user.tokens_valid_after = _utcnow()
+            db.commit()
+    finally:
+        db.close()
+    clear_auth_cookie(response)
+    return {"message": "Signed out on all devices."}
 
 
 @app.get(
@@ -1101,12 +1350,15 @@ def verify_email(req: VerifyEmailRequest, response: Response):
 
     db = SessionLocal()
     try:
-        user = db.query(User).filter(User.verification_token == token).first()
+        user = db.query(User).filter(User.verification_token == hash_token(token)).first()
         if not user:
+            raise HTTPException(status_code=400, detail="Invalid or expired verification token.")
+        if user.verification_token_expires_at and user.verification_token_expires_at < _utcnow():
             raise HTTPException(status_code=400, detail="Invalid or expired verification token.")
 
         user.is_verified = True
         user.verification_token = None
+        user.verification_token_expires_at = None
         db.commit()
 
         send_welcome_email(user.email, user.full_name)
@@ -1135,16 +1387,18 @@ def verify_email(req: VerifyEmailRequest, response: Response):
     description="Always answers the same way, whether or not the address exists, so it cannot be used to discover accounts.",
     responses={**_ok({"message": "If the account exists and is unverified, a new link has been sent."}), **E_RATE},
 )
-def resend_verification(req: ResendVerificationRequest):
+def resend_verification(req: ResendVerificationRequest, background_tasks: BackgroundTasks):
     email = req.email.strip().lower()
     db = SessionLocal()
     try:
         user = db.query(User).filter(User.email == email).first()
+        token = secrets.token_urlsafe(32)
         if user and not user.is_verified:
-            token = secrets.token_urlsafe(32)
-            user.verification_token = token
+            user.verification_token = hash_token(token)
+            user.verification_token_expires_at = _utcnow() + timedelta(hours=VERIFICATION_TOKEN_HOURS)
             db.commit()
-            send_verification_email(user.email, token, user.full_name)
+            if email_allowed("verify", email):
+                background_tasks.add_task(send_verification_email, user.email, token, user.full_name)
         return {"message": "If the account exists and is unverified, a new link has been sent."}
     finally:
         db.close()
@@ -1157,17 +1411,18 @@ def resend_verification(req: ResendVerificationRequest):
     description="Emails a one-hour reset link if the address is registered. The response is identical either way.",
     responses={**_ok({"message": "If this email is registered, password reset instructions have been sent."}), **E_RATE},
 )
-def forgot_password(req: ForgotPasswordRequest):
+def forgot_password(req: ForgotPasswordRequest, background_tasks: BackgroundTasks):
     email = req.email.strip().lower()
     db = SessionLocal()
     try:
         user = db.query(User).filter(User.email == email).first()
+        reset_token = secrets.token_urlsafe(32)
         if user:
-            reset_token = secrets.token_urlsafe(32)
-            user.reset_token = reset_token
-            user.reset_token_expires_at = datetime.utcnow() + timedelta(hours=1)
+            user.reset_token = hash_token(reset_token)
+            user.reset_token_expires_at = _utcnow() + timedelta(hours=1)
             db.commit()
-            send_password_reset_email(user.email, reset_token, user.full_name)
+            if email_allowed("reset", email):
+                background_tasks.add_task(send_password_reset_email, user.email, reset_token, user.full_name)
         return {"message": "If this email is registered, password reset instructions have been sent."}
     finally:
         db.close()
@@ -1190,16 +1445,17 @@ def reset_password(req: ResetPasswordRequest):
     token = req.token.strip()
     db = SessionLocal()
     try:
-        user = db.query(User).filter(User.reset_token == token).first()
+        user = db.query(User).filter(User.reset_token == hash_token(token)).first()
         if not user:
             raise HTTPException(status_code=400, detail="Invalid password reset token.")
-        if not user.reset_token_expires_at or user.reset_token_expires_at < datetime.utcnow():
+        if not user.reset_token_expires_at or user.reset_token_expires_at < _utcnow():
             raise HTTPException(status_code=400, detail="Password reset token has expired.")
 
         user.hashed_password = hash_password(req.new_password)
         user.reset_token = None
         user.reset_token_expires_at = None
         db.commit()
+        counter_reset(login_lock_key(user.email))  # a locked-out owner can get back in by resetting
         return {"message": "Password reset successfully. You can now log in with your new password."}
     finally:
         db.close()
@@ -2302,7 +2558,7 @@ def get_search_history(
                 .all()
             )
         else:
-            if not session_id.strip() or session_id == "anonymous" or len(session_id) > 255:
+            if not SESSION_ID_RE.match(session_id):
                 return {"history": []}
             history = (
                 db.query(SearchHistory)
@@ -2355,7 +2611,7 @@ def delete_history_entry(
         if verified_user_id:
             query = query.filter(SearchHistory.user_id == verified_user_id)
         else:
-            if not session_id.strip() or session_id == "anonymous":
+            if not SESSION_ID_RE.match(session_id):
                 raise HTTPException(status_code=404, detail="History entry not found.")
             query = query.filter(SearchHistory.session_id == session_id, SearchHistory.user_id.is_(None))
         deleted = query.delete(synchronize_session=False)
@@ -2393,7 +2649,7 @@ def delete_search_history(
         if verified_user_id:
             db.query(SearchHistory).filter(SearchHistory.user_id == verified_user_id).delete(synchronize_session=False)
         else:
-            if not session_id.strip() or session_id == "anonymous" or len(session_id) > 255:
+            if not SESSION_ID_RE.match(session_id):
                 return {"message": "Nothing to delete."}
             db.query(SearchHistory).filter(
                 SearchHistory.session_id == session_id,
@@ -2630,6 +2886,8 @@ async def ask(
         )
         return cached_ask_response
 
+    enforce_ai_quota(req, verified_user_id)  # only real provider calls count; cache hits above are free
+
     user_prompt = f"Question: {request.question}\n\nPapers:\n{json.dumps(papers, indent=2)}"
     if request.conversation_history:
         history_str = "\n".join(
@@ -2711,7 +2969,7 @@ DEEP_DIVE_SCHEMA = {
                 "you send. With no abstract the endpoint answers without calling the AI. Open to guests.",
     responses={**_ok({"deep_dive": "## Summary\n..."}), **E_RATE, **E_AI},
 )
-async def deep_dive(request: DeepDiveRequest):
+async def deep_dive(request: DeepDiveRequest, req: Request, authorization: str | None = Header(None)):
     """Guest-friendly, rate limited. Analyses one paper from its title and abstract only."""
     gemini_client, groq_client = get_ai_clients()
 
@@ -2724,6 +2982,8 @@ async def deep_dive(request: DeepDiveRequest):
             "deep_dive": "No abstract is available for this paper, so a grounded analysis can't be generated. "
             "Open the paper through its DOI to read the full text."
         }
+
+    enforce_ai_quota(req, optional_user_id(req, authorization))
 
     user_prompt = f"Title: {title}\n\nAbstract:\n{abstract[:4000]}"
     retry_prompt = f"Title: {title}\n\nAbstract:\n{abstract[:1200]}\n\nKeep it under 150 words."
