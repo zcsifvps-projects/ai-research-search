@@ -576,3 +576,33 @@ def test_database_url_is_pinned_to_the_installed_driver(url, expected):
     assert main.normalize_database_url(url) == expected
     from sqlalchemy import create_engine
     assert create_engine(main.normalize_database_url(url)).dialect.driver in ("psycopg2", "pysqlite")
+
+
+# ---------------------------------------------------------------- no hardcoded domain
+
+def _print_setting(env_overrides, expr, drop=()):
+    env = {k: v for k, v in os.environ.items() if k not in drop}
+    env.update(env_overrides)
+    r = subprocess.run([sys.executable, "-c", f"import main; print('VALUE=' + str({expr}))"],
+                       cwd=os.path.dirname(os.path.abspath(__file__)), env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return [l for l in r.stdout.splitlines() if l.startswith("VALUE=")][0][6:]
+
+
+def test_mail_sender_is_derived_from_app_url_not_hardcoded():
+    out = _print_setting({"APP_URL": "https://example-host.test", "SMTP_FROM_EMAIL": ""}, "main.SMTP_FROM_EMAIL")
+    assert out == "noreply@example-host.test"
+
+
+def test_explicit_sender_and_contact_email_win():
+    env = {"APP_URL": "https://a.test", "SMTP_FROM_EMAIL": "hello@b.test", "CONTACT_EMAIL": "ops@c.test"}
+    assert _print_setting(env, "main.SMTP_FROM_EMAIL") == "hello@b.test"
+    assert _print_setting(env, "main.CONTACT_EMAIL") == "ops@c.test"
+    env.pop("CONTACT_EMAIL")
+    assert _print_setting({**env, "CONTACT_EMAIL": ""}, "main.CONTACT_EMAIL") == "hello@b.test"
+
+
+def test_backend_source_contains_no_hardcoded_site_domains():
+    source = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py"), encoding="utf-8").read().lower()
+    for banned in ("scholarpulse.org", "research.org", "example.com", "imosmart"):
+        assert banned not in source, f"hardcoded domain found in main.py: {banned}"

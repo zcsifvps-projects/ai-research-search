@@ -6,6 +6,7 @@ import hmac
 import json
 import math
 import os
+from urllib.parse import urlparse
 import re
 import secrets
 import smtplib
@@ -121,7 +122,12 @@ SMTP_HOST = os.getenv("SMTP_HOST", "smtp-relay.brevo.com").strip()
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USERNAME = os.getenv("SMTP_USERNAME", "").strip()
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()
-SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", "noreply@scholarpulse.org").strip()
+# No hardcoded domain: the sender defaults to noreply@<host of APP_URL>. Set SMTP_FROM_EMAIL to a sender
+# verified with your SMTP provider (and SPF/DKIM on your domain) so mail is actually delivered.
+_app_host = urlparse(APP_URL).hostname or "localhost"
+SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", "").strip() or f"noreply@{_app_host}"
+# Contact address sent to OpenAlex/Crossref/etc. ("polite pool"). Defaults to the sender address.
+CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "").strip() or SMTP_FROM_EMAIL
 SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "ScholarPulse Research").strip()
 
 
@@ -1382,7 +1388,7 @@ async def search_openalex(client, q, year_min=None, year_max=None, oa_only=False
     params = {
         "search": q.rstrip("?"),
         "per-page": 15,
-        "mailto": "scholarpulse@research.org",
+        "mailto": CONTACT_EMAIL,
     }
     # Filters are applied by OpenAlex itself, so the result slots are not wasted on papers we then discard.
     filters = []
@@ -1395,7 +1401,7 @@ async def search_openalex(client, q, year_min=None, year_max=None, oa_only=False
     if filters:
         params["filter"] = ",".join(filters)
     headers = {
-        "User-Agent": "ScholarPulse/1.0 (mailto:scholarpulse@research.org)"
+        "User-Agent": f"ScholarPulse/1.0 (mailto:{CONTACT_EMAIL})"
     }
 
     try:
@@ -1846,10 +1852,7 @@ async def search(
             timeout=timeout,
             follow_redirects=True,
             headers={
-                "User-Agent": (
-                    "AI-Research-Search/1.0 "
-                    "(mailto:research@example.com)"
-                )
+                "User-Agent": f"ScholarPulse/1.0 (mailto:{CONTACT_EMAIL})"
             },
         ) as client:
 

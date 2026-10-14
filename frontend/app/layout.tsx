@@ -19,7 +19,7 @@ const newsreader = Newsreader({
 });
 
 export const metadata: Metadata = {
-  metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000"),
+  metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL as string),
   title: "ScholarPulse — AI Academic Research & Literature Discovery",
   description: "Federated academic discovery across OpenAlex, Semantic Scholar, arXiv, Crossref, and CORE with multi-turn AI literature synthesis.",
   keywords: [

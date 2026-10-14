@@ -216,8 +216,8 @@ export default function Home() {
   const chatEndRef = useRef<HTMLDivElement>(null);
   const accountMenuRef = useRef<HTMLDivElement>(null);
 
-  const apiBaseUrl =
-    process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+  // Set at build time (see frontend/.env.example); next.config.ts refuses to start without it.
+  const apiBaseUrl = process.env.NEXT_PUBLIC_API_URL as string;
 
   // ============================================================
   // INITIALIZATION & URL PARAMETER HANDLING

@@ -1,14 +1,18 @@
 import type { NextConfig } from "next";
 
-// NEXT_PUBLIC_* values are inlined at BUILD time. Fail the production build loudly instead of
-// silently shipping a frontend that talks to localhost.
-if (process.env.NODE_ENV === "production") {
-  for (const name of ["NEXT_PUBLIC_API_URL", "NEXT_PUBLIC_APP_URL"]) {
-    if (!process.env[name]) {
-      throw new Error(
-        `${name} must be set when building for production (Docker: pass it as a build arg before "npm run build").`,
-      );
-    }
+// NEXT_PUBLIC_* values are inlined at BUILD time and there is no fallback anywhere in the code.
+// Fail immediately (dev, build and start) instead of silently shipping a frontend that talks to the wrong host.
+for (const name of ["NEXT_PUBLIC_API_URL", "NEXT_PUBLIC_APP_URL"]) {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(
+      `${name} is not set. Copy frontend/.env.example to frontend/.env.local (dev) or set it before "npm run build" (production / Docker build arg).`,
+    );
+  }
+  try {
+    new URL(value);
+  } catch {
+    throw new Error(`${name} must be a full URL such as https://example.com (got "${value}").`);
   }
 }
 
