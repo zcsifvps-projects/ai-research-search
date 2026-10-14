@@ -606,3 +606,65 @@ def test_backend_source_contains_no_hardcoded_site_domains():
     source = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py"), encoding="utf-8").read().lower()
     for banned in ("scholarpulse.org", "research.org", "example.com", "imosmart"):
         assert banned not in source, f"hardcoded domain found in main.py: {banned}"
+
+
+# ---------------------------------------------------------------- API documentation (OpenAPI)
+
+def _operations():
+    schema = main.app.openapi()
+    for path, ops in schema["paths"].items():
+        for method, op in ops.items():
+            yield method, path, op
+
+
+def test_every_route_is_documented_with_summary_description_and_tag():
+    ops = list(_operations())
+    assert len(ops) >= 20
+    for method, path, op in ops:
+        assert op.get("summary"), f"{method} {path}: summary missing"
+        assert len(op.get("description", "")) > 25, f"{method} {path}: description missing"
+        assert op.get("tags"), f"{method} {path}: tag missing"
+        assert "200" in op["responses"], f"{method} {path}: no documented 200 example"
+
+
+def test_protected_routes_document_401_and_verified_routes_document_403():
+    by_key = {(m, p): op for m, p, op in _operations()}
+    for key in main.PROTECTED_OPERATIONS:
+        op = by_key[key]
+        assert "401" in op["responses"], key
+        assert op.get("security") == [{"cookieAuth": []}], key
+    for key in [("post", "/bookmarks"), ("get", "/bookmarks"), ("delete", "/bookmarks/{bookmark_id}"), ("post", "/history/sync")]:
+        assert "403" in by_key[key]["responses"], key
+
+
+def test_rate_limited_and_ai_routes_document_their_errors():
+    by_key = {(m, p): op for m, p, op in _operations()}
+    for key in [("post", "/ask"), ("post", "/deep-dive")]:
+        assert {"429", "502", "503"} <= set(by_key[key]["responses"]), key
+    assert "429" in by_key[("post", "/auth/login")]["responses"]
+
+
+def test_documented_error_examples_never_leak_paths_or_secrets():
+    text = str(main.app.openapi()).lower()
+    for banned in (".env", "traceback", "gemini_api_key", "groq_api_key", "/home/", "uvicorn"):
+        assert banned not in text, banned
+
+
+def test_schema_declares_cookie_auth_and_tags():
+    schema = main.app.openapi()
+    assert schema["components"]["securitySchemes"]["cookieAuth"]["name"] == "access_token"
+    assert {t["name"] for t in schema["tags"]} == {"System", "Auth", "Search", "AI", "History", "Library"}
+    assert schema["info"]["title"] == "ScholarPulse API"
+
+
+def test_root_path_is_configurable_for_reverse_proxies():
+    out = _print_setting({"API_ROOT_PATH": "/api/"}, "main.app.openapi()['servers']")
+    assert out == "[{'url': '/api'}]"
+    assert _print_setting({"API_ROOT_PATH": ""}, "main.app.openapi().get('servers')") == "None"
+
+
+def test_interactive_docs_are_served_when_enabled():
+    out = _print_setting({"ENABLE_DOCS": "true"},
+                         "(lambda c: (c.get('/docs').status_code, c.get('/redoc').status_code, c.get('/openapi.json').status_code))"
+                         "(__import__('fastapi.testclient', fromlist=['x']).TestClient(main.app))")
+    assert out == "(200, 200, 200)"

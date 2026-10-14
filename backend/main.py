@@ -109,6 +109,9 @@ TRUSTED_PROXY_COUNT = int(os.getenv("TRUSTED_PROXY_COUNT", "0"))
 MAX_BODY_BYTES = int(os.getenv("MAX_BODY_BYTES", str(1_000_000)))
 ENABLE_DOCS = _env_bool("ENABLE_DOCS", DEV_MODE)  # /docs and /openapi.json are off in production by default
 ENABLE_RERANKING = _env_bool("ENABLE_RERANKING", True)
+# Path prefix when a reverse proxy strips it before forwarding (e.g. nginx "location /api/" -> API_ROOT_PATH=/api).
+# It makes the interactive docs call the right URLs. Leave empty when the API is served at the domain root.
+API_ROOT_PATH = os.getenv("API_ROOT_PATH", "").strip().rstrip("/")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
@@ -620,14 +623,148 @@ class RequestGuardMiddleware(BaseHTTPMiddleware):
 # FASTAPI APP
 # ============================================================
 
+def _err(code: int, description: str, detail: str) -> dict:
+    return {code: {"description": description, "content": {"application/json": {"example": {"detail": detail}}}}}
+
+
+def _ok(example: dict, description: str = "Success") -> dict:
+    return {200: {"description": description, "content": {"application/json": {"example": example}}}}
+
+
+E_RATE = _err(429, "Rate limit exceeded (see Rate limits). The Retry-After header says how many seconds to wait.",
+              "Too many requests. Please slow down and try again shortly.")
+E_401 = _err(401, "No valid session cookie, or the session expired or was invalidated.", "Authentication required.")
+E_403 = _err(403, "Signed in, but the email address is not verified yet.",
+             "Email verification required. Please verify your email to access this feature.")
+E_AI = {
+    **_err(502, "The AI provider failed twice (rate limit, invalid or truncated output). Details are only in the server log.",
+           "Couldn't generate an answer for this question. Please try rephrasing it."),
+    **_err(503, "No AI provider is configured on the server.",
+           "The AI service is temporarily unavailable. Please try again later."),
+}
+
+EXAMPLE_USER = {"id": 7, "email": "jane.doe@university.test", "full_name": "Jane Doe", "is_verified": False}
+EXAMPLE_PAPER = {
+    "title": "Sleep deprivation impairs memory consolidation",
+    "authors": ["A. Researcher", "B. Scientist"],
+    "description": "Journal of Sleep Research",
+    "publication_year": 2024,
+    "doi": "10.1234/abcd.5678",
+    "abstract": "We show that one night of sleep loss reduces next-day recall by 20 percent.",
+    "similarity_score": 0.83,
+    "is_open_access": True,
+}
+EXAMPLE_BOOKMARK = {
+    "id": 3, "user_id": 7, "title": EXAMPLE_PAPER["title"], "authors": EXAMPLE_PAPER["authors"],
+    "abstract": EXAMPLE_PAPER["abstract"], "publication_year": 2024, "source": "Journal of Sleep Research",
+    "doi": EXAMPLE_PAPER["doi"], "created_at": "2026-10-14T09:30:00",
+}
+
+API_DESCRIPTION = """
+ScholarPulse searches five academic databases at once (**OpenAlex, Semantic Scholar, arXiv, Crossref, CORE**) and
+writes a short answer **only from the abstracts of the papers it found**, with citations back to those papers.
+
+## Typical flow
+
+1. `GET /search?q=...` returns papers from all five sources (merged, de-duplicated, ranked).
+2. `POST /ask` sends the question plus those papers; you get a cited answer.
+3. `POST /deep-dive` analyses a single paper from its title and abstract.
+4. Optional: create an account to keep search history and a library of saved papers.
+
+## Authentication
+
+Sign-in uses a **signed, `HttpOnly` session cookie** named `access_token` (30 days). `POST /auth/login`,
+`/auth/register` and `/auth/verify-email` set it; `POST /auth/logout` clears it. Browsers and HTTP clients with a
+cookie jar (`curl -c jar.txt -b jar.txt`) send it automatically. A `Authorization: Bearer <token>` header with the same
+token value is also accepted for scripts. Identity is **only** ever taken from the cookie/token, never from a request body.
+
+| Who | Can do |
+|---|---|
+| **Guest** (no cookie) | `/search`, `/ask`, `/deep-dive`, and their own guest history via `session_id` |
+| **Signed in, unverified** | everything a guest can, plus `/auth/me`, change password, delete account |
+| **Signed in, verified** | everything above, plus `/bookmarks` and `/history/sync` |
+
+## Errors
+
+Every error is JSON: `{"detail": "human readable message"}`. Validation errors (`422`) use FastAPI's standard list in `detail`.
+Messages are deliberately generic: server paths, provider errors and stack traces are never returned.
+
+| Status | Meaning |
+|---|---|
+| 400 | The request is understood but not acceptable (e.g. weak password, empty question) |
+| 401 | Not signed in, or the session is no longer valid |
+| 403 | Signed in but email not verified |
+| 404 | Resource not found, or not yours |
+| 413 | Request body larger than the server limit (1 MB by default) |
+| 422 | A field is missing, too long, or the wrong type |
+| 429 | Rate limit hit; honour `Retry-After` |
+| 502 / 503 | The AI step failed / no AI provider configured |
+
+## Rate limits
+
+Per client IP, per minute, in a fixed window: `/ask` 30, `/deep-dive` 20, `/search` 60, `/auth/login` 10, `/auth/register` 10,
+`/auth/forgot-password` 5, `/auth/resend-verification` 5, `/auth/reset-password` 10, `/auth/verify-email` 10, other `/auth/*` 30,
+`/bookmarks` 60, everything else 150.
+
+## Filters
+
+`/search` accepts `year_min`, `year_max` and `open_access_only`. They are sent to each source so results are not wasted.
+**Open access** means a source confirmed it (OpenAlex flag, Semantic Scholar free PDF, arXiv and CORE always); Crossref cannot
+say, so it is skipped for open-access searches. Papers with an unknown year are dropped when a year filter is set.
+
+More: see `docs/api.md` in the repository for copy-paste examples in curl, JavaScript and Python.
+"""
+
+TAGS_METADATA = [
+    {"name": "System", "description": "Liveness and root."},
+    {"name": "Auth", "description": "Accounts and sessions. Sets or clears the `access_token` cookie."},
+    {"name": "Search", "description": "Federated search across five academic databases."},
+    {"name": "AI", "description": "Answers and paper analysis grounded in abstracts. Open to guests, rate limited."},
+    {"name": "History", "description": "Past questions and answers, per signed-in user or per guest `session_id`."},
+    {"name": "Library", "description": "Saved papers. Requires a verified account."},
+]
+
+PROTECTED_OPERATIONS = {
+    ("get", "/auth/me"), ("post", "/auth/change-password"), ("delete", "/auth/delete-account"),
+    ("post", "/history/sync"), ("post", "/bookmarks"), ("get", "/bookmarks"), ("delete", "/bookmarks/{bookmark_id}"),
+}
+
 app = FastAPI(
-    title="ScholarPulse AI Research Engine",
+    title="ScholarPulse API",
     version="1.0.0",
+    summary="Federated academic search with answers grounded in the papers' abstracts.",
+    description=API_DESCRIPTION,
+    openapi_tags=TAGS_METADATA,
+    root_path=API_ROOT_PATH,
     # Interactive docs reveal the full API surface: off in production unless ENABLE_DOCS=true.
     docs_url="/docs" if ENABLE_DOCS else None,
-    redoc_url=None,
+    redoc_url="/redoc" if ENABLE_DOCS else None,
     openapi_url="/openapi.json" if ENABLE_DOCS else None,
 )
+
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    from fastapi.openapi.utils import get_openapi
+
+    schema = get_openapi(
+        title=app.title, version=app.version, summary=app.summary, description=app.description,
+        routes=app.routes, tags=TAGS_METADATA, servers=[{"url": API_ROOT_PATH}] if API_ROOT_PATH else None,
+    )
+    schema.setdefault("components", {}).setdefault("securitySchemes", {})["cookieAuth"] = {
+        "type": "apiKey", "in": "cookie", "name": "access_token",
+        "description": "Set automatically by POST /auth/login (HttpOnly). Run login first; the docs then send it for you.",
+    }
+    for path, ops in schema.get("paths", {}).items():
+        for method, op in ops.items():
+            if (method, path) in PROTECTED_OPERATIONS:
+                op["security"] = [{"cookieAuth": []}]
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = custom_openapi
 
 # Starlette runs the LAST added middleware first (outermost). CORS must be outermost so that
 # 429 / 413 responses from the ones below it still carry CORS headers and the browser can read them.
@@ -687,14 +824,14 @@ def get_groq_client():
 # ============================================================
 
 class RegisterRequest(BaseModel):
-    email: str = Field(max_length=255)
-    password: str = Field(max_length=MAX_PASSWORD_LENGTH)
-    full_name: str | None = Field(default=None, max_length=255)
+    email: str = Field(max_length=255, examples=["jane.doe@university.test"])
+    password: str = Field(max_length=MAX_PASSWORD_LENGTH, description="8 to 128 characters.", examples=["a-long-passphrase"])
+    full_name: str | None = Field(default=None, max_length=255, examples=["Jane Doe"])
 
 
 class LoginRequest(BaseModel):
-    email: str = Field(max_length=255)
-    password: str = Field(max_length=MAX_PASSWORD_LENGTH)
+    email: str = Field(max_length=255, examples=["jane.doe@university.test"])
+    password: str = Field(max_length=MAX_PASSWORD_LENGTH, examples=["a-long-passphrase"])
 
 
 class VerifyEmailRequest(BaseModel):
@@ -734,15 +871,23 @@ class ConversationTurn(BaseModel):
 
 # Identity comes only from the signed cookie, never from the body: any extra "user_id" is ignored.
 class AskRequest(BaseModel):
-    question: str = Field(max_length=2000)
-    results: list[dict] = Field(max_length=50)
-    session_id: str = Field(default="anonymous", max_length=255)
+    question: str = Field(max_length=2000, examples=["Does sleep deprivation affect memory?"])
+    results: list[dict] = Field(
+        max_length=50,
+        description="Papers exactly as returned by GET /search (title, authors, abstract, publication_year, ...). Only papers with an abstract are used.",
+        examples=[[EXAMPLE_PAPER]],
+    )
+    session_id: str = Field(
+        default="anonymous", max_length=255,
+        description="A random id you generate once per browser/client (e.g. a UUID). Guest history is stored under it.",
+        examples=["3f9c2f0e-8c1a-4b7e-9a55-0d6d2f5c1a11"],
+    )
     conversation_history: list[ConversationTurn] = Field(default_factory=list, max_length=20)
 
 
 class DeepDiveRequest(BaseModel):
-    title: str = Field(max_length=500)
-    abstract: str = Field(max_length=10000)
+    title: str = Field(max_length=500, examples=[EXAMPLE_PAPER["title"]])
+    abstract: str = Field(max_length=10000, examples=[EXAMPLE_PAPER["abstract"]])
 
 
 class BookmarkCreateRequest(BaseModel):
@@ -768,12 +913,25 @@ def validate_new_password(password: str, label: str = "Password"):
 # BASIC ENDPOINTS
 # ============================================================
 
-@app.get("/")
+@app.get(
+    "/",
+    tags=["System"],
+    summary="API root",
+    description="Confirms the API process is up. Use `/health` for a database-backed check.",
+    responses=_ok({"message": "ScholarPulse AI Research API is running"}),
+)
 def root():
     return {"message": "ScholarPulse AI Research API is running"}
 
 
-@app.get("/health")
+@app.get(
+    "/health",
+    tags=["System"],
+    summary="Health check",
+    description="Runs `SELECT 1` against the database. Returns only `{\"status\": \"healthy\"}`; nothing about the "
+                "configuration is exposed. Use it for uptime monitors and load-balancer checks.",
+    responses={**_ok({"status": "healthy"}, "Healthy"), **_err(503, "The database is unreachable.", "unhealthy")},
+)
 def health():
     """Liveness/readiness probe. Deliberately exposes nothing about configuration."""
     try:
@@ -788,7 +946,18 @@ def health():
 # AUTHENTICATION ENDPOINTS
 # ============================================================
 
-@app.post("/auth/register")
+@app.post(
+    "/auth/register",
+    tags=["Auth"],
+    summary="Create an account",
+    description="Creates the account, sends a verification email, and signs you in (sets the `access_token` cookie). "
+                "Library and history sync stay locked (403) until the email is verified. Password: 8 to 128 characters.",
+    responses={
+        **_ok({"token": "<same value as the cookie>", "user": EXAMPLE_USER, "message": "Account created. A verification email has been sent."}, "Account created and signed in"),
+        **_err(400, "Invalid email, password too short/long, or the email is already registered.", "Password must be at least 8 characters."),
+        **E_RATE,
+    },
+)
 def register(req: RegisterRequest, response: Response):
     email = req.email.strip().lower()
     if not EMAIL_RE.match(email) or len(email) > 255:
@@ -834,7 +1003,17 @@ def register(req: RegisterRequest, response: Response):
         db.close()
 
 
-@app.post("/auth/login")
+@app.post(
+    "/auth/login",
+    tags=["Auth"],
+    summary="Sign in",
+    description="Sets the `access_token` cookie. Wrong email and wrong password return the same 401 so accounts cannot be enumerated.",
+    responses={
+        **_ok({"token": "<same value as the cookie>", "user": {**EXAMPLE_USER, "is_verified": True}}, "Signed in"),
+        **_err(401, "Invalid email or password.", "Invalid email or password."),
+        **E_RATE,
+    },
+)
 def login(req: LoginRequest, response: Response):
     email = req.email.strip().lower()
     db = SessionLocal()
@@ -866,13 +1045,25 @@ def login(req: LoginRequest, response: Response):
         db.close()
 
 
-@app.post("/auth/logout")
+@app.post(
+    "/auth/logout",
+    tags=["Auth"],
+    summary="Sign out",
+    description="Clears the session cookie in this browser. Always succeeds, even if you were not signed in.",
+    responses=_ok({"message": "Logged out successfully."}),
+)
 def logout(response: Response):
     clear_auth_cookie(response)
     return {"message": "Logged out successfully."}
 
 
-@app.get("/auth/me")
+@app.get(
+    "/auth/me",
+    tags=["Auth"],
+    summary="Current user",
+    description="Returns the signed-in user. Frontends call this on load to learn whether a session exists; a guest gets 401.",
+    responses={**_ok({"user": EXAMPLE_USER}), **E_401},
+)
 def get_current_user(request: Request, authorization: str | None = Header(None)):
     user_id = resolve_user_id(request, authorization, require_verified=False)
     db = SessionLocal()
@@ -892,7 +1083,17 @@ def get_current_user(request: Request, authorization: str | None = Header(None))
         db.close()
 
 
-@app.post("/auth/verify-email")
+@app.post(
+    "/auth/verify-email",
+    tags=["Auth"],
+    summary="Verify email address",
+    description="Consumes the one-time token from the verification email and signs you in.",
+    responses={
+        **_ok({"token": "<same value as the cookie>", "user": {**EXAMPLE_USER, "is_verified": True}, "message": "Email verified successfully! Welcome to ScholarPulse."}),
+        **_err(400, "Invalid or expired token.", "Invalid or expired verification token."),
+        **E_RATE,
+    },
+)
 def verify_email(req: VerifyEmailRequest, response: Response):
     token = req.token.strip()
     if not token:
@@ -927,7 +1128,13 @@ def verify_email(req: VerifyEmailRequest, response: Response):
         db.close()
 
 
-@app.post("/auth/resend-verification")
+@app.post(
+    "/auth/resend-verification",
+    tags=["Auth"],
+    summary="Resend the verification email",
+    description="Always answers the same way, whether or not the address exists, so it cannot be used to discover accounts.",
+    responses={**_ok({"message": "If the account exists and is unverified, a new link has been sent."}), **E_RATE},
+)
 def resend_verification(req: ResendVerificationRequest):
     email = req.email.strip().lower()
     db = SessionLocal()
@@ -943,7 +1150,13 @@ def resend_verification(req: ResendVerificationRequest):
         db.close()
 
 
-@app.post("/auth/forgot-password")
+@app.post(
+    "/auth/forgot-password",
+    tags=["Auth"],
+    summary="Request a password reset",
+    description="Emails a one-hour reset link if the address is registered. The response is identical either way.",
+    responses={**_ok({"message": "If this email is registered, password reset instructions have been sent."}), **E_RATE},
+)
 def forgot_password(req: ForgotPasswordRequest):
     email = req.email.strip().lower()
     db = SessionLocal()
@@ -960,7 +1173,17 @@ def forgot_password(req: ForgotPasswordRequest):
         db.close()
 
 
-@app.post("/auth/reset-password")
+@app.post(
+    "/auth/reset-password",
+    tags=["Auth"],
+    summary="Set a new password from a reset link",
+    description="Consumes the reset token. **All existing sessions are invalidated.**",
+    responses={
+        **_ok({"message": "Password reset successfully. You can now log in with your new password."}),
+        **_err(400, "Invalid or expired token, or weak password.", "Invalid or expired reset token."),
+        **E_RATE,
+    },
+)
 def reset_password(req: ResetPasswordRequest):
     validate_new_password(req.new_password)
 
@@ -982,7 +1205,17 @@ def reset_password(req: ResetPasswordRequest):
         db.close()
 
 
-@app.post("/auth/change-password")
+@app.post(
+    "/auth/change-password",
+    tags=["Auth"],
+    summary="Change password",
+    description="Requires the current password. Other sessions are invalidated; this one receives a fresh cookie.",
+    responses={
+        **_ok({"message": "Password updated successfully."}),
+        **_err(400, "Current password wrong or the new one is invalid.", "Current password is incorrect."),
+        **E_401,
+    },
+)
 def change_password(
     req: ChangePasswordRequest,
     request: Request,
@@ -1010,7 +1243,17 @@ def change_password(
         db.close()
 
 
-@app.delete("/auth/delete-account")
+@app.delete(
+    "/auth/delete-account",
+    tags=["Auth"],
+    summary="Delete the account and all its data",
+    description="Permanently deletes the user, bookmarks and history. The password is mandatory in the body.",
+    responses={
+        **_ok({"message": "Account and all associated data deleted successfully."}),
+        **_err(400, "Password confirmation incorrect.", "Password confirmation incorrect."),
+        **E_401,
+    },
+)
 def delete_account(
     req: DeleteAccountRequest,
     request: Request,
@@ -1039,7 +1282,14 @@ def delete_account(
         db.close()
 
 
-@app.post("/history/sync")
+@app.post(
+    "/history/sync",
+    tags=["History"],
+    summary="Attach guest history to your account",
+    description="Moves the unclaimed history of a guest `session_id` (created before you signed up) into your account. "
+                "Entries already owned by an account are never touched. Verified accounts only.",
+    responses={**_ok({"synced": 4}, "Number of entries claimed"), **E_401, **E_403},
+)
 def sync_search_history(
     req: SyncHistoryRequest,
     request: Request,
@@ -1071,7 +1321,14 @@ def sync_search_history(
 # BOOKMARKS / MY LIBRARY ENDPOINTS (REQUIRE VERIFIED EMAIL)
 # ============================================================
 
-@app.post("/bookmarks")
+@app.post(
+    "/bookmarks",
+    tags=["Library"],
+    summary="Save a paper",
+    description="Saves a paper to your library. Saving the same DOI (or title when there is no DOI) again returns the existing "
+                "entry with a `message` instead of creating a duplicate. Verified accounts only.",
+    responses={**_ok(EXAMPLE_BOOKMARK, "The saved (or already existing) bookmark"), **E_401, **E_403},
+)
 def create_bookmark(
     req: BookmarkCreateRequest,
     request: Request,
@@ -1131,7 +1388,13 @@ def create_bookmark(
         db.close()
 
 
-@app.get("/bookmarks")
+@app.get(
+    "/bookmarks",
+    tags=["Library"],
+    summary="List saved papers",
+    description="Your saved papers, newest first. Verified accounts only.",
+    responses={**_ok({"bookmarks": [EXAMPLE_BOOKMARK]}), **E_401, **E_403},
+)
 def list_bookmarks(
     request: Request,
     authorization: str | None = Header(None),
@@ -1165,7 +1428,13 @@ def list_bookmarks(
         db.close()
 
 
-@app.delete("/bookmarks/{bookmark_id}")
+@app.delete(
+    "/bookmarks/{bookmark_id}",
+    tags=["Library"],
+    summary="Remove a saved paper",
+    description="Removes one of **your** bookmarks. Someone else's id returns 404, the same as a missing one.",
+    responses={**_ok({"message": "Bookmark removed successfully."}), **E_401, **E_403, **_err(404, "Not found, or not yours.", "Bookmark not found.")},
+)
 def delete_bookmark(
     bookmark_id: int,
     request: Request,
@@ -1815,7 +2084,21 @@ def generate_ask_cache_key(question: str, papers: list[dict], conversation_histo
 # SEARCH ENDPOINT
 # ============================================================
 
-@app.get("/search")
+@app.get(
+    "/search",
+    tags=["Search"],
+    summary="Search five academic databases",
+    description="Searches OpenAlex, Semantic Scholar, arXiv, Crossref and CORE (CORE needs a server-side key), merges duplicates "
+                "by DOI or title, and ranks by semantic similarity when the embedding model is enabled. Open to guests.\n\n"
+                "`year_min` / `year_max` restrict the publication year (inclusive). `open_access_only=true` returns only papers a "
+                "source confirmed as open access (`is_open_access: true`). Papers without an abstract may be returned with "
+                "`abstract: null`; they are never used as evidence by `/ask`.",
+    responses={
+        **_ok({"query": "sleep and memory", "count": 1, "source_counts": {"OpenAlex": 1}, "results": [EXAMPLE_PAPER]}),
+        **_err(400, "Empty query.", "Query cannot be empty."),
+        **E_RATE,
+    },
+)
 async def search(
     q: str = Query(..., max_length=300),
     year_min: int | None = Query(default=None, ge=0, le=3000),
@@ -1990,7 +2273,16 @@ def save_search_history(
 # GET SEARCH HISTORY (SECURE & SCOPED)
 # ============================================================
 
-@app.get("/history/{session_id}")
+@app.get(
+    "/history/{session_id}",
+    tags=["History"],
+    summary="List past questions and answers",
+    description="**Signed in:** returns all your history (the `session_id` in the path is ignored). **Guest:** returns only the "
+                "entries filed under that `session_id`. A guest can never read an account's history.",
+    responses={**_ok({"history": [{"id": 12, "session_id": "3f9c...", "user_id": None, "question": "Does sleep affect memory?",
+                                   "answer": "Yes [1]...", "citations": [{"paper_id": 1, "title": "..."}], "papers": [EXAMPLE_PAPER],
+                                   "created_at": "2026-10-14T09:30:00"}]})},
+)
 def get_search_history(
     session_id: str,
     request: Request,
@@ -2041,7 +2333,13 @@ def get_search_history(
         db.close()
 
 
-@app.delete("/history/entry/{entry_id}")
+@app.delete(
+    "/history/entry/{entry_id}",
+    tags=["History"],
+    summary="Delete one history entry",
+    description="Signed in: deletes one of your entries. Guest: pass the entry's `session_id` as a query parameter.",
+    responses={**_ok({"message": "History entry deleted."}), **_err(404, "Not found, or not yours.", "History entry not found.")},
+)
 def delete_history_entry(
     entry_id: int,
     request: Request,
@@ -2075,7 +2373,13 @@ def delete_history_entry(
         db.close()
 
 
-@app.delete("/history/{session_id}")
+@app.delete(
+    "/history/{session_id}",
+    tags=["History"],
+    summary="Clear history",
+    description="Signed in: clears **all** your history. Guest: clears that `session_id`'s unclaimed entries.",
+    responses=_ok({"message": "Search history deleted successfully."}),
+)
 def delete_search_history(
     session_id: str,
     request: Request,
@@ -2246,7 +2550,22 @@ def sanitize_paper_for_storage(paper: dict) -> dict:
     }
 
 
-@app.post("/ask")
+@app.post(
+    "/ask",
+    tags=["AI"],
+    summary="Ask a question about papers",
+    description="Send the question and the papers from `/search` (up to 50; the first 6 with an abstract are used). The answer is written "
+                "**only from those abstracts** and cites them as `[1]`, `[2]`... by `paper_id` (their position in `results`, starting at 1). "
+                "Citations the model invents are dropped. Include earlier turns in `conversation_history` for follow-ups. "
+                "Identity comes from the cookie only: a `user_id` in the body is ignored. Signed-in answers are saved to your account, "
+                "guest answers to `session_id`. If the first AI attempt fails it is retried once with fewer papers.",
+    responses={
+        **_ok({"answer": "One night of sleep loss reduces next-day recall [1].", "citations": [{"paper_id": 1, "title": EXAMPLE_PAPER["title"]}]}),
+        **_err(400, "Empty question, or none of the papers has an abstract to base an answer on.",
+               "None of these papers include an abstract, so there is nothing to base an answer on. Try a different search."),
+        **E_RATE, **E_AI,
+    },
+)
 async def ask(
     request: AskRequest,
     req: Request,
@@ -2384,7 +2703,14 @@ DEEP_DIVE_SCHEMA = {
 }
 
 
-@app.post("/deep-dive")
+@app.post(
+    "/deep-dive",
+    tags=["AI"],
+    summary="Analyse one paper",
+    description="Markdown analysis (summary, key findings, methods, limitations, why it matters) written only from the title and abstract "
+                "you send. With no abstract the endpoint answers without calling the AI. Open to guests.",
+    responses={**_ok({"deep_dive": "## Summary\n..."}), **E_RATE, **E_AI},
+)
 async def deep_dive(request: DeepDiveRequest):
     """Guest-friendly, rate limited. Analyses one paper from its title and abstract only."""
     gemini_client, groq_client = get_ai_clients()
