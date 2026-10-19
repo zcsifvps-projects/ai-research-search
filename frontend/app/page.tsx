@@ -1,6 +1,8 @@
 "use client";
 
 import jsPDF from "jspdf";
+import { AnimatePresence, animate, motion, useMotionValue, useReducedMotion } from "motion/react";
+import { ModalPanel, ModalShell, SPRING, SlideUp, projectMomentum, useIsDesktop } from "./motion";
 import {
   ArrowRight,
   BookOpen,
@@ -142,6 +144,25 @@ export default function Home() {
 
   // Sidebar state: always starts collapsed on page load (open it with the toggle button)
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const isDesktop = useIsDesktop();
+  const reduceMotion = useReducedMotion();
+  // One motion value drives the sidebar's horizontal position, so the open/close spring and the
+  // finger-drag share it (and a flick's velocity carries straight into the spring).
+  const sidebarX = useMotionValue(-288);
+  const sidebarFirstRun = useRef(true);
+  const sidebarReleaseVelocity = useRef(0);
+  useEffect(() => {
+    const target = isDesktop || sidebarOpen ? 0 : -288;
+    if (sidebarFirstRun.current) {
+      sidebarFirstRun.current = false;
+      sidebarX.set(target); // no animation on first paint: the sidebar must simply start closed
+      return;
+    }
+    const velocity = sidebarReleaseVelocity.current;
+    sidebarReleaseVelocity.current = 0;
+    const controls = animate(sidebarX, target, reduceMotion ? { duration: 0.15 } : { ...SPRING, velocity });
+    return () => controls.stop();
+  }, [sidebarOpen, isDesktop, reduceMotion, sidebarX]);
   const [historySectionOpen, setHistorySectionOpen] = useState(true);
   const [librarySectionOpen, setLibrarySectionOpen] = useState(true);
 
@@ -1168,23 +1189,52 @@ export default function Home() {
   return (
     <div className="flex h-screen w-full overflow-hidden bg-[var(--bg-primary)] text-[var(--text-primary)]">
       {/* Mobile Sidebar Backdrop Overlay */}
-      {sidebarOpen && (
-        <div
-          onClick={() => setSidebarOpen(false)}
-          className="fixed inset-0 z-40 bg-black/60 backdrop-blur-xs md:hidden transition-opacity"
-        />
-      )}
+      <AnimatePresence>
+        {sidebarOpen && !isDesktop && (
+          <motion.div
+            key="sidebar-scrim"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.2 }}
+            onClick={() => setSidebarOpen(false)}
+            className="fixed inset-0 z-40 bg-black/50 backdrop-blur-xs"
+          />
+        )}
+      </AnimatePresence>
 
       {/* ======================================================== */}
       {/* 1. PERSISTENT & MOBILE SLIDE-OVER LEFT SIDEBAR */}
       {/* ======================================================== */}
-      <aside
-        className={`flex flex-col border-r border-[var(--border-color)] bg-[var(--bg-surface)] transition-all duration-200 z-50 ${
+      <motion.aside
+        key={isDesktop ? "sidebar-desktop" : "sidebar-mobile"}
+        initial={false}
+        inert={!sidebarOpen}
+        style={{ x: sidebarX }}
+        animate={{ width: isDesktop ? (sidebarOpen ? 288 : 0) : 288 }}
+        transition={reduceMotion ? { duration: 0.15 } : SPRING}
+        drag={!isDesktop && sidebarOpen ? "x" : false}
+        dragDirectionLock
+        dragConstraints={{ left: -288, right: 0 }}
+        dragElastic={{ left: 0.08, right: 0 }}
+        dragMomentum={false}
+        onDragEnd={(_, info) => {
+          // Decide from where a flick would come to rest, not from where the finger lifted.
+          const rest = info.offset.x + projectMomentum(info.velocity.x);
+          sidebarReleaseVelocity.current = info.velocity.x;
+          if (rest < -144) {
+            setSidebarOpen(false);
+          } else {
+            animate(sidebarX, 0, reduceMotion ? { duration: 0.15 } : { ...SPRING, velocity: info.velocity.x });
+          }
+        }}
+        className={`sp-sidebar flex flex-col bg-[var(--bg-surface)] z-50 overflow-hidden fixed inset-y-0 left-0 md:relative md:inset-auto ${
           sidebarOpen
-            ? "fixed inset-y-0 left-0 w-72 shadow-2xl md:relative md:w-72 md:shadow-none"
-            : "w-0 min-w-0 overflow-hidden border-none -translate-x-full md:translate-x-0"
+            ? "border-r border-[var(--border-color)] shadow-2xl md:shadow-none"
+            : ""
         }`}
       >
+        <div className="flex h-full w-72 flex-col">
         {/* Sidebar Header: Brand & New Search */}
         <div className="p-4 border-b border-[var(--border-color)] flex flex-col gap-3">
           <div className="flex items-center justify-between">
@@ -1454,7 +1504,8 @@ export default function Home() {
             )}
           </div>
         )}
-      </aside>
+        </div>
+      </motion.aside>
 
       {/* ======================================================== */}
       {/* 2. MAIN APPLICATION CONTENT AREA */}
@@ -2109,13 +2160,14 @@ export default function Home() {
                         return (
                           <div
                             key={idx}
+                            style={{ animationDelay: `${Math.min(idx, 8) * 40}ms` }}
                             onClick={() =>
                               setSelectedPaperForDetail({
                                 paper,
                                 index: idx,
                               })
                             }
-                            className={`p-4 rounded-xl border transition cursor-pointer hover:border-[var(--accent)]/50 ${
+                            className={`sp-rise p-4 rounded-xl border transition cursor-pointer hover:border-[var(--accent)]/50 ${
                               isSelected
                                 ? "bg-[var(--accent-light)]/40 border-[var(--accent)]"
                                 : "bg-[var(--bg-surface)] border-[var(--border-color)]"
@@ -2203,9 +2255,10 @@ export default function Home() {
       {/* ======================================================== */}
       {/* 3. SETTINGS MODAL */}
       {/* ======================================================== */}
+      <AnimatePresence>
       {settingsModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4">
-          <div className="w-full max-w-lg bg-[var(--bg-surface)] border border-[var(--border-color)] rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
+        <ModalShell key="settingsModalOpen" className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4">
+          <ModalPanel className="w-full max-w-lg bg-[var(--bg-surface)] border border-[var(--border-color)] rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
             <div className="p-4 border-b border-[var(--border-color)] flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Settings className="w-5 h-5 text-[var(--accent)]" />
@@ -2368,14 +2421,16 @@ export default function Home() {
                 </div>
               )}
             </div>
-          </div>
-        </div>
+          </ModalPanel>
+        </ModalShell>
       )}
+      </AnimatePresence>
 
       {/* Delete Confirmation Modal */}
+      <AnimatePresence>
       {deleteAccountModalOpen && (
-        <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
-          <div className="w-full max-w-sm bg-[var(--bg-surface)] border border-[var(--border-color)] rounded-2xl p-5 space-y-4 shadow-2xl">
+        <ModalShell key="deleteAccountModalOpen" className="fixed inset-0 z-60 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
+          <ModalPanel className="w-full max-w-sm bg-[var(--bg-surface)] border border-[var(--border-color)] rounded-2xl p-5 space-y-4 shadow-2xl">
             <h4 className="font-serif-heading text-base font-bold text-red-600">
               Confirm Account Deletion
             </h4>
@@ -2414,16 +2469,18 @@ export default function Home() {
                 </button>
               </div>
             </form>
-          </div>
-        </div>
+          </ModalPanel>
+        </ModalShell>
       )}
+      </AnimatePresence>
 
       {/* ======================================================== */}
       {/* 4. COMPLIANCE & POLICY MODALS */}
       {/* ======================================================== */}
+      <AnimatePresence>
       {activePolicyModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4">
-          <div className="w-full max-w-xl bg-[var(--bg-surface)] border border-[var(--border-color)] rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[85vh]">
+        <ModalShell key="activePolicyModal" className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4">
+          <ModalPanel className="w-full max-w-xl bg-[var(--bg-surface)] border border-[var(--border-color)] rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[85vh]">
             <div className="p-4 border-b border-[var(--border-color)] flex items-center justify-between">
               <h3 className="font-serif-heading text-base font-bold text-[var(--text-primary)]">
                 {activePolicyModal === "privacy" && "Privacy Policy"}
@@ -2527,18 +2584,21 @@ export default function Home() {
                 </div>
               )}
             </div>
-          </div>
-        </div>
+          </ModalPanel>
+        </ModalShell>
       )}
+      </AnimatePresence>
 
       {/* ======================================================== */}
       {/* 4b. COOKIE CONSENT BANNER (until a choice is stored) */}
       {/* ======================================================== */}
+      <AnimatePresence>
       {!cookieDecided && activePolicyModal !== "cookie_prefs" && (
-        <div
+        <SlideUp
+          key="cookie-banner"
           role="dialog"
           aria-label="Cookie consent"
-          className="fixed bottom-4 left-4 right-4 sm:left-auto sm:right-6 sm:bottom-6 sm:max-w-md z-[60] rounded-2xl border border-[var(--border-color)] bg-[var(--bg-surface)] shadow-2xl p-4 text-xs text-[var(--text-secondary)]"
+          className="glass fixed bottom-4 left-4 right-4 sm:left-auto sm:right-6 sm:bottom-6 sm:max-w-md z-[60] rounded-2xl border border-[var(--border-color)] shadow-2xl p-4 text-xs text-[var(--text-secondary)]"
         >
           <div className="flex items-start gap-3">
             <Cookie className="w-5 h-5 text-[var(--accent)] shrink-0 mt-0.5" />
@@ -2572,15 +2632,17 @@ export default function Home() {
               </div>
             </div>
           </div>
-        </div>
+        </SlideUp>
       )}
+      </AnimatePresence>
 
       {/* ======================================================== */}
       {/* 5. AUTH MODAL (LOGIN / REGISTER WITH FULL NAME) */}
       {/* ======================================================== */}
+      <AnimatePresence>
       {authModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4">
-          <div className="w-full max-w-sm bg-[var(--bg-surface)] border border-[var(--border-color)] rounded-2xl shadow-2xl p-6 space-y-4">
+        <ModalShell key="authModalOpen" className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4">
+          <ModalPanel className="w-full max-w-sm bg-[var(--bg-surface)] border border-[var(--border-color)] rounded-2xl shadow-2xl p-6 space-y-4">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <BookOpen className="w-5 h-5 text-[var(--accent)]" />
@@ -2706,16 +2768,18 @@ export default function Home() {
                 </div>
               )}
             </div>
-          </div>
-        </div>
+          </ModalPanel>
+        </ModalShell>
       )}
+      </AnimatePresence>
 
       {/* ======================================================== */}
       {/* 6. FORGOT PASSWORD MODAL */}
       {/* ======================================================== */}
+      <AnimatePresence>
       {forgotPasswordModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4">
-          <div className="w-full max-w-sm bg-[var(--bg-surface)] border border-[var(--border-color)] rounded-2xl shadow-2xl p-6 space-y-4">
+        <ModalShell key="forgotPasswordModalOpen" className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4">
+          <ModalPanel className="w-full max-w-sm bg-[var(--bg-surface)] border border-[var(--border-color)] rounded-2xl shadow-2xl p-6 space-y-4">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Key className="w-5 h-5 text-[var(--accent)]" />
@@ -2764,16 +2828,18 @@ export default function Home() {
                 {forgotLoading ? "Sending..." : "Send Reset Instructions"}
               </button>
             </form>
-          </div>
-        </div>
+          </ModalPanel>
+        </ModalShell>
       )}
+      </AnimatePresence>
 
       {/* ======================================================== */}
       {/* 7. RESET PASSWORD MODAL (FROM URL TOKEN) */}
       {/* ======================================================== */}
+      <AnimatePresence>
       {resetPasswordModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4">
-          <div className="w-full max-w-sm bg-[var(--bg-surface)] border border-[var(--border-color)] rounded-2xl shadow-2xl p-6 space-y-4">
+        <ModalShell key="resetPasswordModalOpen" className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4">
+          <ModalPanel className="w-full max-w-sm bg-[var(--bg-surface)] border border-[var(--border-color)] rounded-2xl shadow-2xl p-6 space-y-4">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Key className="w-5 h-5 text-[var(--accent)]" />
@@ -2834,14 +2900,16 @@ export default function Home() {
                 {resetLoading ? "Resetting..." : "Save New Password"}
               </button>
             </form>
-          </div>
-        </div>
+          </ModalPanel>
+        </ModalShell>
       )}
+      </AnimatePresence>
 
       {/* Soft Gate Modal */}
+      <AnimatePresence>
       {softGateModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
-          <div className="w-full max-w-sm bg-[var(--bg-surface)] border border-[var(--border-color)] rounded-2xl p-6 space-y-4 shadow-2xl text-center">
+        <ModalShell key="softGateModalOpen" className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
+          <ModalPanel className="w-full max-w-sm bg-[var(--bg-surface)] border border-[var(--border-color)] rounded-2xl p-6 space-y-4 shadow-2xl text-center">
             <div className="w-12 h-12 rounded-full bg-[var(--accent-light)] text-[var(--accent)] flex items-center justify-center mx-auto">
               <Sparkles className="w-6 h-6" />
             </div>
@@ -2871,9 +2939,10 @@ export default function Home() {
                 Maybe later
               </button>
             </div>
-          </div>
-        </div>
+          </ModalPanel>
+        </ModalShell>
       )}
+      </AnimatePresence>
     </div>
   );
 }
