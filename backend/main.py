@@ -2698,6 +2698,17 @@ def parse_ai_json(content: str | None, required_key: str) -> dict:
     return result
 
 
+def gemini_safe_schema(schema):
+    """Gemini's response_schema rejects JSON-Schema's `additionalProperties` (the SDK sends it as
+    `additional_properties`, which the API answers with 400 INVALID_ARGUMENT). Groq's strict mode
+    requires it, so the shared schemas keep it and the Gemini copy has it removed, recursively."""
+    if isinstance(schema, dict):
+        return {k: gemini_safe_schema(v) for k, v in schema.items() if k != "additionalProperties"}
+    if isinstance(schema, list):
+        return [gemini_safe_schema(v) for v in schema]
+    return schema
+
+
 def generate_structured_ai(
     gemini_client,
     groq_client,
@@ -2721,7 +2732,7 @@ def generate_structured_ai(
             ],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=response_schema,
+                response_schema=gemini_safe_schema(response_schema),
                 temperature=0.2,
                 max_output_tokens=AI_MAX_OUTPUT_TOKENS,
             ),
@@ -2748,12 +2759,21 @@ def generate_structured_ai(
         )
         return completion.choices[0].message.content
 
-    call = call_gemini if gemini_client else call_groq
-    try:
-        return parse_ai_json(call(user_prompt), required_key)
-    except Exception as first_error:
-        print("AI first attempt failed, retrying with a shorter prompt:", first_error)
-        return parse_ai_json(call(retry_prompt), required_key)
+    def attempt(call):
+        try:
+            return parse_ai_json(call(user_prompt), required_key)
+        except Exception as first_error:
+            print("AI first attempt failed, retrying with a shorter prompt:", first_error)
+            return parse_ai_json(call(retry_prompt), required_key)
+
+    if gemini_client:
+        try:
+            return attempt(call_gemini)
+        except Exception as gemini_error:
+            if not groq_client:
+                raise
+            print("Gemini failed, falling back to Groq:", gemini_error)
+    return attempt(call_groq)
 
 
 # ============================================================
