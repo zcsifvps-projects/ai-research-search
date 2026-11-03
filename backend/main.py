@@ -2672,7 +2672,7 @@ def delete_search_history(
 def get_ai_clients():
     """Pick the provider: Gemini first, Groq as fallback. 503 (generic text) if neither is configured."""
     gemini_client = get_gemini_client()
-    groq_client = get_groq_client() if not gemini_client else None
+    groq_client = get_groq_client()
     if not gemini_client and not groq_client:
         print(f"No AI API key configured. Set GEMINI_API_KEY or GROQ_API_KEY in {ENV_FILE}")  # server log only
         raise HTTPException(
@@ -2756,6 +2756,7 @@ def generate_structured_ai(
             },
             temperature=0.2,
             max_completion_tokens=AI_MAX_OUTPUT_TOKENS,
+            reasoning_effort="low",
         )
         return completion.choices[0].message.content
 
@@ -2763,6 +2764,9 @@ def generate_structured_ai(
         try:
             return parse_ai_json(call(user_prompt), required_key)
         except Exception as first_error:
+            text = str(first_error)
+            if "429" in text or "RESOURCE_EXHAUSTED" in text or "rate_limit" in text.lower():
+                raise  # quota/rate limit: retrying only burns more quota, fail over now
             print("AI first attempt failed, retrying with a shorter prompt:", first_error)
             return parse_ai_json(call(retry_prompt), required_key)
 
