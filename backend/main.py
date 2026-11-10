@@ -2165,7 +2165,7 @@ async def search_core(client, q, year_min=None, year_max=None, oa_only=False):
     if not CORE_API_KEY:
         print("CORE_API_KEY not configured. Skipping CORE.")
         return []
-    url = "https://api.core.ac.uk/v3/search/works"
+    url = "https://api.core.ac.uk/v3/search/works/"
     headers = {"Authorization": f"Bearer {CORE_API_KEY}"}
     query = q.rstrip("?")
     if year_min is not None:
