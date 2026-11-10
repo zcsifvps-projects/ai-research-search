@@ -1,4 +1,4 @@
-"""Security and behaviour tests for the ScholarPulse API.
+"""Security and behaviour tests for the API.
 
 Run from backend/:   pytest -q
 Uses a throwaway SQLite database and fake AI clients: no Postgres, Redis or API keys needed.
@@ -671,7 +671,7 @@ def test_schema_declares_cookie_auth_and_tags():
     schema = main.app.openapi()
     assert schema["components"]["securitySchemes"]["cookieAuth"]["name"] == "access_token"
     assert {t["name"] for t in schema["tags"]} == {"System", "Auth", "Search", "AI", "History", "Library"}
-    assert schema["info"]["title"] == "ScholarPulse API"
+    assert schema["info"]["title"] == f"{main.APP_NAME} API"
 
 
 def test_root_path_is_configurable_for_reverse_proxies():
@@ -957,3 +957,11 @@ def test_api_responses_carry_a_locked_down_csp(client):
     r = client.get("/")
     assert r.headers["content-security-policy"] == "default-src 'none'; frame-ancestors 'none'"
     assert r.headers["cache-control"] == "no-store"
+
+
+def test_app_name_comes_from_env_not_code():
+    env = {"APP_URL": "https://a.test", "APP_NAME": "Brand Test"}
+    assert _print_setting(env, "main.APP_NAME") == "Brand Test"
+    assert _print_setting(env, "main.SMTP_FROM_NAME") == "Brand Test"  # sender name follows the app name
+    assert _print_setting(env, "main.APP_UA_NAME") == "BrandTest"  # User-Agent token has no spaces
+    assert _print_setting({**env, "SMTP_FROM_NAME": "Team"}, "main.SMTP_FROM_NAME") == "Team"

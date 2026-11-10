@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono, Newsreader } from "next/font/google";
 import "./globals.css";
+import { APP_NAME, APP_TAGLINE } from "./brand";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -20,7 +21,7 @@ const newsreader = Newsreader({
 
 export const metadata: Metadata = {
   metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL as string),
-  title: "ScholarPulse — AI Academic Research & Literature Discovery",
+  title: `${APP_NAME}: ${APP_TAGLINE}`,
   description: "Federated academic discovery across OpenAlex, Semantic Scholar, arXiv, Crossref, and CORE with multi-turn AI literature synthesis.",
   keywords: [
     "academic search engine",
@@ -34,9 +35,9 @@ export const metadata: Metadata = {
     "citation generator",
     "bibtex"
   ],
-  authors: [{ name: "ScholarPulse Research" }],
-  creator: "ScholarPulse",
-  publisher: "ScholarPulse",
+  authors: [{ name: APP_NAME }],
+  creator: APP_NAME,
+  publisher: APP_NAME,
   alternates: {
     canonical: "/",
   },
@@ -46,27 +47,17 @@ export const metadata: Metadata = {
     apple: "/favicon.svg",
   },
   openGraph: {
-    title: "ScholarPulse — AI Academic Research & Literature Discovery",
+    title: `${APP_NAME}: ${APP_TAGLINE}`,
     description: "Federated academic discovery across OpenAlex, Semantic Scholar, arXiv, Crossref, and CORE with multi-turn AI literature synthesis.",
     url: "/",
-    siteName: "ScholarPulse",
+    siteName: APP_NAME,
     type: "website",
     locale: "en_US",
-    images: [
-      {
-        url: "/og-image.png",
-        width: 1200,
-        height: 630,
-        alt: "ScholarPulse: AI academic research engine",
-      },
-    ],
   },
   twitter: {
     card: "summary_large_image",
-    title: "ScholarPulse — AI Academic Research & Literature Discovery",
+    title: `${APP_NAME}: ${APP_TAGLINE}`,
     description: "Federated academic discovery across OpenAlex, Semantic Scholar, arXiv, Crossref, and CORE with multi-turn AI literature synthesis.",
-    creator: "@scholarpulse",
-    images: ["/og-image.png"],
   },
   robots: {
     index: true,

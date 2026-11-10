@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * Shared motion primitives for ScholarPulse.
+ * Shared motion primitives.
  *
  * Principles (Apple-style fluid interfaces, translated to the web):
  *  - Springs, not fixed-duration tweens: motion can be interrupted and reversed at any moment.

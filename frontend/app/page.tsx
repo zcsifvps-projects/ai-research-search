@@ -1,6 +1,7 @@
 "use client";
 
 import jsPDF from "jspdf";
+import { APP_NAME } from "./brand";
 import { AnimatePresence, animate, motion, useMotionValue, useReducedMotion } from "motion/react";
 import { ModalPanel, ModalShell, SPRING, SlideUp, projectMomentum, useIsDesktop } from "./motion";
 import {
@@ -448,7 +449,7 @@ export default function Home() {
       if (res.ok) {
         setVerificationBanner({
           type: "success",
-          message: "Your email has been verified! Welcome to ScholarPulse.",
+          message: `Your email has been verified! Welcome to ${APP_NAME}.`,
         });
         if (data.user) setUser(data.user);
         // Now that the account is verified: claim this browser's guest history and load saved data
@@ -1143,7 +1144,7 @@ export default function Home() {
     const doc = new jsPDF();
     doc.setFont("helvetica", "bold");
     doc.setFontSize(16);
-    doc.text("ScholarPulse Synthesis Report", 14, 20);
+    doc.text(`${APP_NAME} Synthesis Report`, 14, 20);
 
     doc.setFontSize(10);
     doc.setFont("helvetica", "normal");
@@ -1241,7 +1242,7 @@ export default function Home() {
             <div className="flex items-center gap-2">
               <BookOpen className="w-5 h-5 text-[var(--accent)]" />
               <span className="font-serif-heading text-lg font-bold tracking-tight text-[var(--text-primary)]">
-                ScholarPulse
+                {APP_NAME}
               </span>
             </div>
             <button
@@ -1552,7 +1553,7 @@ export default function Home() {
               <div className="flex items-center gap-2">
                 <BookOpen className="w-5 h-5 text-[var(--accent)]" />
                 <span className="font-serif-heading text-lg font-bold tracking-tight text-[var(--text-primary)]">
-                  ScholarPulse
+                  {APP_NAME}
                 </span>
               </div>
             )}
@@ -1741,7 +1742,7 @@ export default function Home() {
                 )}
 
                 <div className="pt-6 pb-6 border-t border-[var(--border-subtle)] flex flex-col sm:flex-row items-center justify-between text-[11px] text-[var(--text-muted)] gap-2">
-                  <div>© 2026 ScholarPulse Inc. All rights reserved.</div>
+                  <div>© 2026 {APP_NAME}. All rights reserved.</div>
                   <div>Federated academic discovery across five academic databases.</div>
                   <div>
                     Developed by{" "}
@@ -1774,7 +1775,7 @@ export default function Home() {
                       }`}
                     >
                       <div className="flex items-center gap-2 mb-1 text-[11px] text-[var(--text-muted)]">
-                        <span>{m.role === "user" ? "You" : "ScholarPulse AI"}</span>
+                        <span>{m.role === "user" ? "You" : `${APP_NAME} AI`}</span>
                         <span>•</span>
                         <span>{m.timestamp}</span>
                         {m.scopedPaperIds && m.scopedPaperIds.length > 0 && (
@@ -2501,7 +2502,7 @@ export default function Home() {
                 <>
                   <p className="font-semibold text-[var(--text-primary)]">Last updated: September 2026</p>
                   <p>
-                    ScholarPulse is committed to protecting your academic research privacy. We process query metadata strictly to provide federated academic search, citation generation, and synthesized literature insights.
+                    {APP_NAME} is committed to protecting your academic research privacy. We process query metadata strictly to provide federated academic search, citation generation, and synthesized literature insights.
                   </p>
                   <h4 className="font-bold text-[var(--text-primary)]">Data Collection & Use</h4>
                   <p>
@@ -2518,7 +2519,7 @@ export default function Home() {
                 <>
                   <p className="font-semibold text-[var(--text-primary)]">Last updated: September 2026</p>
                   <p>
-                    By using ScholarPulse, you agree to comply with standard academic integrity and acceptable use guidelines.
+                    By using {APP_NAME}, you agree to comply with standard academic integrity and acceptable use guidelines.
                   </p>
                   <h4 className="font-bold text-[var(--text-primary)]">Academic Synthesis Disclaimer</h4>
                   <p>
@@ -2572,7 +2573,7 @@ export default function Home() {
                   </div>
 
                   <p className="text-[11px] text-[var(--text-muted)]">
-                    ScholarPulse does not use analytics or advertising cookies.
+                    {APP_NAME} does not use analytics or advertising cookies.
                   </p>
 
                   <button
@@ -2915,7 +2916,7 @@ export default function Home() {
             </div>
 
             <h3 className="font-serif-heading text-lg font-bold text-[var(--text-primary)]">
-              Enjoying ScholarPulse?
+              Enjoying {APP_NAME}?
             </h3>
 
             <p className="text-xs text-[var(--text-secondary)] leading-relaxed">

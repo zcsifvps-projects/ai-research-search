@@ -1,4 +1,4 @@
-# ScholarPulse API guide
+# ImoSmart API guide
 
 A REST API over JSON. Search five academic databases at once, then get an answer written **only from the papers' abstracts**, with citations.
 

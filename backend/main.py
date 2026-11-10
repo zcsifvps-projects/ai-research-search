@@ -148,7 +148,11 @@ _app_host = urlparse(APP_URL).hostname or "localhost"
 SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", "").strip() or f"noreply@{_app_host}"
 # Contact address sent to OpenAlex/Crossref/etc. ("polite pool"). Defaults to the sender address.
 CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "").strip() or SMTP_FROM_EMAIL
-SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "ScholarPulse Research").strip()
+# Product name shown in emails, API docs and the User-Agent sent to the academic APIs. Comes from env so the
+# brand (which may match the domain) is never hardcoded. Set APP_NAME in backend/.env.
+APP_NAME = os.getenv("APP_NAME", "").strip() or "Research Engine"
+APP_UA_NAME = "".join(ch for ch in APP_NAME if ch.isalnum()) or "ResearchEngine"
+SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "").strip() or APP_NAME
 
 
 # ============================================================
@@ -507,7 +511,7 @@ def send_verification_email(to_email: str, token: str, full_name: str | None = N
     greeting = f"Hello {full_name}," if full_name else "Hello,"
     html = f"""
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #E4DCCB; border-radius: 12px; background-color: #FAF6EF;">
-      <h2 style="color: #7C2A2A; margin-top: 0;">ScholarPulse — Verify Your Account</h2>
+      <h2 style="color: #7C2A2A; margin-top: 0;">{APP_NAME}: Verify Your Account</h2>
       <p style="color: #221D18; font-size: 14px; line-height: 1.6;">{greeting}</p>
       <p style="color: #221D18; font-size: 14px; line-height: 1.6;">Please verify your email address to unlock research bookmarks and synchronization.</p>
       <div style="text-align: center; margin: 30px 0;">
@@ -517,12 +521,12 @@ def send_verification_email(to_email: str, token: str, full_name: str | None = N
       <p style="color: #6E6459; font-size: 11px; word-break: break-all;"><a href="{verify_url}" style="color: #7C2A2A;">{verify_url}</a></p>
     </div>
     """
-    text = f"{greeting}\n\nPlease verify your ScholarPulse account at:\n{verify_url}\n"
-    return send_email(to_email, "Verify your ScholarPulse account", html, text)
+    text = f"{greeting}\n\nPlease verify your {APP_NAME} account at:\n{verify_url}\n"
+    return send_email(to_email, f"Verify your {APP_NAME} account", html, text)
 
 
 def send_welcome_email(to_email: str, full_name: str | None = None):
-    greeting = f"Welcome {full_name}!" if full_name else "Welcome to ScholarPulse!"
+    greeting = f"Welcome {full_name}!" if full_name else f"Welcome to {APP_NAME}!"
     html = f"""
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #E4DCCB; border-radius: 12px; background-color: #FAF6EF;">
       <h2 style="color: #7C2A2A; margin-top: 0;">{greeting}</h2>
@@ -534,20 +538,20 @@ def send_welcome_email(to_email: str, full_name: str | None = None):
     </div>
     """
     text = f"{greeting}\n\nYour account is active. Explore research at {APP_URL}\n"
-    return send_email(to_email, "Welcome to ScholarPulse Research Engine", html, text)
+    return send_email(to_email, f"Welcome to {APP_NAME}", html, text)
 
 
 def send_account_exists_email(to_email: str, full_name: str | None = None):
     greeting = f"Hello {full_name}," if full_name else "Hello,"
     html = f"""
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #E4DCCB; border-radius: 12px; background-color: #FAF6EF;">
-      <h2 style="color: #7C2A2A; margin-top: 0;">ScholarPulse — You already have an account</h2>
+      <h2 style="color: #7C2A2A; margin-top: 0;">{APP_NAME}: You already have an account</h2>
       <p style="color: #221D18; font-size: 14px; line-height: 1.6;">{greeting}</p>
-      <p style="color: #221D18; font-size: 14px; line-height: 1.6;">Someone tried to create a ScholarPulse account with this email address, which is already registered. If that was you, just <a href="{APP_URL}" style="color: #7C2A2A;">sign in</a> (or use "Forgot password" on the sign-in form). If it wasn't you, you can ignore this message; nothing was changed.</p>
+      <p style="color: #221D18; font-size: 14px; line-height: 1.6;">Someone tried to create a {APP_NAME} account with this email address, which is already registered. If that was you, just <a href="{APP_URL}" style="color: #7C2A2A;">sign in</a> (or use "Forgot password" on the sign-in form). If it wasn't you, you can ignore this message; nothing was changed.</p>
     </div>
     """
-    text = f"{greeting}\n\nSomeone tried to create a ScholarPulse account with this email, which is already registered. If that was you, sign in at {APP_URL} (or use Forgot password). If not, ignore this message.\n"
-    return send_email(to_email, "You already have a ScholarPulse account", html, text)
+    text = f"{greeting}\n\nSomeone tried to create a {APP_NAME} account with this email, which is already registered. If that was you, sign in at {APP_URL} (or use Forgot password). If not, ignore this message.\n"
+    return send_email(to_email, f"You already have a {APP_NAME} account", html, text)
 
 
 def send_password_reset_email(to_email: str, token: str, full_name: str | None = None):
@@ -555,7 +559,7 @@ def send_password_reset_email(to_email: str, token: str, full_name: str | None =
     greeting = f"Hello {full_name}," if full_name else "Hello,"
     html = f"""
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #E4DCCB; border-radius: 12px; background-color: #FAF6EF;">
-      <h2 style="color: #7C2A2A; margin-top: 0;">ScholarPulse — Reset Password</h2>
+      <h2 style="color: #7C2A2A; margin-top: 0;">{APP_NAME}: Reset Password</h2>
       <p style="color: #221D18; font-size: 14px; line-height: 1.6;">{greeting}</p>
       <p style="color: #221D18; font-size: 14px; line-height: 1.6;">Click the button below to reset your password. This link is valid for 1 hour.</p>
       <div style="text-align: center; margin: 30px 0;">
@@ -566,7 +570,7 @@ def send_password_reset_email(to_email: str, token: str, full_name: str | None =
     </div>
     """
     text = f"{greeting}\n\nReset your password within 1 hour at:\n{reset_url}\n"
-    return send_email(to_email, "Reset your ScholarPulse password", html, text)
+    return send_email(to_email, f"Reset your {APP_NAME} password", html, text)
 
 
 # ============================================================
@@ -715,7 +719,7 @@ EXAMPLE_BOOKMARK = {
 }
 
 API_DESCRIPTION = """
-ScholarPulse searches five academic databases at once (**OpenAlex, Semantic Scholar, arXiv, Crossref, CORE**) and
+__APP_NAME__ searches five academic databases at once (**OpenAlex, Semantic Scholar, arXiv, Crossref, CORE**) and
 writes a short answer **only from the abstracts of the papers it found**, with citations back to those papers.
 
 ## Typical flow
@@ -788,8 +792,10 @@ PROTECTED_OPERATIONS = {
     ("post", "/history/sync"), ("post", "/bookmarks"), ("get", "/bookmarks"), ("delete", "/bookmarks/{bookmark_id}"),
 }
 
+API_DESCRIPTION = API_DESCRIPTION.replace("__APP_NAME__", APP_NAME)
+
 app = FastAPI(
-    title="ScholarPulse API",
+    title=f"{APP_NAME} API",
     version="1.0.0",
     summary="Federated academic search with answers grounded in the papers' abstracts.",
     description=API_DESCRIPTION,
@@ -984,10 +990,10 @@ def validate_new_password(password: str, label: str = "Password"):
     tags=["System"],
     summary="API root",
     description="Confirms the API process is up. Use `/health` for a database-backed check.",
-    responses=_ok({"message": "ScholarPulse AI Research API is running"}),
+    responses=_ok({"message": f"{APP_NAME} API is running"}),
 )
 def root():
-    return {"message": "ScholarPulse AI Research API is running"}
+    return {"message": f"{APP_NAME} API is running"}
 
 
 @app.get(
@@ -1338,7 +1344,7 @@ def get_current_user(request: Request, authorization: str | None = Header(None))
     summary="Verify email address",
     description="Consumes the one-time token from the verification email and signs you in.",
     responses={
-        **_ok({"token": "<same value as the cookie>", "user": {**EXAMPLE_USER, "is_verified": True}, "message": "Email verified successfully! Welcome to ScholarPulse."}),
+        **_ok({"token": "<same value as the cookie>", "user": {**EXAMPLE_USER, "is_verified": True}, "message": f"Email verified successfully! Welcome to {APP_NAME}."}),
         **_err(400, "Invalid or expired token.", "Invalid or expired verification token."),
         **E_RATE,
     },
@@ -1374,7 +1380,7 @@ def verify_email(req: VerifyEmailRequest, response: Response):
                 "full_name": user.full_name,
                 "is_verified": True,
             },
-            "message": "Email verified successfully! Welcome to ScholarPulse.",
+            "message": f"Email verified successfully! Welcome to {APP_NAME}.",
         }
     finally:
         db.close()
@@ -1926,7 +1932,7 @@ async def search_openalex(client, q, year_min=None, year_max=None, oa_only=False
     if filters:
         params["filter"] = ",".join(filters)
     headers = {
-        "User-Agent": f"ScholarPulse/1.0 (mailto:{CONTACT_EMAIL})"
+        "User-Agent": f"{APP_UA_NAME}/1.0 (mailto:{CONTACT_EMAIL})"
     }
 
     try:
@@ -2391,7 +2397,7 @@ async def search(
             timeout=timeout,
             follow_redirects=True,
             headers={
-                "User-Agent": f"ScholarPulse/1.0 (mailto:{CONTACT_EMAIL})"
+                "User-Agent": f"{APP_UA_NAME}/1.0 (mailto:{CONTACT_EMAIL})"
             },
         ) as client:
 

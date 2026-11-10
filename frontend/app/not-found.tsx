@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { BookOpen, ArrowRight, Search } from "lucide-react";
+import { APP_NAME } from "./brand";
 
 export default function NotFound() {
   return (
@@ -33,7 +34,7 @@ export default function NotFound() {
         </div>
 
         <div className="pt-4 border-t border-[var(--border-subtle)] text-[11px] text-[var(--text-muted)]">
-          ScholarPulse — Federated Discovery Across Five Academic Databases
+          {APP_NAME}: Federated Discovery Across Five Academic Databases
         </div>
       </div>
     </div>

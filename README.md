@@ -1,6 +1,6 @@
-# ScholarPulse — AI Academic Research Search
+# ImoSmart: AI Academic Research Search
 
-ScholarPulse is an AI-assisted academic discovery and literature-synthesis application. It searches multiple scholarly indexes, combines and deduplicates results, applies optional publication-year and open-access filters, and can produce concise answers grounded in the abstracts returned by those sources.
+ImoSmart is an AI-assisted academic discovery and literature-synthesis application. It searches multiple scholarly indexes, combines and deduplicates results, applies optional publication-year and open-access filters, and can produce concise answers grounded in the abstracts returned by those sources.
 
 The project includes a Next.js web interface and a FastAPI service. Accounts support email verification, login, password reset/change, saved bookmarks, and synchronized search history. Guest users can search and ask questions subject to server-side rate limits.
 
@@ -35,7 +35,7 @@ The project includes a Next.js web interface and a FastAPI service. Accounts sup
 
 ## Product overview
 
-ScholarPulse is designed to help students, academics, and researchers discover literature without manually searching each provider one at a time. A user enters a topic or question, ScholarPulse queries academic sources, normalizes and deduplicates the results, and displays a combined result set. The user can then ask a question about the retrieved papers or request a deeper analysis of an individual paper.
+ImoSmart is designed to help students, academics, and researchers discover literature without manually searching each provider one at a time. A user enters a topic or question, ImoSmart queries academic sources, normalizes and deduplicates the results, and displays a combined result set. The user can then ask a question about the retrieved papers or request a deeper analysis of an individual paper.
 
 The AI synthesis feature is deliberately constrained: only papers with abstracts are supplied as evidence for answers, and returned citations are checked against the supplied paper list. This improves traceability but does not guarantee that every generated statement is correct. Users should open and read the original publication before relying on a result in academic or professional work.
 
@@ -579,7 +579,7 @@ For a production deployment with real accounts, add and test a versioned migrati
 
 ## Academic data providers
 
-ScholarPulse integrates the following sources:
+ImoSmart integrates the following sources:
 
 | Provider | Use | Notes |
 |---|---|---|
