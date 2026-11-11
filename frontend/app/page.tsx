@@ -35,7 +35,6 @@ import {
   Info,
   Key,
   Layers,
-  Library,
   LogOut,
   Mail,
   Moon,
@@ -51,7 +50,6 @@ import {
   Square,
   Sun,
   Trash2,
-  User as UserIcon,
   X
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
@@ -168,6 +166,17 @@ type Citation = {
   title: string;
 };
 
+type AnswerMode = "quick" | "deep" | "medical";
+type ResearchMode = "auto" | AnswerMode;
+type MeterLabel = "yes" | "no" | "possibly";
+type Meter = {
+  yes: number;
+  no: number;
+  possibly: number;
+  total: number;
+  labels: { paper_id: number; label: MeterLabel }[];
+};
+
 type Message = {
   id: string;
   role: "user" | "assistant";
@@ -175,7 +184,107 @@ type Message = {
   citations?: Citation[];
   timestamp: string;
   scopedPaperIds?: number[];
+  // Phase 3: how the answer was made, for the label, the meter and the Go deeper / quick fallback buttons.
+  mode?: AnswerMode;
+  modeLabel?: string;
+  subQueries?: string[];
+  meter?: Meter | null;
+  question?: string;
+  offerQuick?: boolean;
 };
+
+const MODE_OPTIONS: { value: ResearchMode; label: string; hint: string }[] = [
+  { value: "auto", label: "Auto", hint: "Picks Quick, Deep or Medical from your question" },
+  { value: "quick", label: "Quick", hint: "One search, a short answer from the top papers" },
+  { value: "deep", label: "Deep", hint: "3 to 5 searches and a structured review (takes longer)" },
+  { value: "medical", label: "Medical", hint: "Ranks meta-analyses, reviews and trials first; not medical advice" },
+];
+
+const METER_STYLES: Record<MeterLabel, { label: string; bar: string; text: string }> = {
+  yes: { label: "Yes", bar: "bg-emerald-500", text: "text-emerald-600" },
+  possibly: { label: "Possibly", bar: "bg-amber-400", text: "text-amber-600" },
+  no: { label: "No", bar: "bg-red-500", text: "text-red-600" },
+};
+
+function now(): string {
+  return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+let messageCounter = 0;
+function newMessageId(tag = "msg"): string {
+  messageCounter += 1;
+  return `${tag}-${Date.now()}-${messageCounter}`;
+}
+
+function errorMessage(err: unknown, fallback: string): string {
+  return err instanceof Error && err.message ? err.message : fallback;
+}
+
+// Paper ids in an answer refer to the list sent with it. Scoped follow-ups send a subset, so map back to positions
+// in the full results list (what the cards and the detail view use).
+function toResultIds(meter: Meter | null | undefined, sent: Result[], all: Result[]): Meter | null {
+  if (!meter) return null;
+  const labels = meter.labels
+    .map((item) => ({ ...item, paper_id: all.indexOf(sent[item.paper_id - 1]) + 1 }))
+    .filter((item) => item.paper_id > 0);
+  return { ...meter, labels };
+}
+
+function EvidenceMeter({ meter, onOpenPaper }: { meter: Meter; onOpenPaper: (paperId: number) => void }) {
+  const [open, setOpen] = useState<MeterLabel | null>(null);
+  const order: MeterLabel[] = ["yes", "possibly", "no"];
+  const pct = (n: number) => Math.round((n / meter.total) * 100);
+  return (
+    <div className="mt-4 pt-3 border-t border-[var(--border-color)]">
+      <div className="text-xs font-semibold text-[var(--text-secondary)] mb-2">
+        What the papers say (based on {meter.total} papers)
+      </div>
+      <div className="flex h-2.5 w-full overflow-hidden rounded-full bg-[var(--bg-surface-elevated)]" aria-hidden="true">
+        {order.map((key) =>
+          meter[key] > 0 ? (
+            <div key={key} className={METER_STYLES[key].bar} style={{ width: `${pct(meter[key])}%` }} />
+          ) : null
+        )}
+      </div>
+      <div className="mt-2 flex flex-wrap gap-2 text-xs">
+        {order.map((key) => (
+          <button
+            key={key}
+            type="button"
+            disabled={meter[key] === 0}
+            onClick={() => setOpen(open === key ? null : key)}
+            aria-expanded={open === key}
+            className={`px-2 py-0.5 rounded-md border border-[var(--border-color)] hover:bg-[var(--bg-surface-elevated)] disabled:opacity-50 transition ${
+              open === key ? "bg-[var(--bg-surface-elevated)]" : ""
+            }`}
+          >
+            <span className={`font-semibold ${METER_STYLES[key].text}`}>{pct(meter[key])}% {METER_STYLES[key].label}</span>
+            <span className="text-[var(--text-muted)]"> ({meter[key]})</span>
+          </button>
+        ))}
+      </div>
+      {open && (
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          {meter.labels
+            .filter((item) => item.label === open)
+            .map((item) => (
+              <button
+                key={item.paper_id}
+                type="button"
+                onClick={() => onOpenPaper(item.paper_id)}
+                className="text-xs px-2 py-0.5 rounded-md border border-[var(--border-color)] bg-[var(--bg-surface-elevated)] hover:text-[var(--accent)] transition font-semibold"
+              >
+                [{item.paper_id}]
+              </button>
+            ))}
+        </div>
+      )}
+      <div className="mt-2 text-[11px] text-[var(--text-muted)]">
+        AI labels from abstracts only, not a vote on the truth. Check the papers before relying on it.
+      </div>
+    </div>
+  );
+}
 
 type User = {
   id: number;
@@ -222,6 +331,9 @@ export default function Home() {
   const [yearFilter, setYearFilter] = useState<"all" | "3" | "5" | "10">("all");
   const [openAccessOnly, setOpenAccessOnly] = useState<boolean>(false);
   const [showMoreFilters, setShowMoreFilters] = useState<boolean>(false);
+  const [researchMode, setResearchMode] = useState<ResearchMode>("auto");
+  // Mode of the current conversation, so follow-up questions on a medical answer stay medical.
+  const [activeMode, setActiveMode] = useState<AnswerMode>("quick");
   const [studyTypeFilter, setStudyTypeFilter] = useState<string>("");
   const [fieldFilter, setFieldFilter] = useState<string>("");
   const [minCitations, setMinCitations] = useState<string>("");
@@ -381,77 +493,10 @@ export default function Home() {
   // ============================================================
 
   useEffect(() => {
-    // 0. Cookie consent: show the banner until a choice has been stored
-    try {
-      const rawConsent = localStorage.getItem("scholarpulse-cookie-consent");
-      if (rawConsent) {
-        const stored = JSON.parse(rawConsent);
-        setCookiePrefs({ essential: true, preferences: Boolean(stored?.preferences) });
-        setCookieDecided(true);
-      } else {
-        setCookieDecided(false);
-      }
-    } catch {
-      setCookieDecided(false);
-    }
-
-    // 1. Load Theme
-    const savedTheme = localStorage.getItem("researchai-theme") as "light" | "dark" | null;
-    if (savedTheme) {
-      setTheme(savedTheme);
-      document.documentElement.setAttribute("data-theme", savedTheme);
-      if (savedTheme === "dark") {
-        document.documentElement.classList.add("dark");
-      } else {
-        document.documentElement.classList.remove("dark");
-      }
-    }
-
-    // 2. (Sidebar always starts closed; nothing to restore.)
-
-    // 3. Load Guest Count
-    const savedCount = parseInt(
-      localStorage.getItem("researchai-guest-searches") || "0",
-      10
-    );
-    setGuestSearchCount(isNaN(savedCount) ? 0 : savedCount);
-
-    // 4. Authenticate via httpOnly Cookie
-    fetchCurrentUser();
-
-    // 5. Handle URL Tokens (Email Verification / Password Reset)
-    const urlParams = new URLSearchParams(window.location.search);
-    const vToken = urlParams.get("verify_token");
-    const rToken = urlParams.get("reset_token");
-
-    if (vToken) {
-      handleVerifyEmailToken(vToken);
-    }
-    if (rToken) {
-      setResetToken(rToken);
-      setResetPasswordModalOpen(true);
-    }
-
-    // Click outside listener for account dropdown
-    function handleClickOutside(event: MouseEvent) {
-      if (accountMenuRef.current && !accountMenuRef.current.contains(event.target as Node)) {
-        setAccountDropdownOpen(false);
-      }
-    }
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, []);
-
-  useEffect(() => {
     if (messages.length > 0) {
       chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }
   }, [messages, loading]);
-
-  useEffect(() => {
-    setVisiblePapers(10);
-    setSelectedPaperIds([]);
-  }, [results]);
 
   useEffect(() => {
     if (!loadMoreRef.current || !papersScrollRef.current) return;
@@ -981,7 +1026,7 @@ export default function Home() {
   function handleSelectHistoryItem(item: HistoryItem) {
     setQuery(item.question);
     if (item.papers && item.papers.length > 0) {
-      setResults(item.papers);
+      showResults(item.papers);
     }
     const restoredMessages: Message[] = [
       {
@@ -1044,6 +1089,75 @@ export default function Home() {
     }
   }
 
+  // Page load: cookie choice, theme, sign-in and email links. Declared after the functions it calls.
+  useEffect(() => {
+    // 0. Cookie consent: show the banner until a choice has been stored
+    try {
+      const rawConsent = localStorage.getItem("scholarpulse-cookie-consent");
+      if (rawConsent) {
+        const stored = JSON.parse(rawConsent);
+        // Saved choices live in localStorage, which only exists in the browser. Reading it while rendering would
+        // make the server and browser HTML differ (a hydration error), so it is read once here after mount.
+        // eslint-disable-next-line react-hooks/set-state-in-effect
+        setCookiePrefs({ essential: true, preferences: Boolean(stored?.preferences) });
+        setCookieDecided(true);
+      } else {
+        setCookieDecided(false);
+      }
+    } catch {
+      setCookieDecided(false);
+    }
+
+    // 1. Load Theme
+    const savedTheme = localStorage.getItem("researchai-theme") as "light" | "dark" | null;
+    if (savedTheme) {
+      setTheme(savedTheme);
+      document.documentElement.setAttribute("data-theme", savedTheme);
+      if (savedTheme === "dark") {
+        document.documentElement.classList.add("dark");
+      } else {
+        document.documentElement.classList.remove("dark");
+      }
+    }
+
+    // 2. (Sidebar always starts closed; nothing to restore.)
+
+    // 3. Load Guest Count
+    const savedCount = parseInt(
+      localStorage.getItem("researchai-guest-searches") || "0",
+      10
+    );
+    setGuestSearchCount(isNaN(savedCount) ? 0 : savedCount);
+
+    // 4. Authenticate via httpOnly Cookie
+    fetchCurrentUser();
+
+    // 5. Handle URL Tokens (Email Verification / Password Reset)
+    const urlParams = new URLSearchParams(window.location.search);
+    const vToken = urlParams.get("verify_token");
+    const rToken = urlParams.get("reset_token");
+
+    if (vToken) {
+      handleVerifyEmailToken(vToken);
+    }
+    if (rToken) {
+      setResetToken(rToken);
+      setResetPasswordModalOpen(true);
+    }
+
+    // Click outside listener for account dropdown
+    function handleClickOutside(event: MouseEvent) {
+      if (accountMenuRef.current && !accountMenuRef.current.contains(event.target as Node)) {
+        setAccountDropdownOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+    // Runs once on page load on purpose (email verification and reset links). Listing the handlers as
+    // dependencies would re-run it on every render and repeat the verification request.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // ============================================================
   // SEARCH & QUESTION WORKFLOW
   // ============================================================
@@ -1052,16 +1166,147 @@ export default function Home() {
     setQuery("");
     setFollowUpQuery("");
     setMessages([]);
-    setResults([]);
+    showResults([]);
     setError("");
     setSelectedPaperForDetail(null);
-    setSelectedPaperIds([]);
     if (window.innerWidth < 768) {
       setSidebarOpen(false);
     }
   }
 
-  async function executeSearch(searchQuery: string) {
+  // Results change in one place, so the visible count and ticked papers always reset together.
+  function showResults(list: Result[]) {
+    setResults(list);
+    setVisiblePapers(10);
+    setSelectedPaperIds([]);
+  }
+
+  function currentFilters() {
+    const currentYear = new Date().getFullYear();
+    let yearMin: number | undefined;
+    if (yearFilter === "3") yearMin = currentYear - 2;
+    if (yearFilter === "5") yearMin = currentYear - 4;
+    if (yearFilter === "10") yearMin = currentYear - 9;
+    return {
+      year_min: yearMin,
+      open_access_only: openAccessOnly,
+      study_type: studyTypeFilter || undefined,
+      field: fieldFilter || undefined,
+      min_citations: minCitations ? Number(minCitations) : undefined,
+      exclude_preprints: excludePreprints,
+    };
+  }
+
+  async function pickMode(question: string, forced?: AnswerMode): Promise<AnswerMode> {
+    if (forced) return forced;
+    if (researchMode !== "auto") return researchMode;
+    const q = question.trim();
+    // Author, title and DOI lookups are not research questions: answer them quickly.
+    if (searchBy !== "topic" || /^(author|title|doi)\s*:/i.test(q) || /^(https?:\/\/(dx\.)?doi\.org\/)?10\.\d{4,9}\//i.test(q)) {
+      return "quick";
+    }
+    try {
+      const res = await fetch(`${apiBaseUrl}/mode?${new URLSearchParams({ q: q.slice(0, 2000) }).toString()}`, {
+        credentials: "include",
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.mode === "deep" || data.mode === "medical" || data.mode === "quick") return data.mode;
+      }
+    } catch {
+      // fall back to a quick answer
+    }
+    return "quick";
+  }
+
+  async function runDeepResearch(question: string, medical: boolean | null) {
+    setLoading(true);
+    setError("");
+    const steps = [
+      "Planning 3 to 5 searches...",
+      "Searching 7 academic databases...",
+      "Merging and ranking the papers...",
+      "Reading the top abstracts...",
+      "Writing the structured review...",
+    ];
+    let step = 0;
+    setLoadingStep(steps[0]);
+    const timer = setInterval(() => {
+      step = Math.min(step + 1, steps.length - 1);
+      setLoadingStep(steps[step]);
+    }, 6000);
+
+    try {
+      const res = await fetch(`${apiBaseUrl}/deep-research`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          question: question.slice(0, 2000),
+          session_id: getSessionId(),
+          medical,
+          ...currentFilters(),
+        }),
+      });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        const detail = typeof errData.detail === "string" ? errData.detail : "Deep research failed.";
+        if (res.status === 429 && /deep research limit/i.test(detail)) {
+          setMessages((prev) => [
+            ...prev,
+            { id: newMessageId("deep-limit"), role: "assistant", content: detail, timestamp: now(), question, offerQuick: true },
+          ]);
+          return;
+        }
+        throw new Error(detail);
+      }
+
+      const data = await res.json();
+      const list: Result[] = Array.isArray(data.results) ? data.results : [];
+      showResults(list);
+      setSelectedPaperForDetail(null);
+      rememberTakeaways(data.takeaways, list);
+      setActiveMode(data.medical ? "medical" : "deep");
+      const subQueries: string[] = Array.isArray(data.sub_queries) ? data.sub_queries : [];
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: newMessageId("deep"),
+          role: "assistant",
+          content: data.answer || "Deep research complete.",
+          citations: data.citations || [],
+          timestamp: now(),
+          mode: "deep",
+          modeLabel: `Deep research${data.medical ? " · medical" : ""} · ${subQueries.length} search${
+            subQueries.length === 1 ? "" : "es"
+          } · ${list.length} papers`,
+          subQueries,
+          meter: data.meter || null,
+          question,
+        },
+      ]);
+      loadHistory();
+    } catch (err) {
+      setError(errorMessage(err, "Deep research failed. Please try again."));
+    } finally {
+      clearInterval(timer);
+      setLoading(false);
+      setLoadingStep("");
+    }
+  }
+
+  function handleGoDeeper(m: Message) {
+    if (!m.question || loading) return;
+    setMessages((prev) => [...prev, { id: newMessageId("go-deeper"), role: "user", content: `Go deeper: ${m.question}`, timestamp: now() }]);
+    runDeepResearch(m.question, m.mode === "medical" ? true : null);
+  }
+
+  function handleQuickFallback(m: Message) {
+    if (!m.question || loading) return;
+    executeSearch(m.question, "quick");
+  }
+
+  async function executeSearch(searchQuery: string, forcedMode?: AnswerMode) {
     if (!searchQuery.trim()) return;
 
     if (!user) {
@@ -1075,62 +1320,63 @@ export default function Home() {
 
     setLoading(true);
     setError("");
-    setResults([]);
+    showResults([]);
     setSelectedPaperForDetail(null);
-    setSelectedPaperIds([]);
-    setLoadingStep("Querying OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed, and Europe PMC...");
+    setLoadingStep("Choosing how to research this...");
 
     const userMessage: Message = {
-      id: Date.now().toString(),
+      id: newMessageId(),
       role: "user",
       content: searchQuery,
-      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+      timestamp: now(),
     };
     setMessages([userMessage]);
 
     try {
-      const currentYear = new Date().getFullYear();
-      let yearMin: number | undefined;
-      if (yearFilter === "3") yearMin = currentYear - 2;
-      if (yearFilter === "5") yearMin = currentYear - 4;
-      if (yearFilter === "10") yearMin = currentYear - 9;
+      const mode = await pickMode(searchQuery, forcedMode);
+      setActiveMode(mode);
+      if (mode === "deep") {
+        await runDeepResearch(searchQuery, null);
+        return;
+      }
 
+      setLoadingStep("Querying OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed, and Europe PMC...");
+      const filters = currentFilters();
       const searchParams = new URLSearchParams({
         q: searchQuery,
-        open_access_only: openAccessOnly.toString(),
+        open_access_only: filters.open_access_only.toString(),
       });
-      if (yearMin) searchParams.append("year_min", yearMin.toString());
-      if (studyTypeFilter) searchParams.append("study_type", studyTypeFilter);
-      if (fieldFilter) searchParams.append("field", fieldFilter);
-      if (minCitations) searchParams.append("min_citations", minCitations);
-      if (excludePreprints) searchParams.append("exclude_preprints", "true");
+      if (filters.year_min) searchParams.append("year_min", filters.year_min.toString());
+      if (filters.study_type) searchParams.append("study_type", filters.study_type);
+      if (filters.field) searchParams.append("field", filters.field);
+      if (filters.min_citations) searchParams.append("min_citations", filters.min_citations.toString());
+      if (filters.exclude_preprints) searchParams.append("exclude_preprints", "true");
       if (sortBy !== "relevance") searchParams.append("sort", sortBy);
       if (searchBy !== "topic") searchParams.append("search_by", searchBy);
+      if (mode === "medical") searchParams.append("medical", "true");
 
       const searchRes = await fetch(`${apiBaseUrl}/search?${searchParams.toString()}`, {
         credentials: "include",
       });
       if (!searchRes.ok) {
         const errData = await searchRes.json().catch(() => ({}));
-        throw new Error(errData.detail || "Paper search failed.");
+        throw new Error(typeof errData.detail === "string" ? errData.detail : "Paper search failed.");
       }
 
       const searchData = await searchRes.json();
       const fetchedResults: Result[] = searchData.results || [];
-      setResults(fetchedResults);
+      showResults(fetchedResults);
 
       if (fetchedResults.length === 0) {
         setMessages((prev) => [
           ...prev,
           {
-            id: (Date.now() + 1).toString(),
+            id: newMessageId(),
             role: "assistant",
             content: "No matching academic papers found across OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed, or Europe PMC. Try adjusting your search query or filters.",
-            timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+            timestamp: now(),
           },
         ]);
-        setLoading(false);
-        setLoadingStep("");
         return;
       }
 
@@ -1146,28 +1392,36 @@ export default function Home() {
           results: fetchedResults,
           session_id: sid,
           conversation_history: [],
+          mode: mode === "medical" ? "medical" : "quick",
         }),
       });
 
       if (!askRes.ok) {
         const errData = await askRes.json().catch(() => ({}));
-        throw new Error(errData.detail || "AI synthesis failed.");
+        throw new Error(typeof errData.detail === "string" ? errData.detail : "AI synthesis failed.");
       }
 
       const askData = await askRes.json();
       rememberTakeaways(askData.takeaways, fetchedResults);
       const assistantMessage: Message = {
-        id: (Date.now() + 2).toString(),
+        id: newMessageId(),
         role: "assistant",
         content: askData.answer || "Synthesized analysis completed.",
         citations: askData.citations || [],
-        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        timestamp: now(),
+        mode,
+        modeLabel:
+          mode === "medical"
+            ? `Medical · strongest evidence first · ${fetchedResults.length} papers`
+            : `Quick answer · ${fetchedResults.length} papers`,
+        meter: askData.meter || null,
+        question: searchQuery,
       };
 
       setMessages((prev) => [...prev, assistantMessage]);
       loadHistory();
-    } catch (err: any) {
-      setError(err.message || "An unexpected error occurred.");
+    } catch (err) {
+      setError(errorMessage(err, "An unexpected error occurred."));
     } finally {
       setLoading(false);
       setLoadingStep("");
@@ -1191,7 +1445,7 @@ export default function Home() {
     setLoadingStep("Synthesizing follow-up research answer...");
 
     const userMessage: Message = {
-      id: Date.now().toString(),
+      id: newMessageId(),
       role: "user",
       content: followUpText,
       timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
@@ -1225,29 +1479,33 @@ export default function Home() {
           results: papersToPass,
           session_id: sid,
           conversation_history: historyTurns,
+          mode: activeMode === "medical" ? "medical" : "quick",
         }),
       });
 
       if (!askRes.ok) {
         const errData = await askRes.json().catch(() => ({}));
-        throw new Error(errData.detail || "Follow-up synthesis failed.");
+        throw new Error(typeof errData.detail === "string" ? errData.detail : "Follow-up synthesis failed.");
       }
 
       const askData = await askRes.json();
       rememberTakeaways(askData.takeaways, papersToPass);
       const assistantMessage: Message = {
-        id: (Date.now() + 1).toString(),
+        id: newMessageId(),
         role: "assistant",
         content: askData.answer || "Synthesis complete.",
         citations: askData.citations || [],
-        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        timestamp: now(),
         scopedPaperIds: selectedPaperIds.length > 0 ? [...selectedPaperIds] : undefined,
+        mode: activeMode === "medical" ? "medical" : "quick",
+        meter: toResultIds(askData.meter, papersToPass, results),
+        question: followUpText,
       };
 
       setMessages((prev) => [...prev, assistantMessage]);
       loadHistory();
-    } catch (err: any) {
-      setError(err.message || "Failed to process follow-up question.");
+    } catch (err) {
+      setError(errorMessage(err, "Failed to process follow-up question."));
     } finally {
       setLoading(false);
       setLoadingStep("");
@@ -1272,8 +1530,8 @@ export default function Home() {
       if (!res.ok) throw new Error("Deep dive generation failed.");
       const data = await res.json();
       setDeepDives((prev) => ({ ...prev, [index]: data.deep_dive || data.analysis || "Analysis complete." }));
-    } catch (err: any) {
-      setDeepDives((prev) => ({ ...prev, [index]: "Unable to generate deep dive analysis for this paper." }));
+    } catch {
+      setDeepDives((prev) => ({ ...prev, [index]: "Unable to analyze this paper right now. Please try again." }));
     } finally {
       setDeepDiveLoading((prev) => ({ ...prev, [index]: false }));
     }
@@ -2012,6 +2270,35 @@ export default function Home() {
                     </button>
                   </div>
 
+                  {/* Research mode */}
+                  <div
+                    role="radiogroup"
+                    aria-label="Research mode"
+                    className="flex flex-wrap items-center justify-center gap-1.5 mt-4 text-xs text-[var(--text-secondary)]"
+                  >
+                    <span className="font-medium mr-1">Mode:</span>
+                    {MODE_OPTIONS.map((option) => (
+                      <button
+                        key={option.value}
+                        type="button"
+                        role="radio"
+                        aria-checked={researchMode === option.value}
+                        title={option.hint}
+                        onClick={() => setResearchMode(option.value)}
+                        className={`px-2.5 py-1 rounded-full border transition ${
+                          researchMode === option.value
+                            ? "bg-[var(--accent)] text-white border-[var(--accent)]"
+                            : "bg-[var(--bg-surface)] border-[var(--border-color)] hover:bg-[var(--bg-surface-elevated)]"
+                        }`}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="mt-1.5 text-center text-[11px] text-[var(--text-muted)]">
+                    {MODE_OPTIONS.find((option) => option.value === researchMode)?.hint}
+                  </p>
+
                   {/* Filter Pills */}
                   <div className="flex flex-wrap items-center justify-center gap-2 mt-4 text-xs text-[var(--text-secondary)]">
                     <span className="font-medium">Filter by year:</span>
@@ -2293,6 +2580,17 @@ export default function Home() {
                             : "bg-[var(--bg-surface)] text-[var(--text-primary)] border border-[var(--border-color)] shadow-sm"
                         }`}
                       >
+                        {m.role === "assistant" && m.modeLabel && (
+                          <div className="mb-3 flex flex-wrap items-center gap-1.5 text-[11px]">
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-[var(--accent-light)] text-[var(--accent)] font-semibold">
+                              <Sparkles className="w-3 h-3" />
+                              {m.modeLabel}
+                            </span>
+                            {m.subQueries && m.subQueries.length > 0 && (
+                              <span className="text-[var(--text-muted)]">Searched: {m.subQueries.join(" · ")}</span>
+                            )}
+                          </div>
+                        )}
                         {m.role === "assistant" ? (
                           <Markdown text={m.content} />
                         ) : (
@@ -2329,9 +2627,42 @@ export default function Home() {
                           </div>
                         )}
 
+                        {m.role === "assistant" && m.meter && m.meter.total > 0 && (
+                          <EvidenceMeter
+                            meter={m.meter}
+                            onOpenPaper={(paperId) => {
+                              const target = results[paperId - 1];
+                              if (target) setSelectedPaperForDetail({ paper: target, index: paperId - 1 });
+                            }}
+                          />
+                        )}
+
                         {/* Action buttons for assistant answers */}
                         {m.role === "assistant" && (
-                          <div className="mt-4 pt-3 border-t border-[var(--border-subtle)] flex items-center justify-end gap-2 text-xs text-[var(--text-secondary)]">
+                          <div className="mt-4 pt-3 border-t border-[var(--border-subtle)] flex flex-wrap items-center justify-end gap-2 text-xs text-[var(--text-secondary)]">
+                            {m.question && (m.mode === "quick" || m.mode === "medical") && (
+                              <button
+                                type="button"
+                                onClick={() => handleGoDeeper(m)}
+                                disabled={loading}
+                                className="mr-auto px-2.5 py-1.5 rounded-lg bg-[var(--accent)] hover:bg-[var(--accent-hover)] disabled:opacity-50 text-white font-semibold transition flex items-center gap-1"
+                                title="Run 3 to 5 searches and write a structured review (takes longer)"
+                              >
+                                <Layers className="w-3.5 h-3.5" />
+                                <span>Go deeper</span>
+                              </button>
+                            )}
+                            {m.offerQuick && m.question && (
+                              <button
+                                type="button"
+                                onClick={() => handleQuickFallback(m)}
+                                disabled={loading}
+                                className="mr-auto px-2.5 py-1.5 rounded-lg bg-[var(--accent)] hover:bg-[var(--accent-hover)] disabled:opacity-50 text-white font-semibold transition flex items-center gap-1"
+                              >
+                                <Sparkles className="w-3.5 h-3.5" />
+                                <span>Get a quick answer</span>
+                              </button>
+                            )}
                             <button
                               onClick={() => handleCopyAnswer(m)}
                               className="p-1.5 rounded-lg hover:bg-[var(--bg-surface-elevated)] hover:text-[var(--text-primary)] transition flex items-center gap-1"
@@ -2545,7 +2876,7 @@ export default function Home() {
                               <span>
                                 {deepDiveLoading[selectedPaperForDetail.index]
                                   ? "Analyzing..."
-                                  : "Generate Deep Dive"}
+                                  : "Analyze this paper"}
                               </span>
                             </button>
 
@@ -2579,7 +2910,7 @@ export default function Home() {
                                 )
                               }
                               className="flex items-center gap-1.5 px-3 py-2 bg-[var(--bg-surface-elevated)] hover:bg-[var(--border-color)] text-[var(--text-primary)] text-xs font-medium rounded-lg border border-[var(--border-color)] transition"
-                              title="Download this paper's details, abstract, deep dive and BibTeX as a PDF"
+                              title="Download this paper's details, abstract, analysis and BibTeX as a PDF"
                             >
                               <FileDown className="w-3.5 h-3.5" />
                               <span>Export PDF</span>
@@ -2602,7 +2933,7 @@ export default function Home() {
                             <div className="mt-4 p-4 rounded-xl bg-[var(--accent-light)] border border-[var(--accent)]/30 text-xs text-[var(--text-primary)] space-y-2">
                               <div className="font-semibold text-[var(--accent)] flex items-center gap-1.5">
                                 <Compass className="w-4 h-4" />
-                                <span>Deep Dive Synthesis:</span>
+                                <span>Paper analysis:</span>
                               </div>
                               <Markdown text={deepDives[selectedPaperForDetail.index]} compact />
                             </div>
@@ -3655,7 +3986,7 @@ export default function Home() {
             <div className="text-center text-xs text-[var(--text-secondary)] pt-2 border-t border-[var(--border-subtle)]">
               {authMode === "login" ? (
                 <div>
-                  Don't have an account?{" "}
+                  Don&apos;t have an account?{" "}
                   <button
                     onClick={() => {
                       setAuthMode("register");
@@ -3832,7 +4163,7 @@ export default function Home() {
             </h3>
 
             <p className="text-xs text-[var(--text-secondary)] leading-relaxed">
-              You've completed {GUEST_SEARCH_LIMIT} free guest searches. Create a free account to unlock unlimited searches, persist your research library, and access multi-turn deep dives.
+              You&apos;ve completed {GUEST_SEARCH_LIMIT} free guest searches. Create a free account to unlock unlimited searches, persist your research library, and access multi-turn research.
             </p>
 
             <div className="space-y-2 pt-2">

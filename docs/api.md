@@ -90,6 +90,8 @@ Shorter or guessable values are rejected with `422`, because the `session_id` is
 | `POST /deep-dive` | none | Markdown analysis of one paper. Body: `title`, `abstract` |
 | `POST /takeaways` | none | One-sentence takeaway per paper (up to 10). Body: `papers` |
 | `POST /compare` | none | Side-by-side comparison of 2 to 5 papers. Body: `papers` |
+| `POST /deep-research` | optional | 3 to 5 searches and a structured review. Body: `question`, `session_id`, `medical`, filters |
+| `GET /mode` | none | Suggests `quick`, `deep` or `medical` for a question (rules, no AI). Param: `q` |
 | `GET /history/{session_id}` | optional | Your history (signed in) or the guest session's |
 | `DELETE /history/entry/{id}` | optional | Delete one entry (guests add `?session_id=`) |
 | `DELETE /history/{session_id}` | optional | Clear history |
@@ -139,6 +141,27 @@ Full request and response shapes, with examples for every status code, are in th
   A value the abstract does not state is exactly `Not stated`. Cached for 2 hours.
 - Both leave out papers without an abstract and retracted papers. `/compare` returns 400 if fewer than two remain.
 
+### Research modes, evidence meter and deep research
+
+- `GET /mode?q=...` returns `{"mode": "quick" | "deep" | "medical"}` from the question's wording (no AI call). Health words
+  pick `medical`; broad or comparative wording (compare, versus, across, state of research, long multi-part questions) picks
+  `deep`; everything else is `quick`. Medical wins when both match.
+- `GET /search?...&medical=true` ranks meta-analyses, systematic reviews and RCTs higher within relevance.
+- `POST /ask` accepts `mode`: `quick` (default) or `medical`. Medical adds evidence-level guidance to the prompt and always ends
+  the answer with a not-medical-advice note.
+- `/ask` and `/deep-research` return `meter` for yes/no questions: `{yes, no, possibly, total, labels: [{paper_id, label}]}`, or
+  `null` when the question is not yes/no or fewer than 3 papers were labelled. Labels for unknown paper ids are dropped.
+- `POST /deep-research` body: `question`, `session_id`, `medical` (`true`/`false`, or `null` to detect), and the same filters as
+  `/search` (`year_min`, `year_max`, `open_access_only`, `min_citations`, `exclude_preprints`, `study_type`, `field`). It:
+  1. asks the AI for 3 to 5 sub-searches (falls back to the question itself if that fails),
+  2. runs them through `/search` (2 at a time), merges and re-ranks the papers (up to 50 in `results`),
+  3. writes a review from the top 15 abstracts with Overview, Key findings, an Evidence table, Conflicting findings and
+     Research gaps.
+  Response: `mode`, `medical`, `sub_queries`, `count`, `papers_used`, `source_counts`, `results`, `answer`, `citations`,
+  `takeaways`, `meter`. Saved to history like `/ask`, cached for 2 hours.
+- Deep research uses 2 AI calls (both count toward the AI caps) and has its own daily cap: `DEEP_DAILY_LIMIT_GUEST` (3),
+  `DEEP_DAILY_LIMIT_USER` (20), `DEEP_DAILY_LIMIT_GLOBAL` (300). Over the cap it returns 429 with a message offering a quick answer.
+
 ### How `/ask` stays grounded
 
 - Only the first 6 papers that have an abstract are used. A paper without an abstract is never evidence.
@@ -164,7 +187,7 @@ messages or stack traces.
 
 ## 5. Rate limits
 
-Per client IP, per minute (fixed window): `/ask` 30, `/deep-dive` 20, `/takeaways` 20, `/compare` 20, `/search` 60, `/auth/login` 10, `/auth/register` 10, `/auth/forgot-password` 5,
+Per client IP, per minute (fixed window): `/ask` 30, `/deep-dive` 20, `/takeaways` 20, `/compare` 20, `/deep-research` 5, `/mode` 60, `/search` 60, `/auth/login` 10, `/auth/register` 10, `/auth/forgot-password` 5,
 `/auth/resend-verification` 5, `/auth/reset-password` 10, `/auth/verify-email` 10, other `/auth/*` 30, `/bookmarks` 60, everything else 150.
 Behind a reverse proxy set `TRUSTED_PROXY_COUNT=1`, otherwise all users share the proxy's IP. The per-minute limiter is per process: run one worker
 (the account lockout, email caps and daily AI caps use Redis when `REDIS_URL` is reachable, so they are shared across workers).

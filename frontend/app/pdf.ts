@@ -618,7 +618,7 @@ export function exportPaperPdf(input: { appName: string; paper: PdfPaper; deepDi
 
   if (input.deepDive && input.deepDive.trim()) {
     w.gap(2);
-    w.sectionTitle("AI Deep Dive");
+    w.sectionTitle("AI Paper Analysis");
     w.markdown(input.deepDive);
   }
 

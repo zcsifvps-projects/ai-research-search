@@ -129,6 +129,10 @@ VERIFICATION_TOKEN_HOURS = int(os.getenv("VERIFICATION_TOKEN_HOURS", "48"))
 AI_DAILY_LIMIT_GUEST = int(os.getenv("AI_DAILY_LIMIT_GUEST", "30"))     # AI calls per guest IP per UTC day
 AI_DAILY_LIMIT_USER = int(os.getenv("AI_DAILY_LIMIT_USER", "200"))      # per signed-in account per UTC day
 AI_DAILY_LIMIT_GLOBAL = int(os.getenv("AI_DAILY_LIMIT_GLOBAL", "3000")) # all callers together per UTC day
+# Deep research runs several searches and 2 AI calls, so it has its own, smaller daily caps (on top of the AI caps).
+DEEP_DAILY_LIMIT_GUEST = int(os.getenv("DEEP_DAILY_LIMIT_GUEST", "3"))
+DEEP_DAILY_LIMIT_USER = int(os.getenv("DEEP_DAILY_LIMIT_USER", "20"))
+DEEP_DAILY_LIMIT_GLOBAL = int(os.getenv("DEEP_DAILY_LIMIT_GLOBAL", "300"))
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
@@ -609,6 +613,8 @@ class RateLimiterMiddleware(BaseHTTPMiddleware):
             "/deep-dive": (20, 60),
             "/takeaways": (20, 60),
             "/compare": (20, 60),
+            "/deep-research": (5, 60),
+            "/mode": (60, 60),
             "/search": (60, 60),
             "/auth/login": (10, 60),
             "/auth/register": (10, 60),
@@ -966,6 +972,21 @@ class AskRequest(BaseModel):
         examples=["3f9c2f0e-8c1a-4b7e-9a55-0d6d2f5c1a11"],
     )
     conversation_history: list[ConversationTurn] = Field(default_factory=list, max_length=20)
+    mode: str = Field(default="quick", pattern="^(quick|medical)$",
+                      description="`medical` adds evidence-level guidance and a not-medical-advice note to the answer.")
+
+
+class DeepResearchRequest(BaseModel):
+    question: str = Field(max_length=2000, examples=["How does remote work affect productivity across industries?"])
+    session_id: str = Field(default="anonymous", max_length=128, pattern=r"^(anonymous|[A-Za-z0-9_-]{16,128})$")
+    medical: bool | None = Field(default=None, description="true/false forces medical handling; null detects it from the wording.")
+    year_min: int | None = Field(default=None, ge=0, le=3000)
+    year_max: int | None = Field(default=None, ge=0, le=3000)
+    open_access_only: bool = False
+    min_citations: int | None = Field(default=None, ge=0, le=1_000_000)
+    exclude_preprints: bool = False
+    study_type: str | None = Field(default=None, max_length=40)
+    field: str | None = Field(default=None, max_length=60)
 
 
 class DeepDiveRequest(BaseModel):
@@ -1176,6 +1197,24 @@ def enforce_ai_quota(request: Request, user_id: int | None):
             detail="The AI service is very busy right now. Please try again later.",
             headers={"Retry-After": str(min(ttl, 3600))},
         )
+
+
+DEEP_LIMIT_MESSAGE = "Daily deep research limit reached. A quick answer is still available."
+
+
+def enforce_deep_quota(request: Request, user_id: int | None):
+    """Separate daily caps for deep research (per account or guest IP, plus a global cap). 0 turns a cap off."""
+    day = _utcnow().strftime("%Y%m%d")
+    ttl = _seconds_until_utc_midnight()
+    if user_id is not None:
+        subject_key, limit = f"deep:u:{user_id}:{day}", DEEP_DAILY_LIMIT_USER
+    else:
+        subject_key, limit = f"deep:ip:{_subject_key(get_client_ip(request))}:{day}", DEEP_DAILY_LIMIT_GUEST
+    if limit > 0 and counter_incr(subject_key, ttl) > limit:
+        raise HTTPException(status_code=429, detail=DEEP_LIMIT_MESSAGE + (
+            "" if user_id is not None else " Signing in raises the limit."), headers={"Retry-After": str(ttl)})
+    if DEEP_DAILY_LIMIT_GLOBAL > 0 and counter_incr(f"deep:g:{day}", ttl) > DEEP_DAILY_LIMIT_GLOBAL:
+        raise HTTPException(status_code=429, detail=DEEP_LIMIT_MESSAGE, headers={"Retry-After": str(min(ttl, 3600))})
 
 
 # ============================================================
@@ -2847,9 +2886,10 @@ def set_in_search_cache(cache_key: str, data: dict, ttl: int = SEARCH_CACHE_TTL)
     }
 
 
-def generate_ask_cache_key(question: str, papers: list[dict], conversation_history: list[dict]) -> str:
+def generate_ask_cache_key(question: str, papers: list[dict], conversation_history: list[dict], mode: str = "quick") -> str:
     raw = json.dumps({
-        "v": 2,  # v2 answers include takeaways; older cached answers are not reused
+        "v": 3,  # v3 answers include takeaways and the evidence meter; older cached answers are not reused
+        "m": mode,
         "q": question.strip().lower(),
         "p": [(p.get("title", ""), (p.get("abstract") or "")[:200]) for p in papers],
         "h": [(h.get("question", ""), h.get("answer", "")) for h in conversation_history],
@@ -2862,6 +2902,67 @@ def takeaway_cache_key(title: str, abstract: str) -> str:
     /takeaways (which sends more) share entries."""
     raw = json.dumps([str(title or "").strip().lower(), str(abstract or "").strip()[:300]])
     return "tk:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+# ============================================================
+# RESEARCH MODE (rules, no AI call): quick, deep or medical
+# ============================================================
+
+_MEDICAL_PATTERN = re.compile(
+    r"\b(patients?|treatments?|therap(y|ies|eutic)|dos(e|es|age|ing)|drugs?|medications?|medicines?|"
+    r"diseases?|disorders?|symptoms?|syndromes?|diagnos(is|ed|tic)|clinical|pregnan(t|cy)|cancers?|tumou?rs?|"
+    r"vaccines?|vaccination|infections?|diabet(es|ic)|hypertension|blood pressure|cardiac|heart attack|strokes?|"
+    r"asthma|depression|anxiety|insomnia|dementia|alzheimer'?s?|surgery|surgical|side effects?|adverse effects?|"
+    r"antibiotics?|supplements?|vitamins?|mortality|prognosis|chemotherapy|hiv|tuberculosis|malaria|covid(-19)?|"
+    r"placebo|nursing|hospitali[sz]ation|obesity|melatonin|ibuprofen|paracetamol|metformin|statins?)\b",
+    re.IGNORECASE,
+)
+_DEEP_PATTERN = re.compile(
+    r"\b(compare|comparison|comparing|versus|vs\.?|across|state of (the )?(research|art|evidence)|"
+    r"what is known|what do we know|literature review|systematic|review of|overview of|landscape|trends?|"
+    r"pros and cons|advantages and disadvantages|differences? between|similarities|debate|controvers(y|ial)|"
+    r"determinants|implications|over time|evolution of)\b",
+    re.IGNORECASE,
+)
+
+
+def detect_research_mode(question: str) -> str:
+    """Pick quick, deep or medical from the wording alone. Medical wins over deep (it adds the safety note)."""
+    text = (question or "").strip()
+    if _MEDICAL_PATTERN.search(text):
+        return "medical"
+    words = len(text.split())
+    parts = text.count("?") + len(re.findall(r"\band\b", text, re.IGNORECASE))
+    if _DEEP_PATTERN.search(text) or words >= 25 or (words >= 14 and parts >= 2):
+        return "deep"
+    return "quick"
+
+
+# Medical ranking: stronger study designs move up, within relevance.
+_EVIDENCE_BONUS = {"meta_analysis": 12, "systematic_review": 10, "rct": 8, "clinical_trial": 4, "review": 2}
+
+
+def evidence_bonus(paper: dict) -> int:
+    return max([_EVIDENCE_BONUS.get(t, 0) for t in (paper.get("study_types") or [])] or [0])
+
+
+def rank_by_evidence(results: list[dict]) -> list[dict]:
+    """Relevance score plus a bonus for meta-analyses, systematic reviews and RCTs. Without scores (re-ranking off)
+    the order is a stable sort by evidence level."""
+    if any(isinstance(p.get("similarity_score"), (int, float)) for p in results):
+        return sorted(results, key=lambda p: (p.get("similarity_score") or 0) + evidence_bonus(p), reverse=True)
+    return sorted(results, key=evidence_bonus, reverse=True)
+
+
+@app.get(
+    "/mode",
+    tags=["Search"],
+    summary="Suggest a research mode",
+    description="Returns `quick`, `deep` or `medical` for a question, from its wording (no AI call). Used by Auto mode.",
+    responses={**_ok({"mode": "medical"}), **E_RATE},
+)
+async def suggest_mode(q: str = Query(..., max_length=2000)):
+    return {"mode": detect_research_mode(q)}
 
 
 # ============================================================
@@ -2879,6 +2980,7 @@ def takeaway_cache_key(title: str, abstract: str) -> str:
                 "source confirmed as open access (`is_open_access: true`). `min_citations`, `exclude_preprints`, `study_type` "
                 "(" + ", ".join(STUDY_TYPES) + ") and `field` narrow the results further; a paper whose value is unknown is "
                 "left out by that filter. `sort` is `relevance` (default), `newest` or `most_cited`.\n\n"
+                "`medical=true` ranks meta-analyses, systematic reviews and RCTs higher within relevance. "
                 "`search_by` is `topic` (default), `title` or `author`; the prefixes `author:`, `title:` and `doi:` in `q` do the "
                 "same. A query that is only a DOI is looked up directly. Papers without an abstract may be returned with "
                 "`abstract: null`; they are never used as evidence by `/ask`.",
@@ -2900,6 +3002,7 @@ async def search(
     field: str | None = Query(default=None, max_length=60),
     sort: str = Query(default="relevance", pattern="^(relevance|newest|most_cited)$"),
     search_by: str = Query(default="topic", pattern="^(topic|title|author)$"),
+    medical: bool = False,
 ):
 
     if not q.strip():
@@ -2939,7 +3042,7 @@ async def search(
     }
     cache_key = json.dumps(
         [mode, term.lower(), year_min, year_max, open_access_only, min_citations, exclude_preprints,
-         study_type, field, sort],
+         study_type, field, sort, medical],
         separators=(",", ":"),
     )
 
@@ -3033,6 +3136,8 @@ async def search(
         for result in results:
             result.setdefault("similarity_score", None)
 
+    if medical and sort == "relevance" and mode in ("topic", "title"):
+        results = rank_by_evidence(results)
     results = sort_results(results, sort)
 
     # Papers per database (not per journal).
@@ -3362,9 +3467,67 @@ ASK_SYSTEM_PROMPT = (
     "Cite papers using [1], [2], etc. matching their paper_id. "
     "Also give every supplied paper a one-sentence takeaway (at most 30 words) stating its main finding from its "
     "abstract only; if the abstract states no finding, the takeaway is exactly 'Not stated in the abstract.' "
-    "Return a valid JSON object with 'answer' (string in markdown), 'citations' (list of {paper_id, title}) and "
-    "'takeaways' (list of {paper_id, takeaway})."
+    "If the question can be answered yes or no, set meter.is_yes_no to true and label EVERY paper 'yes' (its findings "
+    "support a yes), 'no' (they support a no) or 'possibly' (mixed, partial or unclear); otherwise set "
+    "meter.is_yes_no to false and meter.labels to an empty list. "
+    "Return a valid JSON object with 'answer' (string in markdown), 'citations' (list of {paper_id, title}), "
+    "'takeaways' (list of {paper_id, takeaway}) and 'meter' ({is_yes_no, labels: list of {paper_id, label}})."
 )
+
+MEDICAL_PROMPT_ADDENDUM = (
+    " This is a health or medical question. Prefer evidence from meta-analyses, systematic reviews and randomised "
+    "controlled trials, and say what kind of study each key finding comes from (study_types, when given, tells you). "
+    "Point out when evidence is weak, small, old or only from animals or lab studies. Never give personal medical "
+    "advice, doses or treatment instructions for an individual."
+)
+
+MEDICAL_DISCLAIMER = (
+    "\n\n> **Not medical advice.** This summary of research papers is for information only. "
+    "Talk to a qualified health professional about your own situation."
+)
+
+METER_LABELS = ("yes", "no", "possibly")
+METER_MIN_PAPERS = 3
+
+METER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "is_yes_no": {"type": "boolean"},
+        "labels": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "paper_id": {"type": "integer"},
+                    "label": {"type": "string", "enum": list(METER_LABELS)},
+                },
+                "required": ["paper_id", "label"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["is_yes_no", "labels"],
+    "additionalProperties": False,
+}
+
+
+def clean_meter(raw, valid_ids) -> dict | None:
+    """Counts of yes / no / possibly over known papers, one label each. None when the question is not yes/no or
+    fewer than METER_MIN_PAPERS papers were labelled."""
+    if not isinstance(raw, dict) or raw.get("is_yes_no") is not True:
+        return None
+    labels, seen = [], set()
+    for item in raw.get("labels") or []:
+        if not isinstance(item, dict):
+            continue
+        pid, label = item.get("paper_id"), str(item.get("label") or "").strip().lower()
+        if pid in valid_ids and pid not in seen and label in METER_LABELS:
+            seen.add(pid)
+            labels.append({"paper_id": pid, "label": label})
+    if len(labels) < METER_MIN_PAPERS:
+        return None
+    counts = {name: sum(1 for x in labels if x["label"] == name) for name in METER_LABELS}
+    return {**counts, "total": len(labels), "labels": sorted(labels, key=lambda x: x["paper_id"])}
 
 TAKEAWAY_ITEM_SCHEMA = {
     "type": "object",
@@ -3393,8 +3556,9 @@ ASK_SCHEMA = {
             },
         },
         "takeaways": {"type": "array", "items": TAKEAWAY_ITEM_SCHEMA},
+        "meter": METER_SCHEMA,
     },
-    "required": ["answer", "citations", "takeaways"],
+    "required": ["answer", "citations", "takeaways", "meter"],
     "additionalProperties": False,
 }
 
@@ -3444,7 +3608,7 @@ def sanitize_paper_for_storage(paper: dict) -> dict:
     summary="Ask a question about papers",
     description="Send the question and the papers from `/search` (up to 50; the first 6 with an abstract are used). The answer is written "
                 "**only from those abstracts** and cites them as `[1]`, `[2]`... by `paper_id` (their position in `results`, starting at 1). "
-                "Citations the model invents are dropped. `takeaways` gives a one-sentence finding for each paper used. Include earlier turns in `conversation_history` for follow-ups. "
+                "Citations the model invents are dropped. `takeaways` gives a one-sentence finding for each paper used. For yes/no questions `meter` counts papers labelled yes, no or possibly (null otherwise, or when fewer than 3 papers were labelled). `mode: medical` adds evidence-level guidance and a not-medical-advice note. Include earlier turns in `conversation_history` for follow-ups. "
                 "Identity comes from the cookie only: a `user_id` in the body is ignored. Signed-in answers are saved to your account, "
                 "guest answers to `session_id`. If the first AI attempt fails it is retried once with fewer papers.",
     responses={
@@ -3491,6 +3655,8 @@ async def ask(
                 "publication_year": result.get("publication_year") if isinstance(result.get("publication_year"), int) else None,
                 "source": str(result.get("description") or "Academic Database")[:100],
                 "abstract": clean_abstract,
+                **({"study_types": [t for t in result["study_types"] if t in STUDY_TYPES][:6]}
+                   if isinstance(result.get("study_types"), list) and result["study_types"] else {}),
             }
         )
         if len(papers) >= 6:
@@ -3508,6 +3674,7 @@ async def ask(
         request.question,
         papers,
         [turn.model_dump() for turn in request.conversation_history],
+        request.mode,
     )
     cached_ask_response = get_from_search_cache(ask_cache_key)
     if cached_ask_response is not None:
@@ -3542,7 +3709,7 @@ async def ask(
             generate_structured_ai,
             gemini_client,
             groq_client,
-            ASK_SYSTEM_PROMPT,
+            ASK_SYSTEM_PROMPT + (MEDICAL_PROMPT_ADDENDUM if request.mode == "medical" else ""),
             user_prompt,
             retry_prompt,
             ASK_SCHEMA,
@@ -3556,7 +3723,15 @@ async def ask(
             if pid in valid_titles:
                 valid_citations.append({"paper_id": pid, "title": valid_titles[pid]})
         takeaways = clean_takeaways(result.get("takeaways"), set(valid_titles))
-        result = {"answer": result["answer"], "citations": valid_citations, "takeaways": takeaways}
+        answer = result["answer"].rstrip()
+        if request.mode == "medical":
+            answer += MEDICAL_DISCLAIMER
+        result = {
+            "answer": answer,
+            "citations": valid_citations,
+            "takeaways": takeaways,
+            "meter": clean_meter(result.get("meter"), set(valid_titles)),
+        }
         for item in takeaways:
             # Reused by POST /takeaways, so these papers are never charged again.
             paper = next(p for p in papers if p["paper_id"] == item["paper_id"])
@@ -3580,6 +3755,215 @@ async def ask(
     except Exception as error:
         print("AI request failed:", error)  # the real error stays in the server logs only
         raise HTTPException(status_code=502, detail=GENERIC_AI_ERROR)
+
+
+# ============================================================
+# DEEP RESEARCH (plan 3 to 5 searches, run them, write a structured review)
+# ============================================================
+
+DEEP_MAX_RESULTS = 50
+DEEP_MAX_EVIDENCE = 15
+DEEP_SEARCH_CONCURRENCY = 2  # gentle on the source APIs (PubMed allows 3 requests/second without a key)
+
+DEEP_PLAN_PROMPT = (
+    "You plan academic literature searches. Split the research question into 3 to 5 short, distinct search queries "
+    "(keywords, at most 12 words each) that together cover its parts. Return a valid JSON object with 'queries' "
+    "(list of strings)."
+)
+
+DEEP_PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {"queries": {"type": "array", "items": {"type": "string"}}},
+    "required": ["queries"],
+    "additionalProperties": False,
+}
+
+DEEP_SYSTEM_PROMPT = (
+    "You are an expert research scientist writing a short structured literature review. Use ONLY the supplied papers; "
+    "never invent findings, statistics, papers or citations, and say plainly where the papers do not answer the question. "
+    "Cite papers as [1], [2] matching their paper_id. Write the 'answer' in markdown with exactly these sections: "
+    "'## Overview' (2 to 4 sentences), '## Key findings' (bullets with citations), '## Evidence table' (a markdown table "
+    "with columns Paper, Study type, Population, Main finding; one row per cited paper, Paper written as [n]; write "
+    "'Not stated' when the abstract does not say), '## Conflicting findings' (or say none were found), and "
+    "'## Research gaps' (what the papers do not cover). "
+    "Also give every supplied paper a one-sentence takeaway (at most 30 words) from its abstract only; if the abstract "
+    "states no finding, the takeaway is exactly 'Not stated in the abstract.' "
+    "If the question can be answered yes or no, set meter.is_yes_no to true and label EVERY paper 'yes', 'no' or "
+    "'possibly'; otherwise set meter.is_yes_no to false and meter.labels to an empty list. "
+    "Return a valid JSON object with 'answer', 'citations' (list of {paper_id, title}), 'takeaways' (list of "
+    "{paper_id, takeaway}) and 'meter' ({is_yes_no, labels: list of {paper_id, label}})."
+)
+
+
+def clean_search_queries(raw, limit: int = 5) -> list[str]:
+    out, seen = [], set()
+    for item in raw or []:
+        if not isinstance(item, str):
+            continue
+        text = re.sub(r"\s+", " ", item).strip(" \"'?.")[:200]
+        if len(text) >= 3 and text.lower() not in seen:
+            seen.add(text.lower())
+            out.append(text)
+        if len(out) >= limit:
+            break
+    return out
+
+
+@app.post(
+    "/deep-research",
+    tags=["AI"],
+    summary="Deep research: several searches and a structured review",
+    description="The AI splits the question into 3 to 5 searches; the server runs them across all sources (with the filters given), "
+                "merges and re-ranks the papers, and writes a review from the top 15 abstracts with Overview, Key findings, an "
+                "Evidence table, Conflicting findings and Research gaps. Returns the merged `results` (up to 50; `paper_id` = "
+                "position) plus `answer`, `citations`, `takeaways`, `meter` and `sub_queries`. Uses 2 AI calls and counts toward "
+                "the daily AI caps and a separate, smaller deep research cap. Medical questions (detected, or `medical: true`) "
+                "rank stronger study designs first and end with a not-medical-advice note. Cached for 2 hours.",
+    responses={
+        **_ok({"mode": "deep", "medical": False, "sub_queries": ["remote work productivity"], "count": 1,
+               "papers_used": 1, "source_counts": {"OpenAlex": 1}, "results": [EXAMPLE_PAPER],
+               "answer": "## Overview\n...", "citations": [{"paper_id": 1, "title": EXAMPLE_PAPER["title"]}],
+               "takeaways": [], "meter": None}),
+        **_err(400, "Empty question, unknown filter value, or no papers with an abstract were found.",
+               "No papers with an abstract were found for this question. Try different wording or fewer filters."),
+        **E_RATE, **E_AI,
+    },
+)
+async def deep_research(request: DeepResearchRequest, req: Request, authorization: str | None = Header(None)):
+    user_id = optional_user_id(req, authorization)
+    question = request.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+    if request.study_type is not None and request.study_type not in STUDY_TYPES:
+        raise HTTPException(status_code=400, detail="Unknown study type.")
+    if request.field is not None and request.field not in FIELDS_OF_STUDY:
+        raise HTTPException(status_code=400, detail="Unknown field of study.")
+    medical = request.medical if request.medical is not None else detect_research_mode(question) == "medical"
+
+    filters = {
+        "year_min": request.year_min, "year_max": request.year_max, "open_access_only": request.open_access_only,
+        "min_citations": request.min_citations, "exclude_preprints": request.exclude_preprints,
+        "study_type": request.study_type, "field": request.field,
+    }
+    cache_key = "deepr:" + hashlib.sha256(
+        json.dumps([question.lower(), medical, filters], sort_keys=True).encode("utf-8")).hexdigest()
+    cached = get_from_search_cache(cache_key)
+    if cached is not None:
+        save_search_history(request.session_id, question, cached["answer"], citations=cached.get("citations", []),
+                            user_id=user_id, papers=[sanitize_paper_for_storage(r) for r in cached.get("results", [])])
+        return cached
+
+    gemini_client, groq_client = get_ai_clients()
+    enforce_deep_quota(req, user_id)
+
+    # 1. Plan the searches (if planning fails, search the question itself).
+    enforce_ai_quota(req, user_id)
+    queries = []
+    try:
+        plan = await asyncio.to_thread(
+            generate_structured_ai, gemini_client, groq_client, DEEP_PLAN_PROMPT,
+            f"Research question: {question}", f"Research question: {question[:300]}", DEEP_PLAN_SCHEMA, "queries",
+        )
+        queries = clean_search_queries(plan.get("queries"))
+    except Exception as error:
+        print("Deep research planning failed, searching the question directly:", error)
+    if not queries:
+        queries = [clean_academic_query(question)[:300]]
+
+    # 2. Run the searches (the same code as GET /search, so filters and caching behave the same).
+    semaphore = asyncio.Semaphore(DEEP_SEARCH_CONCURRENCY)
+
+    async def run_one(sub_query: str) -> dict:
+        async with semaphore:
+            try:
+                return await search(
+                    q=sub_query[:300], year_min=request.year_min, year_max=request.year_max,
+                    open_access_only=request.open_access_only, min_citations=request.min_citations,
+                    exclude_preprints=request.exclude_preprints, study_type=request.study_type, field=request.field,
+                    sort="relevance", search_by="topic", medical=medical,
+                )
+            except HTTPException:
+                return {"results": []}
+
+    responses = await asyncio.gather(*(run_one(q) for q in queries))
+    # Copies, so merging never changes papers held in the search cache.
+    merged = deduplicate_results([dict(p) for r in responses for p in (r.get("results") or [])])
+    merged = rerank_papers_by_similarity(question, merged)
+    if medical:
+        merged = rank_by_evidence(merged)
+    results = merged[:DEEP_MAX_RESULTS]
+
+    evidence = []
+    for index, paper in enumerate(results, start=1):
+        abstract = paper.get("abstract")
+        if not isinstance(abstract, str) or not abstract.strip() or paper.get("is_retracted") is True:
+            continue
+        evidence.append({
+            "paper_id": index,
+            "title": str(paper.get("title") or "Untitled")[:300],
+            "authors": [str(a)[:100] for a in (paper.get("authors") or [])[:3]],
+            "publication_year": paper.get("publication_year") if isinstance(paper.get("publication_year"), int) else None,
+            "source": str(paper.get("description") or "Academic Database")[:100],
+            **({"study_types": paper["study_types"][:6]} if paper.get("study_types") else {}),
+            "abstract": abstract.strip()[:500],
+        })
+        if len(evidence) >= DEEP_MAX_EVIDENCE:
+            break
+    if not evidence:
+        raise HTTPException(status_code=400, detail="No papers with an abstract were found for this question. "
+                                                    "Try different wording or fewer filters.")
+
+    # 3. Write the structured review.
+    enforce_ai_quota(req, user_id)
+    system_prompt = DEEP_SYSTEM_PROMPT + (MEDICAL_PROMPT_ADDENDUM if medical else "")
+    user_prompt = f"Question: {question}\n\nPapers:\n{json.dumps(evidence, indent=2)}"
+    retry_prompt = (f"Question: {question}\n\nPapers:\n"
+                    + json.dumps([{**p, "abstract": p["abstract"][:250]} for p in evidence[:8]])
+                    + "\n\nKeep the answer under 300 words.")
+    try:
+        result = await asyncio.to_thread(
+            generate_structured_ai, gemini_client, groq_client, system_prompt, user_prompt, retry_prompt,
+            ASK_SCHEMA, "answer",
+        )
+    except Exception as error:
+        print("Deep research synthesis failed:", error)
+        raise HTTPException(status_code=502, detail=GENERIC_AI_ERROR)
+
+    valid_titles = {p["paper_id"]: p["title"] for p in evidence}
+    citations, seen = [], set()
+    for citation in result.get("citations") or []:
+        pid = citation.get("paper_id") if isinstance(citation, dict) else None
+        if pid in valid_titles and pid not in seen:
+            seen.add(pid)
+            citations.append({"paper_id": pid, "title": valid_titles[pid]})
+    takeaways = clean_takeaways(result.get("takeaways"), set(valid_titles))
+    for item in takeaways:
+        paper = next(p for p in evidence if p["paper_id"] == item["paper_id"])
+        set_in_search_cache(takeaway_cache_key(paper["title"], paper["abstract"]), {"t": item["takeaway"]}, ttl=86400)
+    answer = result["answer"].rstrip() + (MEDICAL_DISCLAIMER if medical else "")
+
+    source_counts = {}
+    for paper in results:
+        name = paper.get("database") or paper.get("description") or "Unknown source"
+        source_counts[name] = source_counts.get(name, 0) + 1
+
+    response = {
+        "mode": "deep",
+        "medical": medical,
+        "sub_queries": queries,
+        "count": len(results),
+        "papers_used": len(evidence),
+        "source_counts": source_counts,
+        "results": results,
+        "answer": answer,
+        "citations": citations,
+        "takeaways": takeaways,
+        "meter": clean_meter(result.get("meter"), set(valid_titles)),
+    }
+    save_search_history(request.session_id, question, answer, citations=citations, user_id=user_id,
+                        papers=[sanitize_paper_for_storage(r) for r in results])
+    set_in_search_cache(cache_key, response, ttl=7200)
+    return response
 
 
 # ============================================================
