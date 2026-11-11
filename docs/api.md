@@ -97,6 +97,11 @@ Shorter or guessable values are rejected with `422`, because the `session_id` is
 | `DELETE /history/{session_id}` | optional | Clear history |
 | `POST /history/sync` | verified | Attach a guest `session_id`'s history to your account |
 | `GET/POST /bookmarks`, `DELETE /bookmarks/{id}` | verified | Saved papers |
+| `GET/POST /collections`, `POST /collections/{id}/rename`, `DELETE /collections/{id}` | verified | Folders for saved papers |
+| `POST /collections/{id}/items`, `DELETE /collections/{id}/items/{bookmark_id}` | verified | Put a saved paper in a folder, or take it out |
+| `GET/POST /threads`, `GET/POST/DELETE /threads/{id}`, `POST /threads/{id}/rename` | verified | Saved conversations |
+| `POST /threads/{id}/share`, `POST /threads/{id}/unshare` | verified | Turn a read-only share link on or off |
+| `GET /share/{token}` | none | Open a shared conversation (read-only, nothing about the owner) |
 | `POST /auth/register` | none | Start sign-up; emails a link (never signs in, never reveals existing accounts) |
 | `POST /auth/login`, `/auth/logout` | none | Sign in; sign out (revokes this session) |
 | `POST /auth/logout-all` | signed in | Revoke every session |
@@ -168,6 +173,16 @@ Full request and response shapes, with examples for every status code, are in th
   25 words and exactly `Not stated` when the abstract does not say. Same AI call, no extra cost.
 - With no abstract it answers without an AI call and `glance` is `null`.
 - Cached per paper (title and abstract) for 24 hours, so analysing the same paper again uses no AI quota.
+
+### Folders, saved conversations and share links
+
+- `GET /bookmarks` returns `collection_ids` for each paper; `?collection_id=` lists one folder. Deleting a folder keeps its papers;
+  deleting a saved paper removes it from every folder. Up to 50 folders per account.
+- A saved conversation holds `turns` (`question`, `answer`, `citations`, `mode`; up to 50) and `papers` (up to 50, stored in the same
+  trimmed form as history). Saving again with `POST /threads/{id}` replaces them. Up to 200 per account.
+- Share links use a 256-bit random token. `GET /share/{token}` returns only `title`, `turns`, `papers`, `shared_at` and `updated_at`,
+  with `X-Robots-Tag: noindex`. Unsharing or deleting stops the link at once; sharing again makes a new link.
+- Someone else's folder or conversation always returns 404.
 
 ### Admin
 

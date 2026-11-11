@@ -1,3 +1,4 @@
+import path from "node:path";
 import type { NextConfig } from "next";
 
 // NEXT_PUBLIC_* values are inlined at BUILD time and there is no fallback anywhere in the code.
@@ -48,6 +49,9 @@ const csp = contentSecurityPolicy();
 
 const nextConfig: NextConfig = {
   poweredByHeader: false,
+  // This folder is the project root. Without this, a package-lock.json in a parent folder (for example /var/www)
+  // makes Next.js guess the root and print a warning on every build.
+  turbopack: { root: path.join(__dirname) },
   async headers() {
     return [
       {

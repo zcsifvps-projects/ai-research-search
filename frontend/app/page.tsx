@@ -8,6 +8,13 @@ import { ModalPanel, ModalShell, SPRING, SlideUp, projectMomentum, useIsDesktop 
 import { buildCsv, downloadCsv } from "./csv";
 import type { ComparisonRow, Glance } from "./pdf";
 import {
+  Folder,
+  FolderPlus,
+  Link2,
+  MessageSquare,
+  Pencil,
+  Save,
+  Share2,
   ArrowDown,
   ArrowRight,
   ArrowUp,
@@ -314,7 +321,22 @@ type BookmarkItem = {
   source: string | null;
   doi: string | null;
   created_at: string;
+  collection_ids?: number[];
 };
+
+type CollectionInfo = { id: number; name: string; count: number };
+
+type ThreadSummary = {
+  id: number;
+  title: string;
+  turn_count: number;
+  paper_count: number;
+  shared: boolean;
+  share_token: string | null;
+  updated_at: string | null;
+};
+
+type ThreadTurn = { question: string; answer: string; citations: Citation[]; mode?: AnswerMode | null };
 
 const GUEST_SEARCH_LIMIT = 5;
 
@@ -385,6 +407,20 @@ export default function Home() {
   // Feature 3: Bookmarks / My Library
   const [bookmarks, setBookmarks] = useState<BookmarkItem[]>([]);
   const [libraryLoading, setLibraryLoading] = useState(false);
+
+  // Phase 6: folders, saved conversations, share links
+  const [collections, setCollections] = useState<CollectionInfo[]>([]);
+  const [activeCollection, setActiveCollection] = useState<number | null>(null);
+  const [folderMenuFor, setFolderMenuFor] = useState<number | null>(null);
+  const [threads, setThreads] = useState<ThreadSummary[]>([]);
+  const [threadsSectionOpen, setThreadsSectionOpen] = useState(true);
+  const [currentThreadId, setCurrentThreadId] = useState<number | null>(null);
+  const [savedTurnCount, setSavedTurnCount] = useState(0);
+  const [threadSaving, setThreadSaving] = useState(false);
+  const [threadNotice, setThreadNotice] = useState("");
+  const [shareTarget, setShareTarget] = useState<ThreadSummary | null>(null);
+  const [shareBusy, setShareBusy] = useState(false);
+  const [shareCopied, setShareCopied] = useState(false);
 
   // Theme mode: 'light' or 'dark'
   const [theme, setTheme] = useState<"light" | "dark">("light");
@@ -762,6 +798,11 @@ export default function Home() {
     setAccountDropdownOpen(false);
     setSettingsModalOpen(false);
     setBookmarks([]);
+    setCollections([]);
+    setActiveCollection(null);
+    setThreads([]);
+    setCurrentThreadId(null);
+    setSavedTurnCount(0);
     loadHistory();
   }
 
@@ -931,7 +972,241 @@ export default function Home() {
     } finally {
       setLibraryLoading(false);
     }
+    loadCollections();
+    loadThreads();
   }
+
+  // ============================================================
+  // FOLDERS (collections)
+  // ============================================================
+
+  async function loadCollections() {
+    try {
+      const res = await fetch(`${apiBaseUrl}/collections`, { credentials: "include" });
+      if (res.ok) setCollections((await res.json()).collections || []);
+    } catch {
+      // ignore
+    }
+  }
+
+  async function createCollection() {
+    const name = window.prompt("Name for the new folder:")?.trim();
+    if (!name) return;
+    const res = await fetch(`${apiBaseUrl}/collections`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ name: name.slice(0, 100) }),
+    }).catch(() => null);
+    if (res && !res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      setError(typeof errData.detail === "string" ? errData.detail : "Could not create the folder.");
+    }
+    loadCollections();
+  }
+
+  async function renameCollection(folder: CollectionInfo) {
+    const name = window.prompt("Rename folder:", folder.name)?.trim();
+    if (!name || name === folder.name) return;
+    await fetch(`${apiBaseUrl}/collections/${folder.id}/rename`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ name: name.slice(0, 100) }),
+    }).catch(() => null);
+    loadCollections();
+  }
+
+  async function deleteCollection(folder: CollectionInfo) {
+    if (!window.confirm(`Delete the folder "${folder.name}"? The papers stay in your library.`)) return;
+    await fetch(`${apiBaseUrl}/collections/${folder.id}`, { method: "DELETE", credentials: "include" }).catch(() => null);
+    if (activeCollection === folder.id) setActiveCollection(null);
+    loadBookmarks();
+  }
+
+  async function toggleInCollection(bookmark: BookmarkItem, folderId: number) {
+    const inside = (bookmark.collection_ids || []).includes(folderId);
+    const res = await fetch(
+      inside ? `${apiBaseUrl}/collections/${folderId}/items/${bookmark.id}` : `${apiBaseUrl}/collections/${folderId}/items`,
+      {
+        method: inside ? "DELETE" : "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: inside ? undefined : JSON.stringify({ bookmark_id: bookmark.id }),
+      },
+    ).catch(() => null);
+    if (res && res.ok) {
+      setBookmarks((prev) =>
+        prev.map((b) =>
+          b.id === bookmark.id
+            ? {
+                ...b,
+                collection_ids: inside
+                  ? (b.collection_ids || []).filter((id) => id !== folderId)
+                  : [...(b.collection_ids || []), folderId],
+              }
+            : b,
+        ),
+      );
+      setCollections((prev) => prev.map((c) => (c.id === folderId ? { ...c, count: c.count + (inside ? -1 : 1) } : c)));
+    }
+  }
+
+  // ============================================================
+  // SAVED CONVERSATIONS (threads) AND SHARE LINKS
+  // ============================================================
+
+  async function loadThreads() {
+    try {
+      const res = await fetch(`${apiBaseUrl}/threads`, { credentials: "include" });
+      if (res.ok) setThreads((await res.json()).threads || []);
+    } catch {
+      // ignore
+    }
+  }
+
+  // Question and answer pairs from the chat, in order.
+  function conversationTurns(list: Message[]): ThreadTurn[] {
+    const turns: ThreadTurn[] = [];
+    for (let i = 0; i < list.length - 1; i += 1) {
+      const q = list[i];
+      const a = list[i + 1];
+      if (q.role === "user" && a.role === "assistant") {
+        turns.push({
+          question: q.content.slice(0, 2000),
+          answer: a.content.slice(0, 20000),
+          citations: (a.citations || []).slice(0, 50),
+          mode: a.mode || null,
+        });
+        i += 1;
+      }
+    }
+    return turns.slice(-50);
+  }
+
+  const chatTurns = conversationTurns(messages);
+  const unsavedTurns = chatTurns.length > 0 && (currentThreadId === null || chatTurns.length !== savedTurnCount);
+
+  async function saveThread() {
+    if (!user) {
+      openAuthModal("register", "Create a free account to save conversations.");
+      return;
+    }
+    if (!user.is_verified) {
+      setThreadNotice("Verify your email to save conversations.");
+      return;
+    }
+    if (chatTurns.length === 0 || threadSaving) return;
+    setThreadSaving(true);
+    setThreadNotice("");
+    try {
+      const res = await fetch(currentThreadId ? `${apiBaseUrl}/threads/${currentThreadId}` : `${apiBaseUrl}/threads`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ turns: chatTurns, papers: results.slice(0, 50) }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : "Could not save the conversation.");
+      setCurrentThreadId(data.id);
+      setSavedTurnCount(chatTurns.length);
+      setThreadNotice("Saved.");
+      loadThreads();
+    } catch (err) {
+      setThreadNotice(errorMessage(err, "Could not save the conversation."));
+    } finally {
+      setThreadSaving(false);
+    }
+  }
+
+  async function openThread(summary: ThreadSummary) {
+    try {
+      const res = await fetch(`${apiBaseUrl}/threads/${summary.id}`, { credentials: "include" });
+      if (!res.ok) throw new Error("Could not open the conversation.");
+      const data = await res.json();
+      const turns: ThreadTurn[] = Array.isArray(data.turns) ? data.turns : [];
+      showResults(Array.isArray(data.papers) ? data.papers : []);
+      setSelectedPaperForDetail(null);
+      const restored: Message[] = [];
+      turns.forEach((t, i) => {
+        restored.push({ id: newMessageId(`thread-q${i}`), role: "user", content: t.question, timestamp: "" });
+        restored.push({
+          id: newMessageId(`thread-a${i}`),
+          role: "assistant",
+          content: t.answer,
+          citations: t.citations || [],
+          timestamp: "",
+          mode: t.mode || undefined,
+        });
+      });
+      setMessages(restored);
+      const lastMode = turns.length > 0 ? turns[turns.length - 1].mode : null;
+      setActiveMode(lastMode === "medical" ? "medical" : "quick");
+      setCurrentThreadId(summary.id);
+      setSavedTurnCount(turns.length);
+      setThreadNotice("");
+      if (window.innerWidth < 768) setSidebarOpen(false);
+    } catch (err) {
+      setError(errorMessage(err, "Could not open the conversation."));
+    }
+  }
+
+  async function renameThread(summary: ThreadSummary) {
+    const title = window.prompt("Rename conversation:", summary.title)?.trim();
+    if (!title || title === summary.title) return;
+    await fetch(`${apiBaseUrl}/threads/${summary.id}/rename`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ title: title.slice(0, 200) }),
+    }).catch(() => null);
+    loadThreads();
+  }
+
+  async function deleteThread(summary: ThreadSummary) {
+    const extra = summary.shared ? " Its share link will stop working." : "";
+    if (!window.confirm(`Delete "${summary.title}"?${extra}`)) return;
+    await fetch(`${apiBaseUrl}/threads/${summary.id}`, { method: "DELETE", credentials: "include" }).catch(() => null);
+    if (currentThreadId === summary.id) {
+      setCurrentThreadId(null);
+      setSavedTurnCount(0);
+    }
+    loadThreads();
+  }
+
+  function shareUrl(token: string): string {
+    return `${window.location.origin}/share/${token}`;
+  }
+
+  async function setSharing(summary: ThreadSummary, on: boolean) {
+    setShareBusy(true);
+    try {
+      const res = await fetch(`${apiBaseUrl}/threads/${summary.id}/${on ? "share" : "unshare"}`, {
+        method: "POST",
+        credentials: "include",
+      });
+      if (res.ok) {
+        const data: ThreadSummary = await res.json();
+        setShareTarget(data);
+        setThreads((prev) => prev.map((t) => (t.id === data.id ? { ...t, ...data } : t)));
+      }
+    } finally {
+      setShareBusy(false);
+    }
+  }
+
+  async function copyShareLink(token: string) {
+    try {
+      await navigator.clipboard.writeText(shareUrl(token));
+      setShareCopied(true);
+      setTimeout(() => setShareCopied(false), 2000);
+    } catch {
+      window.prompt("Copy this link:", shareUrl(token));
+    }
+  }
+
+  const visibleBookmarks =
+    activeCollection === null ? bookmarks : bookmarks.filter((b) => (b.collection_ids || []).includes(activeCollection));
 
   function isPaperBookmarked(paper: Result | null): BookmarkItem | undefined {
     if (!paper) return undefined;
@@ -1025,6 +1300,9 @@ export default function Home() {
   }
 
   function handleSelectHistoryItem(item: HistoryItem) {
+    setCurrentThreadId(null);
+    setSavedTurnCount(0);
+    setThreadNotice("");
     setQuery(item.question);
     if (item.papers && item.papers.length > 0) {
       showResults(item.papers);
@@ -1162,6 +1440,9 @@ export default function Home() {
   // ============================================================
 
   function handleNewSearch() {
+    setCurrentThreadId(null);
+    setSavedTurnCount(0);
+    setThreadNotice("");
     setQuery("");
     setFollowUpQuery("");
     setMessages([]);
@@ -1321,6 +1602,9 @@ export default function Home() {
     setError("");
     showResults([]);
     setSelectedPaperForDetail(null);
+    setCurrentThreadId(null);
+    setSavedTurnCount(0);
+    setThreadNotice("");
     setLoadingStep("Choosing how to research this...");
 
     const userMessage: Message = {
@@ -1975,6 +2259,91 @@ export default function Home() {
             )}
           </div>
 
+          {/* Saved Conversations Accordion */}
+          <div>
+            <button
+              onClick={() => setThreadsSectionOpen(!threadsSectionOpen)}
+              className="flex items-center justify-between w-full px-2 py-1.5 text-xs font-semibold uppercase tracking-wider text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition"
+            >
+              <div className="flex items-center gap-2">
+                <MessageSquare className="w-3.5 h-3.5 text-[var(--accent)]" />
+                <span>Saved Conversations</span>
+                <span className="text-[10px] bg-[var(--bg-surface-elevated)] px-1.5 py-0.5 rounded-full text-[var(--text-secondary)]">
+                  {threads.length}
+                </span>
+              </div>
+              <ChevronDown
+                className={`w-3.5 h-3.5 transition-transform duration-200 ${threadsSectionOpen ? "" : "-rotate-90"}`}
+              />
+            </button>
+            {threadsSectionOpen && (
+              <div className="mt-2 space-y-1">
+                {threads.length === 0 ? (
+                  <div className="text-xs text-[var(--text-muted)] px-2 py-2 italic">
+                    {user ? "Use \"Save conversation\" above an answer to keep it here." : "Sign in to save conversations."}
+                  </div>
+                ) : (
+                  threads.map((t) => (
+                    <div
+                      key={t.id}
+                      onClick={() => openThread(t)}
+                      className={`group flex items-center justify-between gap-1 px-2.5 py-2 rounded-lg text-xs cursor-pointer transition ${
+                        currentThreadId === t.id
+                          ? "bg-[var(--accent-light)] text-[var(--accent)]"
+                          : "hover:bg-[var(--bg-surface-elevated)] text-[var(--text-primary)]"
+                      }`}
+                    >
+                      <div className="flex items-center gap-2 truncate">
+                        {t.shared ? (
+                          <Link2 className="w-3 h-3 text-[var(--accent)] shrink-0" aria-label="Shared" />
+                        ) : (
+                          <MessageSquare className="w-3 h-3 text-[var(--text-muted)] shrink-0" />
+                        )}
+                        <span className="truncate">{t.title}</span>
+                      </div>
+                      <div className="flex items-center shrink-0 opacity-100 md:opacity-0 md:group-hover:opacity-100 transition">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setShareCopied(false);
+                            setShareTarget(t);
+                          }}
+                          className="p-1 hover:text-[var(--accent)]"
+                          title="Share"
+                          aria-label={`Share ${t.title}`}
+                        >
+                          <Share2 className="w-3 h-3" />
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            renameThread(t);
+                          }}
+                          className="p-1 hover:text-[var(--accent)]"
+                          title="Rename"
+                          aria-label={`Rename ${t.title}`}
+                        >
+                          <Pencil className="w-3 h-3" />
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            deleteThread(t);
+                          }}
+                          className="p-1 hover:text-red-600"
+                          title="Delete"
+                          aria-label={`Delete ${t.title}`}
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+          </div>
+
           {/* My Library Accordion */}
           <div>
             <button
@@ -1997,18 +2366,69 @@ export default function Home() {
 
             {librarySectionOpen && (
               <div className="mt-2 space-y-1">
+                {user && user.is_verified && (
+                  <div className="px-2 pb-1 flex flex-wrap items-center gap-1">
+                    <button
+                      onClick={() => setActiveCollection(null)}
+                      className={`px-2 py-0.5 rounded-full text-[11px] border transition ${
+                        activeCollection === null
+                          ? "bg-[var(--accent)] text-white border-[var(--accent)]"
+                          : "border-[var(--border-color)] text-[var(--text-secondary)] hover:bg-[var(--bg-surface-elevated)]"
+                      }`}
+                    >
+                      All
+                    </button>
+                    {collections.map((c) => (
+                      <button
+                        key={c.id}
+                        onClick={() => setActiveCollection(activeCollection === c.id ? null : c.id)}
+                        className={`px-2 py-0.5 rounded-full text-[11px] border transition flex items-center gap-1 max-w-[160px] ${
+                          activeCollection === c.id
+                            ? "bg-[var(--accent)] text-white border-[var(--accent)]"
+                            : "border-[var(--border-color)] text-[var(--text-secondary)] hover:bg-[var(--bg-surface-elevated)]"
+                        }`}
+                        title={c.name}
+                      >
+                        <Folder className="w-3 h-3 shrink-0" />
+                        <span className="truncate">{c.name}</span>
+                        <span className="opacity-70">{c.count}</span>
+                      </button>
+                    ))}
+                    <button
+                      onClick={createCollection}
+                      className="p-1 rounded-full text-[var(--text-muted)] hover:text-[var(--accent)] transition"
+                      title="New folder"
+                      aria-label="New folder"
+                    >
+                      <FolderPlus className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                )}
+                {activeCollection !== null && (() => {
+                  const folder = collections.find((c) => c.id === activeCollection);
+                  return folder ? (
+                    <div className="px-2 pb-1 flex items-center gap-2 text-[11px] text-[var(--text-muted)]">
+                      <button onClick={() => renameCollection(folder)} className="hover:text-[var(--accent)] flex items-center gap-1">
+                        <Pencil className="w-3 h-3" /> Rename folder
+                      </button>
+                      <button onClick={() => deleteCollection(folder)} className="hover:text-red-600 flex items-center gap-1">
+                        <Trash2 className="w-3 h-3" /> Delete folder
+                      </button>
+                    </div>
+                  ) : null;
+                })()}
                 {!user ? (
                   <div className="text-xs text-[var(--text-muted)] px-2 py-2 italic">
                     No saved papers yet.
                   </div>
                 ) : libraryLoading ? (
                   <div className="text-xs text-[var(--text-muted)] px-2 py-2">Loading library...</div>
-                ) : bookmarks.length === 0 ? (
+                ) : visibleBookmarks.length === 0 ? (
                   <div className="text-xs text-[var(--text-muted)] px-2 py-2 italic">
-                    No bookmarked papers yet.
+                    {activeCollection === null ? "No bookmarked papers yet." : "This folder is empty. Use the folder icon on a saved paper to add it."}
                   </div>
                 ) : (
-                  bookmarks.map((bm) => (
+                  visibleBookmarks.map((bm) => (
                     <div
                       key={bm.id}
                       onClick={() => {
@@ -2039,12 +2459,50 @@ export default function Home() {
                         <BookmarkCheck className="w-3.5 h-3.5 text-[var(--accent)] shrink-0" />
                         <span className="truncate text-[var(--text-primary)]">{bm.title}</span>
                       </div>
+                      {collections.length > 0 && (
+                        <div className="relative shrink-0">
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setFolderMenuFor(folderMenuFor === bm.id ? null : bm.id);
+                            }}
+                            className={`p-1 hover:text-[var(--accent)] transition ${
+                              (bm.collection_ids || []).length > 0 ? "text-[var(--accent)]" : "opacity-100 md:opacity-0 md:group-hover:opacity-100"
+                            }`}
+                            title="Folders"
+                            aria-label={`Folders for ${bm.title}`}
+                            aria-expanded={folderMenuFor === bm.id}
+                          >
+                            <Folder className="w-3 h-3" />
+                          </button>
+                          {folderMenuFor === bm.id && (
+                            <div
+                              onClick={(e) => e.stopPropagation()}
+                              className="absolute right-0 top-6 z-20 w-48 rounded-lg border border-[var(--border-color)] bg-[var(--bg-surface)] shadow-lg py-1"
+                            >
+                              {collections.map((c) => {
+                                const inside = (bm.collection_ids || []).includes(c.id);
+                                return (
+                                  <button
+                                    key={c.id}
+                                    onClick={() => toggleInCollection(bm, c.id)}
+                                    className="w-full px-3 py-1.5 text-left text-xs flex items-center gap-2 hover:bg-[var(--bg-surface-elevated)] text-[var(--text-primary)]"
+                                  >
+                                    <Check className={`w-3 h-3 ${inside ? "opacity-100 text-[var(--accent)]" : "opacity-0"}`} />
+                                    <span className="truncate">{c.name}</span>
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      )}
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
                           deleteBookmarkById(bm.id);
                         }}
-                        className="opacity-0 group-hover:opacity-100 p-1 hover:text-[var(--accent)] transition"
+                        className="opacity-100 md:opacity-0 md:group-hover:opacity-100 p-1 hover:text-[var(--accent)] transition"
                         title="Remove bookmark"
                       >
                         <Trash2 className="w-3 h-3" />
@@ -2561,6 +3019,44 @@ export default function Home() {
             <div className="flex-1 flex flex-col md:flex-row h-full overflow-hidden">
               {/* Left Chat / Synthesis Column */}
               <div className="flex-1 flex flex-col h-full border-r border-[var(--border-color)] bg-[var(--bg-primary)] overflow-hidden">
+                {chatTurns.length > 0 && (
+                  <div className="px-4 sm:px-6 py-2 border-b border-[var(--border-color)] bg-[var(--bg-surface)] flex flex-wrap items-center gap-2 text-xs shrink-0">
+                    <button
+                      type="button"
+                      onClick={saveThread}
+                      disabled={threadSaving || loading || !unsavedTurns}
+                      className="px-2.5 py-1.5 rounded-lg border border-[var(--border-color)] hover:bg-[var(--bg-surface-elevated)] disabled:opacity-60 font-medium text-[var(--text-secondary)] flex items-center gap-1.5 transition"
+                    >
+                      {unsavedTurns ? <Save className="w-3.5 h-3.5" /> : <Check className="w-3.5 h-3.5 text-emerald-600" />}
+                      <span>
+                        {threadSaving
+                          ? "Saving..."
+                          : !unsavedTurns
+                            ? "Saved"
+                            : currentThreadId
+                              ? "Save changes"
+                              : "Save conversation"}
+                      </span>
+                    </button>
+                    {currentThreadId !== null && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const t = threads.find((x) => x.id === currentThreadId);
+                          if (t) {
+                            setShareCopied(false);
+                            setShareTarget(t);
+                          }
+                        }}
+                        className="px-2.5 py-1.5 rounded-lg border border-[var(--border-color)] hover:bg-[var(--bg-surface-elevated)] font-medium text-[var(--text-secondary)] flex items-center gap-1.5 transition"
+                      >
+                        <Share2 className="w-3.5 h-3.5" />
+                        <span>Share</span>
+                      </button>
+                    )}
+                    {threadNotice && <span className="text-[var(--text-muted)]">{threadNotice}</span>}
+                  </div>
+                )}
                 {/* Scrollable Messages */}
                 <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6">
                   {messages.map((m) => (
@@ -3250,6 +3746,87 @@ export default function Home() {
           )}
         </div>
       </main>
+
+      {/* ======================================================== */}
+      {/* 2a. SHARE DIALOG (Phase 6) */}
+      {/* ======================================================== */}
+      <AnimatePresence>
+      {shareTarget && (
+        <ModalShell
+          key="shareTarget"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4"
+          onClick={() => setShareTarget(null)}
+        >
+          <ModalPanel
+            role="dialog"
+            aria-modal="true"
+            aria-label="Share conversation"
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-md bg-[var(--bg-surface)] border border-[var(--border-color)] rounded-2xl shadow-2xl p-5 space-y-4"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="font-serif-heading text-base font-bold text-[var(--text-primary)] flex items-center gap-2 truncate">
+                <Share2 className="w-5 h-5 text-[var(--accent)] shrink-0" />
+                <span className="truncate">Share &quot;{shareTarget.title}&quot;</span>
+              </h3>
+              <button
+                onClick={() => setShareTarget(null)}
+                aria-label="Close"
+                className="p-1 rounded-lg hover:bg-[var(--bg-surface-elevated)] text-[var(--text-secondary)]"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            {shareTarget.shared && shareTarget.share_token ? (
+              <>
+                <p className="text-xs text-[var(--text-secondary)]">
+                  Anyone with this link can read the questions, answers and papers. They cannot see your name or email,
+                  and cannot change anything. Saving changes later updates what the link shows.
+                </p>
+                <div className="flex gap-2">
+                  <input
+                    readOnly
+                    value={shareUrl(shareTarget.share_token)}
+                    onFocus={(e) => e.currentTarget.select()}
+                    className="flex-1 min-w-0 px-3 py-2 rounded-lg border border-[var(--border-color)] bg-[var(--bg-primary)] text-xs text-[var(--text-primary)]"
+                    aria-label="Share link"
+                  />
+                  <button
+                    onClick={() => copyShareLink(shareTarget.share_token as string)}
+                    className="px-3 py-2 rounded-lg bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-xs font-semibold flex items-center gap-1"
+                  >
+                    {shareCopied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                    {shareCopied ? "Copied" : "Copy"}
+                  </button>
+                </div>
+                <button
+                  onClick={() => setSharing(shareTarget, false)}
+                  disabled={shareBusy}
+                  className="text-xs text-red-600 hover:underline disabled:opacity-60"
+                >
+                  Stop sharing (the link stops working at once)
+                </button>
+              </>
+            ) : (
+              <>
+                <p className="text-xs text-[var(--text-secondary)]">
+                  Create a read-only link to this conversation. Only people you give the link to can open it, it is hidden
+                  from search engines, and you can switch it off at any time.
+                </p>
+                <button
+                  onClick={() => setSharing(shareTarget, true)}
+                  disabled={shareBusy}
+                  className="w-full px-3 py-2 rounded-lg bg-[var(--accent)] hover:bg-[var(--accent-hover)] disabled:opacity-60 text-white text-xs font-semibold flex items-center justify-center gap-1.5"
+                >
+                  <Link2 className="w-3.5 h-3.5" />
+                  {shareBusy ? "Creating link..." : "Create share link"}
+                </button>
+              </>
+            )}
+          </ModalPanel>
+        </ModalShell>
+      )}
+      </AnimatePresence>
 
       {/* ======================================================== */}
       {/* 2b. TABLE VIEW OVERLAY (Phase 2) */}

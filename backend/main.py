@@ -638,6 +638,9 @@ class RateLimiterMiddleware(BaseHTTPMiddleware):
             "/auth/verify-email": (10, 60),
             "/auth/": (30, 60),
             "/bookmarks": (60, 60),
+            "/collections": (60, 60),
+            "/threads": (60, 60),
+            "/share/": (60, 60),
             "default": (150, 60),
         }
 
@@ -1740,22 +1743,33 @@ def create_bookmark(
     "/bookmarks",
     tags=["Library"],
     summary="List saved papers",
-    description="Your saved papers, newest first. Verified accounts only.",
+    description="Your saved papers, newest first, each with `collection_ids` (its folders). `collection_id` limits the list "
+                "to one of your folders. Verified accounts only.",
     responses={**_ok({"bookmarks": [EXAMPLE_BOOKMARK]}), **E_401, **E_403},
 )
 def list_bookmarks(
     request: Request,
+    collection_id: int | None = Query(default=None, ge=1),
     authorization: str | None = Header(None),
 ):
     uid = resolve_user_id(request, authorization, require_verified=True)
     db = SessionLocal()
     try:
-        items = (
-            db.query(Bookmark)
-            .filter(Bookmark.user_id == uid)
-            .order_by(Bookmark.created_at.desc())
-            .all()
-        )
+        query = db.query(Bookmark).filter(Bookmark.user_id == uid)
+        if collection_id is not None:
+            _own_collection(db, uid, collection_id)
+            ids_in = [r[0] for r in db.query(CollectionItem.bookmark_id)
+                      .filter(CollectionItem.collection_id == collection_id).all()]
+            query = query.filter(Bookmark.id.in_(ids_in or [-1]))
+        items = query.order_by(Bookmark.created_at.desc()).all()
+        folder_map: dict[int, list[int]] = {}
+        if items:
+            own_folders = [c.id for c in db.query(Collection.id).filter(Collection.user_id == uid).all()]
+            if own_folders:
+                for cid, bid in (db.query(CollectionItem.collection_id, CollectionItem.bookmark_id)
+                                 .filter(CollectionItem.collection_id.in_(own_folders),
+                                         CollectionItem.bookmark_id.in_([b.id for b in items])).all()):
+                    folder_map.setdefault(bid, []).append(cid)
         return {
             "bookmarks": [
                 {
@@ -1768,6 +1782,7 @@ def list_bookmarks(
                     "source": b.source,
                     "doi": b.doi,
                     "created_at": b.created_at,
+                    "collection_ids": sorted(folder_map.get(b.id, [])),
                 }
                 for b in items
             ]
@@ -1796,6 +1811,8 @@ def delete_bookmark(
             .filter(Bookmark.id == bookmark_id, Bookmark.user_id == uid)
             .delete(synchronize_session=False)
         )
+        if deleted:
+            db.query(CollectionItem).filter(CollectionItem.bookmark_id == bookmark_id).delete(synchronize_session=False)
         db.commit()
         if not deleted:
             raise HTTPException(status_code=404, detail="Bookmark not found.")
@@ -4918,3 +4935,399 @@ def admin_clear_key(name: str, body: AdminCodeRequest, request: Request, authori
     reset_panel_key_cache()
     audit(admin, "key_clear", request, target=name)
     return {"name": name, "source": "env" if globals().get(name) else "none"}
+
+
+# ============================================================
+# COLLECTIONS, SAVED CONVERSATIONS AND SHARE LINKS (Phase 6)
+# Verified accounts only, like the library. A shared conversation is read-only, reachable only through an
+# unguessable link (256-bit random token), can be switched off at any time, and never shows who shared it.
+# ============================================================
+
+MAX_COLLECTIONS_PER_USER = 50
+MAX_THREADS_PER_USER = 200
+MAX_THREAD_TURNS = 50
+SHARE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{20,64}$")
+
+
+class Collection(Base):
+    __tablename__ = "collections"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    name = Column(String(100), nullable=False)
+    created_at = Column(DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+
+
+class CollectionItem(Base):
+    __tablename__ = "collection_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    collection_id = Column(Integer, nullable=False, index=True)
+    bookmark_id = Column(Integer, nullable=False, index=True)
+    created_at = Column(DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+
+
+class Thread(Base):
+    __tablename__ = "threads"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    title = Column(String(200), nullable=False)
+    turns = Column(JSON, nullable=False, default=list)
+    papers = Column(JSON, nullable=False, default=list)
+    share_token = Column(String(64), nullable=True, unique=True, index=True)
+    shared_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    updated_at = Column(DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+
+
+try:
+    Base.metadata.create_all(bind=engine, tables=[Collection.__table__, CollectionItem.__table__, Thread.__table__])
+except Exception as _phase6_tables_error:
+    print("Phase 6 tables note:", _phase6_tables_error)
+
+
+class CollectionNameRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+
+
+class CollectionItemRequest(BaseModel):
+    bookmark_id: int = Field(ge=1)
+
+
+class ThreadTurn(BaseModel):
+    question: str = Field(max_length=2000)
+    answer: str = Field(max_length=20000)
+    citations: list[dict] = Field(default_factory=list, max_length=50)
+    mode: str | None = Field(default=None, max_length=20)
+
+
+class ThreadSaveRequest(BaseModel):
+    title: str | None = Field(default=None, max_length=200)
+    turns: list[ThreadTurn] = Field(min_length=1, max_length=MAX_THREAD_TURNS)
+    papers: list[dict] = Field(default_factory=list, max_length=50)
+
+
+class ThreadRenameRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+
+
+def _clean_name(value: str, limit: int) -> str:
+    name = re.sub(r"\s+", " ", value or "").strip()[:limit]
+    if not name:
+        raise HTTPException(status_code=400, detail="Name cannot be empty.")
+    return name
+
+
+def _own_collection(db, uid: int, collection_id: int) -> "Collection":
+    collection = db.query(Collection).filter(Collection.id == collection_id, Collection.user_id == uid).first()
+    if not collection:
+        raise HTTPException(status_code=404, detail="Folder not found.")
+    return collection
+
+
+def _own_thread(db, uid: int, thread_id: int) -> "Thread":
+    thread = db.query(Thread).filter(Thread.id == thread_id, Thread.user_id == uid).first()
+    if not thread:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    return thread
+
+
+def _clean_turns(turns: list[ThreadTurn]) -> list[dict]:
+    out = []
+    for t in turns:
+        citations = []
+        for c in t.citations[:50]:
+            pid = c.get("paper_id") if isinstance(c, dict) else None
+            if isinstance(pid, int) and not isinstance(pid, bool) and 1 <= pid <= 1000:
+                citations.append({"paper_id": pid, "title": str(c.get("title") or "")[:300]})
+        out.append({
+            "question": t.question.strip(),
+            "answer": t.answer.strip(),
+            "citations": citations,
+            "mode": t.mode if t.mode in ("quick", "deep", "medical") else None,
+        })
+    return out
+
+
+def _thread_summary(t: "Thread") -> dict:
+    return {
+        "id": t.id,
+        "title": t.title,
+        "turn_count": len(t.turns or []),
+        "paper_count": len(t.papers or []),
+        "shared": bool(t.share_token),
+        "share_token": t.share_token,
+        "created_at": t.created_at.isoformat() if t.created_at else None,
+        "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+    }
+
+
+# ---------------------------------------------------------------- collections
+
+@app.get("/collections", tags=["Library"], summary="List your folders",
+         description="Your folders, oldest first, each with how many saved papers it holds. Verified accounts only.",
+         responses={**_ok({"collections": [{"id": 1, "name": "Thesis", "count": 4, "created_at": "2026-11-11T09:30:00"}]}),
+                    **E_401, **E_403})
+def list_collections(request: Request, authorization: str | None = Header(None)):
+    uid = resolve_user_id(request, authorization, require_verified=True)
+    from sqlalchemy import func
+
+    db = SessionLocal()
+    try:
+        rows = db.query(Collection).filter(Collection.user_id == uid).order_by(Collection.id).all()
+        ids = [c.id for c in rows]
+        counts = dict(db.query(CollectionItem.collection_id, func.count(CollectionItem.id))
+                      .filter(CollectionItem.collection_id.in_(ids)).group_by(CollectionItem.collection_id).all()) if ids else {}
+        return {"collections": [{"id": c.id, "name": c.name, "count": int(counts.get(c.id, 0)),
+                                 "created_at": c.created_at.isoformat() if c.created_at else None} for c in rows]}
+    finally:
+        db.close()
+
+
+@app.post("/collections", tags=["Library"], summary="Create a folder",
+          description=f"Creates a folder for saved papers. Names are up to 100 characters; at most {MAX_COLLECTIONS_PER_USER} "
+                      "folders per account. Verified accounts only.",
+          responses={**_ok({"id": 1, "name": "Thesis", "count": 0}), **E_401, **E_403})
+def create_collection(body: CollectionNameRequest, request: Request, authorization: str | None = Header(None)):
+    uid = resolve_user_id(request, authorization, require_verified=True)
+    name = _clean_name(body.name, 100)
+    db = SessionLocal()
+    try:
+        if db.query(Collection).filter(Collection.user_id == uid).count() >= MAX_COLLECTIONS_PER_USER:
+            raise HTTPException(status_code=400, detail=f"You can have up to {MAX_COLLECTIONS_PER_USER} folders.")
+        collection = Collection(user_id=uid, name=name)
+        db.add(collection)
+        db.commit()
+        db.refresh(collection)
+        return {"id": collection.id, "name": collection.name, "count": 0}
+    finally:
+        db.close()
+
+
+@app.post("/collections/{collection_id}/rename", tags=["Library"], summary="Rename a folder",
+          description="Renames one of your folders. Someone else's folder returns 404. Verified accounts only.",
+          responses={**_ok({"id": 1, "name": "Thesis chapter 2"}), **E_401, **E_403})
+def rename_collection(collection_id: int, body: CollectionNameRequest, request: Request,
+                      authorization: str | None = Header(None)):
+    uid = resolve_user_id(request, authorization, require_verified=True)
+    db = SessionLocal()
+    try:
+        collection = _own_collection(db, uid, collection_id)
+        collection.name = _clean_name(body.name, 100)
+        db.commit()
+        return {"id": collection.id, "name": collection.name}
+    finally:
+        db.close()
+
+
+@app.delete("/collections/{collection_id}", tags=["Library"], summary="Delete a folder",
+            description="Deletes the folder only. The papers in it stay in your library. Verified accounts only.",
+            responses={**_ok({"message": "Folder deleted."}), **E_401, **E_403})
+def delete_collection(collection_id: int, request: Request, authorization: str | None = Header(None)):
+    uid = resolve_user_id(request, authorization, require_verified=True)
+    db = SessionLocal()
+    try:
+        collection = _own_collection(db, uid, collection_id)
+        db.query(CollectionItem).filter(CollectionItem.collection_id == collection.id).delete(synchronize_session=False)
+        db.delete(collection)
+        db.commit()
+        return {"message": "Folder deleted."}
+    finally:
+        db.close()
+
+
+@app.post("/collections/{collection_id}/items", tags=["Library"], summary="Add a saved paper to a folder",
+          description="Adds one of your saved papers (`bookmark_id`) to one of your folders. Adding it twice is harmless. "
+                      "Verified accounts only.",
+          responses={**_ok({"collection_id": 1, "bookmark_id": 3, "added": True}), **E_401, **E_403})
+def add_collection_item(collection_id: int, body: CollectionItemRequest, request: Request,
+                        authorization: str | None = Header(None)):
+    uid = resolve_user_id(request, authorization, require_verified=True)
+    db = SessionLocal()
+    try:
+        _own_collection(db, uid, collection_id)
+        if not db.query(Bookmark).filter(Bookmark.id == body.bookmark_id, Bookmark.user_id == uid).first():
+            raise HTTPException(status_code=404, detail="Saved paper not found.")
+        exists = db.query(CollectionItem).filter(CollectionItem.collection_id == collection_id,
+                                                 CollectionItem.bookmark_id == body.bookmark_id).first()
+        if not exists:
+            db.add(CollectionItem(collection_id=collection_id, bookmark_id=body.bookmark_id))
+            db.commit()
+        return {"collection_id": collection_id, "bookmark_id": body.bookmark_id, "added": True}
+    finally:
+        db.close()
+
+
+@app.delete("/collections/{collection_id}/items/{bookmark_id}", tags=["Library"], summary="Remove a paper from a folder",
+            description="Takes the paper out of the folder. It stays in your library. Verified accounts only.",
+            responses={**_ok({"message": "Removed from folder."}), **E_401, **E_403})
+def remove_collection_item(collection_id: int, bookmark_id: int, request: Request,
+                           authorization: str | None = Header(None)):
+    uid = resolve_user_id(request, authorization, require_verified=True)
+    db = SessionLocal()
+    try:
+        _own_collection(db, uid, collection_id)
+        db.query(CollectionItem).filter(CollectionItem.collection_id == collection_id,
+                                        CollectionItem.bookmark_id == bookmark_id).delete(synchronize_session=False)
+        db.commit()
+        return {"message": "Removed from folder."}
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------- saved conversations
+
+@app.get("/threads", tags=["Library"], summary="List saved conversations",
+         description="Your saved conversations, most recently updated first (without the full text). Verified accounts only.",
+         responses={**_ok({"threads": [{"id": 1, "title": "Sleep and memory", "turn_count": 2, "paper_count": 30,
+                                       "shared": False, "share_token": None}]}), **E_401, **E_403})
+def list_threads(request: Request, authorization: str | None = Header(None)):
+    uid = resolve_user_id(request, authorization, require_verified=True)
+    db = SessionLocal()
+    try:
+        rows = db.query(Thread).filter(Thread.user_id == uid).order_by(Thread.updated_at.desc(), Thread.id.desc()).all()
+        return {"threads": [_thread_summary(t) for t in rows]}
+    finally:
+        db.close()
+
+
+@app.post("/threads", tags=["Library"], summary="Save a conversation",
+          description=f"Saves the questions, answers and papers of a conversation (up to {MAX_THREAD_TURNS} turns and 50 papers). "
+                      "The title defaults to the first question. Verified accounts only.",
+          responses={**_ok({"id": 1, "title": "Sleep and memory", "turn_count": 1}), **E_401, **E_403})
+def create_thread(body: ThreadSaveRequest, request: Request, authorization: str | None = Header(None)):
+    uid = resolve_user_id(request, authorization, require_verified=True)
+    turns = _clean_turns(body.turns)
+    title = _clean_name(body.title or turns[0]["question"], 200)
+    db = SessionLocal()
+    try:
+        if db.query(Thread).filter(Thread.user_id == uid).count() >= MAX_THREADS_PER_USER:
+            raise HTTPException(status_code=400, detail=f"You can save up to {MAX_THREADS_PER_USER} conversations. "
+                                                        "Delete some to save more.")
+        thread = Thread(user_id=uid, title=title, turns=turns,
+                        papers=[sanitize_paper_for_storage(p) for p in body.papers[:50]])
+        db.add(thread)
+        db.commit()
+        db.refresh(thread)
+        return _thread_summary(thread)
+    finally:
+        db.close()
+
+
+@app.get("/threads/{thread_id}", tags=["Library"], summary="Open a saved conversation",
+         description="Returns one of your saved conversations in full. Someone else's returns 404. Verified accounts only.",
+         responses={**_ok({"id": 1, "title": "Sleep and memory", "turns": [], "papers": []}), **E_401, **E_403})
+def get_thread(thread_id: int, request: Request, authorization: str | None = Header(None)):
+    uid = resolve_user_id(request, authorization, require_verified=True)
+    db = SessionLocal()
+    try:
+        t = _own_thread(db, uid, thread_id)
+        return {**_thread_summary(t), "turns": t.turns or [], "papers": t.papers or []}
+    finally:
+        db.close()
+
+
+@app.post("/threads/{thread_id}", tags=["Library"], summary="Update a saved conversation",
+          description="Replaces the turns and papers (for example after more follow-up questions). A share link keeps "
+                      "working and shows the update. Verified accounts only.",
+          responses={**_ok({"id": 1, "title": "Sleep and memory", "turn_count": 3}), **E_401, **E_403})
+def update_thread(thread_id: int, body: ThreadSaveRequest, request: Request, authorization: str | None = Header(None)):
+    uid = resolve_user_id(request, authorization, require_verified=True)
+    db = SessionLocal()
+    try:
+        t = _own_thread(db, uid, thread_id)
+        t.turns = _clean_turns(body.turns)
+        t.papers = [sanitize_paper_for_storage(p) for p in body.papers[:50]]
+        if body.title:
+            t.title = _clean_name(body.title, 200)
+        t.updated_at = _utcnow().replace(tzinfo=None)
+        db.commit()
+        return _thread_summary(t)
+    finally:
+        db.close()
+
+
+@app.post("/threads/{thread_id}/rename", tags=["Library"], summary="Rename a saved conversation",
+          description="Changes the title. Verified accounts only.",
+          responses={**_ok({"id": 1, "title": "New title"}), **E_401, **E_403})
+def rename_thread(thread_id: int, body: ThreadRenameRequest, request: Request, authorization: str | None = Header(None)):
+    uid = resolve_user_id(request, authorization, require_verified=True)
+    db = SessionLocal()
+    try:
+        t = _own_thread(db, uid, thread_id)
+        t.title = _clean_name(body.title, 200)
+        db.commit()
+        return _thread_summary(t)
+    finally:
+        db.close()
+
+
+@app.delete("/threads/{thread_id}", tags=["Library"], summary="Delete a saved conversation",
+            description="Deletes it. A share link to it stops working at once. Verified accounts only.",
+            responses={**_ok({"message": "Conversation deleted."}), **E_401, **E_403})
+def delete_thread(thread_id: int, request: Request, authorization: str | None = Header(None)):
+    uid = resolve_user_id(request, authorization, require_verified=True)
+    db = SessionLocal()
+    try:
+        db.delete(_own_thread(db, uid, thread_id))
+        db.commit()
+        return {"message": "Conversation deleted."}
+    finally:
+        db.close()
+
+
+@app.post("/threads/{thread_id}/share", tags=["Library"], summary="Turn on a share link",
+          description="Creates a read-only link (`/share/<token>`) anyone can open. The token is 256-bit random. Sharing again "
+                      "returns the same link. Verified accounts only.",
+          responses={**_ok({"id": 1, "shared": True, "share_token": "Xy..."}), **E_401, **E_403})
+def share_thread(thread_id: int, request: Request, authorization: str | None = Header(None)):
+    uid = resolve_user_id(request, authorization, require_verified=True)
+    db = SessionLocal()
+    try:
+        t = _own_thread(db, uid, thread_id)
+        if not t.share_token:
+            t.share_token = secrets.token_urlsafe(32)
+            t.shared_at = _utcnow().replace(tzinfo=None)
+            db.commit()
+        return _thread_summary(t)
+    finally:
+        db.close()
+
+
+@app.post("/threads/{thread_id}/unshare", tags=["Library"], summary="Turn off the share link",
+          description="The old link stops working immediately. Sharing again later creates a new, different link. "
+                      "Verified accounts only.",
+          responses={**_ok({"id": 1, "shared": False, "share_token": None}), **E_401, **E_403})
+def unshare_thread(thread_id: int, request: Request, authorization: str | None = Header(None)):
+    uid = resolve_user_id(request, authorization, require_verified=True)
+    db = SessionLocal()
+    try:
+        t = _own_thread(db, uid, thread_id)
+        t.share_token = None
+        t.shared_at = None
+        db.commit()
+        return _thread_summary(t)
+    finally:
+        db.close()
+
+
+@app.get("/share/{token}", tags=["Library"], summary="Open a shared conversation",
+         description="Public, read-only. Returns the title, questions, answers and papers of a shared conversation, and nothing "
+                     "about who shared it. Unknown or switched-off links return 404.",
+         responses={**_ok({"title": "Sleep and memory", "turns": [], "papers": [], "shared_at": "2026-11-11T09:30:00"}),
+                    **_err(404, "Unknown or switched-off link.", "This shared conversation is not available.")})
+def open_shared_thread(token: str, response: Response):
+    response.headers["X-Robots-Tag"] = "noindex, nofollow"
+    if not SHARE_TOKEN_RE.fullmatch(token or ""):
+        raise HTTPException(status_code=404, detail="This shared conversation is not available.")
+    db = SessionLocal()
+    try:
+        t = db.query(Thread).filter(Thread.share_token == token).first()
+        if not t:
+            raise HTTPException(status_code=404, detail="This shared conversation is not available.")
+        return {"title": t.title, "turns": t.turns or [], "papers": t.papers or [],
+                "shared_at": t.shared_at.isoformat() if t.shared_at else None,
+                "updated_at": t.updated_at.isoformat() if t.updated_at else None}
+    finally:
+        db.close()
