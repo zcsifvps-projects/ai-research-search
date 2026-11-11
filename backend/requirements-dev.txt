@@ -1,2 +1,4 @@
 -r requirements.txt
 pytest==9.1.1
+# Starlette's test client uses httpx2 (plain httpx is deprecated there and prints a warning)
+httpx2==2.16.0

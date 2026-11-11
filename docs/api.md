@@ -169,6 +169,11 @@ Full request and response shapes, with examples for every status code, are in th
 - With no abstract it answers without an AI call and `glance` is `null`.
 - Cached per paper (title and abstract) for 24 hours, so analysing the same paper again uses no AI quota.
 
+### Admin
+
+The admin routes (`/admin/...`) are not part of the public API and are left out of the interactive docs. They need a signed-in
+admin account plus an authenticator code. See `docs/admin.md`.
+
 ### How `/ask` stays grounded
 
 - Only the first 6 papers that have an abstract are used. A paper without an abstract is never evidence.

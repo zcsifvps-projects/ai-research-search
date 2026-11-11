@@ -195,6 +195,12 @@ class User(Base):
     verification_token_expires_at = Column(DateTime, nullable=True)
     # sessions issued before this moment are rejected ("sign out everywhere")
     tokens_valid_after = Column(DateTime, nullable=True)
+    # Phase 5: admin rights are granted only by backend/make_admin.py; disabled accounts cannot sign in.
+    is_admin = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    is_disabled = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    totp_secret = Column(Text, nullable=True)        # encrypted with SETTINGS_ENCRYPTION_KEY
+    totp_last_step = Column(Integer, nullable=True)  # last accepted authenticator time step (no code reuse)
+    last_login_at = Column(DateTime, nullable=True)
     created_at = Column(
         DateTime,
         nullable=False,
@@ -260,6 +266,11 @@ def init_db():
             conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires_at TIMESTAMP;"))
             conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS verification_token_expires_at TIMESTAMP;"))
             conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS tokens_valid_after TIMESTAMP;"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_disabled BOOLEAN NOT NULL DEFAULT FALSE;"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret TEXT;"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_last_step INTEGER;"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP;"))
             conn.commit()
     except Exception as e:
         print("Schema migration note:", e)
@@ -397,7 +408,7 @@ def _load_session_user(payload: dict | None) -> "User | None":
     db = SessionLocal()
     try:
         user = db.query(User).filter(User.id == uid).first()
-        if not user:
+        if not user or getattr(user, "is_disabled", False):
             return None
         if "pv" in payload and payload["pv"] != password_version(user.hashed_password):
             return None
@@ -614,6 +625,9 @@ class RateLimiterMiddleware(BaseHTTPMiddleware):
             "/takeaways": (20, 60),
             "/compare": (20, 60),
             "/deep-research": (5, 60),
+            "/admin/unlock": (10, 60),
+            "/admin/keys": (20, 60),
+            "/admin": (120, 60),
             "/mode": (60, 60),
             "/search": (60, 60),
             "/auth/login": (10, 60),
@@ -890,15 +904,17 @@ except Exception as e:
 # ============================================================
 
 def get_gemini_client():
-    if not GEMINI_API_KEY:
+    key = effective_key("GEMINI_API_KEY")
+    if not key:
         return None
-    return genai.Client(api_key=GEMINI_API_KEY)
+    return genai.Client(api_key=key)
 
 
 def get_groq_client():
-    if not GROQ_API_KEY:
+    key = effective_key("GROQ_API_KEY")
+    if not key:
         return None
-    return Groq(api_key=GROQ_API_KEY)
+    return Groq(api_key=key)
 
 
 # ============================================================
@@ -1309,10 +1325,13 @@ def login(req: LoginRequest, response: Response):
             record_login_failure(email)
             raise HTTPException(status_code=401, detail="Invalid email or password.")
         counter_reset(login_lock_key(email))
+        if user.is_disabled:
+            raise HTTPException(status_code=403, detail="This account has been disabled. Please contact support.")
 
         if password_needs_rehash(user.hashed_password):
             user.hashed_password = hash_password(req.password)
-            db.commit()
+        user.last_login_at = _utcnow().replace(tzinfo=None)
+        db.commit()
 
         token = create_access_token(user.id, user.email, user.hashed_password)
         set_auth_cookie(response, token)
@@ -2252,8 +2271,9 @@ async def search_semantic_scholar(client, q, year_min=None, year_max=None, oa_on
         params["fieldsOfStudy"] = ",".join(FIELDS_OF_STUDY[flt["field"]]["s2"])
 
     headers = {}
-    if SEMANTIC_SCHOLAR_API_KEY:
-        headers["x-api-key"] = SEMANTIC_SCHOLAR_API_KEY
+    s2_key = effective_key("SEMANTIC_SCHOLAR_API_KEY")
+    if s2_key:
+        headers["x-api-key"] = s2_key
 
     try:
         response = await client.get(url, params=params, headers=headers)
@@ -2434,11 +2454,12 @@ async def search_crossref(client, q, year_min=None, year_max=None, oa_only=False
 # ============================================================
 
 async def search_core(client, q, year_min=None, year_max=None, oa_only=False, filters=None):
-    if not CORE_API_KEY:
+    core_key = effective_key("CORE_API_KEY")
+    if not core_key:
         print("CORE_API_KEY not configured. Skipping CORE.")
         return []
     url = "https://api.core.ac.uk/v3/search/works/"
-    headers = {"Authorization": f"Bearer {CORE_API_KEY}"}
+    headers = {"Authorization": f"Bearer {core_key}"}
     query = q.rstrip("?")
     if year_min is not None:
         query = f"({query}) AND yearPublished>={year_min}"
@@ -2498,8 +2519,9 @@ def ncbi_params() -> dict:
     email = NCBI_EMAIL or CONTACT_EMAIL
     if email:
         params["email"] = email
-    if NCBI_API_KEY:
-        params["api_key"] = NCBI_API_KEY
+    ncbi_key = effective_key("NCBI_API_KEY")
+    if ncbi_key:
+        params["api_key"] = ncbi_key
     return params
 
 
@@ -4258,3 +4280,641 @@ async def compare(request: CompareRequest, req: Request, authorization: str | No
     response = {"summary": str(result["summary"]).strip()[:2000], "rows": rows}
     set_in_search_cache(cache_key, response, ttl=7200)
     return response
+
+
+# ============================================================
+# ADMIN (Phase 5)
+#
+# Security model:
+# - Admin rights are granted only on the server (backend/make_admin.py). No web route can make someone an admin.
+# - The admin area needs the normal sign-in PLUS a 6-digit authenticator-app code (TOTP, RFC 6238). Unlocking sets a
+#   separate short-lived `admin_token` cookie (30 minutes) that is tied to the current sign-in session: signing out,
+#   changing the password, "log out everywhere" or losing admin rights ends it.
+# - Every admin action is written to admin_audit_log. API key values are never logged, returned or shown.
+# - API keys saved in the panel are encrypted with AES-256-GCM using SETTINGS_ENCRYPTION_KEY (from .env). A database
+#   dump alone does not reveal them. Each key change needs a fresh authenticator code and is tested against the
+#   provider before it is saved, so a wrong key never goes live. With no panel value, the .env value is used.
+# ============================================================
+
+ADMIN_SESSION_MINUTES = int(os.getenv("ADMIN_SESSION_MINUTES", "30"))
+ADMIN_CODE_MAX_FAILURES = 5          # wrong authenticator codes per admin ...
+ADMIN_CODE_LOCK_SECONDS = 900        # ... within 15 minutes, then locked until the window ends
+SETTINGS_ENCRYPTION_KEY = os.getenv("SETTINGS_ENCRYPTION_KEY", "").strip()
+TOTP_PERIOD = 30
+TOTP_DIGITS = 6
+
+
+class AppSetting(Base):
+    """API keys saved from the admin panel (encrypted). A missing row means the .env value is used."""
+    __tablename__ = "app_settings"
+
+    name = Column(String(64), primary_key=True)
+    value_encrypted = Column(Text, nullable=False)
+    last4 = Column(String(8), nullable=True)
+    updated_at = Column(DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    updated_by = Column(Integer, nullable=True)
+
+
+class AdminAuditLog(Base):
+    __tablename__ = "admin_audit_log"
+
+    id = Column(Integer, primary_key=True, index=True)
+    admin_user_id = Column(Integer, nullable=True, index=True)
+    admin_email = Column(String(255), nullable=True)
+    action = Column(String(64), nullable=False, index=True)
+    target = Column(String(255), nullable=True)
+    detail = Column(String(500), nullable=True)
+    ip = Column(String(64), nullable=True)
+    created_at = Column(DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP"), index=True)
+
+
+# New tables are created now; the new user columns are added by init_db() on startup.
+try:
+    Base.metadata.create_all(bind=engine, tables=[AppSetting.__table__, AdminAuditLog.__table__])
+except Exception as _admin_tables_error:
+    print("Admin tables note:", _admin_tables_error)
+
+
+# ---------------------------------------------------------------- encryption (AES-256-GCM)
+
+def _settings_cipher():
+    """AESGCM cipher from SETTINGS_ENCRYPTION_KEY, or None when it is not configured or invalid."""
+    if not SETTINGS_ENCRYPTION_KEY:
+        return None
+    try:
+        import base64
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        raw = base64.urlsafe_b64decode(SETTINGS_ENCRYPTION_KEY + "=" * (-len(SETTINGS_ENCRYPTION_KEY) % 4))
+        if len(raw) != 32:
+            print("SETTINGS_ENCRYPTION_KEY must decode to 32 bytes; admin features are disabled.")
+            return None
+        return AESGCM(raw)
+    except Exception as error:
+        print("SETTINGS_ENCRYPTION_KEY note:", type(error).__name__)
+        return None
+
+
+def encrypt_setting(name: str, value: str) -> str:
+    import base64
+
+    cipher = _settings_cipher()
+    if cipher is None:
+        raise RuntimeError("SETTINGS_ENCRYPTION_KEY is not configured.")
+    nonce = secrets.token_bytes(12)
+    # The setting name is authenticated data: a ciphertext cannot be moved to a different setting.
+    sealed = cipher.encrypt(nonce, value.encode("utf-8"), name.encode("utf-8"))
+    return "v1:" + base64.urlsafe_b64encode(nonce + sealed).decode("ascii")
+
+
+def decrypt_setting(name: str, stored: str) -> str | None:
+    import base64
+
+    cipher = _settings_cipher()
+    if cipher is None or not stored or not stored.startswith("v1:"):
+        return None
+    try:
+        blob = base64.urlsafe_b64decode(stored[3:])
+        return cipher.decrypt(blob[:12], blob[12:], name.encode("utf-8")).decode("utf-8")
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------- authenticator codes (TOTP, RFC 6238)
+
+def new_totp_secret() -> str:
+    import base64
+
+    return base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
+
+
+def totp_code(secret_b32: str, step: int) -> str:
+    import base64
+    import struct
+
+    key = base64.b32decode(secret_b32.upper() + "=" * (-len(secret_b32) % 8))
+    digest = hmac.new(key, struct.pack(">Q", step), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    number = (int.from_bytes(digest[offset:offset + 4], "big") & 0x7FFFFFFF) % (10 ** TOTP_DIGITS)
+    return str(number).zfill(TOTP_DIGITS)
+
+
+def match_totp(secret_b32: str, code: str, last_step: int | None, at: float | None = None) -> int | None:
+    """Return the matching time step (one step of clock drift allowed either way), or None. A step at or
+    before last_step is refused, so a code can never be used twice."""
+    code = (code or "").strip().replace(" ", "")
+    if not re.fullmatch(r"\d{6}", code):
+        return None
+    current = int((at if at is not None else time.time()) // TOTP_PERIOD)
+    for step in (current - 1, current, current + 1):
+        if last_step is not None and step <= last_step:
+            continue
+        if hmac.compare_digest(totp_code(secret_b32, step), code):
+            return step
+    return None
+
+
+def totp_uri(secret_b32: str, email: str) -> str:
+    from urllib.parse import quote
+
+    issuer = quote(APP_NAME)
+    return f"otpauth://totp/{issuer}:{quote(email)}?secret={secret_b32}&issuer={issuer}&period={TOTP_PERIOD}&digits={TOTP_DIGITS}"
+
+
+# ---------------------------------------------------------------- admin session cookie
+
+def _sign(purpose: str, payload_hex: str) -> str:
+    return hmac.new(AUTH_SECRET.encode("utf-8"), f"{purpose}:{payload_hex}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def create_admin_token(user: "User", session_jti: str) -> tuple[str, int]:
+    expires = int(time.time()) + ADMIN_SESSION_MINUTES * 60
+    payload = {"uid": user.id, "sid": session_jti, "pv": password_version(user.hashed_password), "exp": expires}
+    payload_hex = json.dumps(payload, separators=(",", ":")).encode("utf-8").hex()
+    return f"{payload_hex}.{_sign('admin', payload_hex)}", expires
+
+
+def read_admin_token(token: str | None) -> dict | None:
+    if not token or "." not in token:
+        return None
+    try:
+        payload_hex, signature = token.split(".", 1)
+        if not hmac.compare_digest(signature, _sign("admin", payload_hex)):
+            return None
+        payload = json.loads(bytes.fromhex(payload_hex).decode("utf-8"))
+        return payload if payload.get("exp", 0) >= int(time.time()) else None
+    except Exception:
+        return None
+
+
+def _admin_cookie_kwargs() -> dict:
+    kwargs = {"key": "admin_token", "path": "/", "httponly": True, "secure": COOKIE_SECURE,
+              # Strict: the admin cookie is never sent on requests started by other sites.
+              "samesite": "strict" if COOKIE_SAMESITE != "none" else "none"}
+    if COOKIE_DOMAIN:
+        kwargs["domain"] = COOKIE_DOMAIN
+    return kwargs
+
+
+def session_user_and_jti(request: Request, authorization: str | None = None) -> tuple["User", str]:
+    """The signed-in user and their session id. 401 when not signed in."""
+    token = extract_token_from_request(request, authorization)
+    payload = verify_access_token(token) if token else None
+    user = _load_session_user(payload)
+    if not user or not payload.get("jti"):
+        raise HTTPException(status_code=401, detail="Authentication required.")
+    return user, payload["jti"]
+
+
+def require_admin(request: Request, authorization: str | None = None) -> "User":
+    """Signed in, verified, not disabled, still an admin, and unlocked with an authenticator code for this session."""
+    user, jti = session_user_and_jti(request, authorization)
+    if not getattr(user, "is_admin", False) or not user.is_verified:
+        raise HTTPException(status_code=403, detail="Not authorized.")
+    admin = read_admin_token(request.cookies.get("admin_token"))
+    if (not admin or admin.get("uid") != user.id or admin.get("sid") != jti
+            or admin.get("pv") != password_version(user.hashed_password)):
+        raise HTTPException(status_code=403, detail="Admin area locked. Enter your authenticator code.")
+    return user
+
+
+def audit(admin: "User | None", action: str, request: Request | None, target: str | None = None,
+          detail: str | None = None):
+    db = SessionLocal()
+    try:
+        db.add(AdminAuditLog(
+            admin_user_id=admin.id if admin else None,
+            admin_email=admin.email if admin else None,
+            action=action[:64],
+            target=(target or "")[:255] or None,
+            detail=(detail or "")[:500] or None,
+            ip=(get_client_ip(request) if request is not None else None),
+        ))
+        db.commit()
+    except Exception as error:
+        print("Audit log note:", error)
+    finally:
+        db.close()
+
+
+def _check_admin_code(user_id: int, code: str) -> None:
+    """Verify an authenticator code for this admin (lockout after repeated failures; codes are single-use)."""
+    fail_key = f"adminfail:{user_id}"
+    if counter_get(fail_key) >= ADMIN_CODE_MAX_FAILURES:
+        raise HTTPException(status_code=429, detail="Too many wrong codes. Please wait 15 minutes.",
+                            headers={"Retry-After": str(max(1, counter_ttl(fail_key)))})
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        secret = decrypt_setting(f"totp:{user_id}", user.totp_secret) if user and user.totp_secret else None
+        if not secret:
+            raise HTTPException(status_code=403, detail="No authenticator is set up for this account. "
+                                                        "Run make_admin.py on the server.")
+        step = match_totp(secret, code, user.totp_last_step)
+        if step is None:
+            counter_incr(fail_key, ADMIN_CODE_LOCK_SECONDS)
+            raise HTTPException(status_code=401, detail="Wrong or already used code. Wait for the next code and try again.")
+        user.totp_last_step = step
+        db.commit()
+        counter_reset(fail_key)
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------- API keys editable from the panel
+
+def _test_gemini(key: str):
+    genai.Client(api_key=key).models.get(model=GEMINI_MODEL)
+
+
+def _test_groq(key: str):
+    Groq(api_key=key).models.list()
+
+
+def _test_http(url: str, params: dict | None = None, headers: dict | None = None):
+    response = httpx.get(url, params=params, headers=headers, timeout=15.0, follow_redirects=True)
+    if response.status_code in (401, 403):
+        raise ValueError("The provider rejected this key.")
+    response.raise_for_status()
+
+
+def _test_core(key: str):
+    _test_http("https://api.core.ac.uk/v3/search/works/", {"q": "test", "limit": 1}, {"Authorization": f"Bearer {key}"})
+
+
+def _test_semantic_scholar(key: str):
+    _test_http("https://api.semanticscholar.org/graph/v1/paper/search", {"query": "test", "limit": 1}, {"x-api-key": key})
+
+
+def _test_ncbi(key: str):
+    response = httpx.get(f"{NCBI_EUTILS}/einfo.fcgi", params={"db": "pubmed", "retmode": "json", "api_key": key},
+                         timeout=15.0)
+    if response.status_code != 200 or "error" in response.text[:500].lower():
+        raise ValueError("The provider rejected this key.")
+
+
+MANAGED_KEYS = {
+    "GEMINI_API_KEY": {"label": "Gemini (main AI)", "test": _test_gemini},
+    "GROQ_API_KEY": {"label": "Groq (AI fallback)", "test": _test_groq},
+    "CORE_API_KEY": {"label": "CORE (papers)", "test": _test_core},
+    "SEMANTIC_SCHOLAR_API_KEY": {"label": "Semantic Scholar (papers)", "test": _test_semantic_scholar},
+    "NCBI_API_KEY": {"label": "PubMed / NCBI (papers)", "test": _test_ncbi},
+}
+
+_PANEL_KEYS: dict[str, str] | None = None   # decrypted panel values, loaded once (single worker)
+_PANEL_KEYS_LOCK = threading.Lock()
+
+
+def _load_panel_keys() -> dict[str, str]:
+    global _PANEL_KEYS
+    with _PANEL_KEYS_LOCK:
+        if _PANEL_KEYS is None:
+            values = {}
+            db = SessionLocal()
+            try:
+                for row in db.query(AppSetting).filter(AppSetting.name.in_(list(MANAGED_KEYS))).all():
+                    value = decrypt_setting(row.name, row.value_encrypted)
+                    if value:
+                        values[row.name] = value
+            except Exception as error:
+                print("Panel keys note:", type(error).__name__)
+            finally:
+                db.close()
+            _PANEL_KEYS = values
+        return _PANEL_KEYS
+
+
+def effective_key(name: str) -> str:
+    """The key in use: a value saved in the admin panel wins, otherwise the .env value."""
+    return _load_panel_keys().get(name) or globals().get(name, "") or ""
+
+
+def reset_panel_key_cache():
+    global _PANEL_KEYS
+    with _PANEL_KEYS_LOCK:
+        _PANEL_KEYS = None
+
+
+def _last4(value: str) -> str:
+    return value[-4:] if len(value) >= 8 else ""
+
+
+# ---------------------------------------------------------------- request models
+
+class AdminCodeRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=8)
+
+
+class AdminKeyRequest(BaseModel):
+    value: str = Field(min_length=8, max_length=500)
+    code: str = Field(min_length=6, max_length=8)
+
+
+E_ADMIN = {
+    **_err(401, "Not signed in, or a wrong / already used authenticator code.", "Authentication required."),
+    **_err(403, "Not an admin, or the admin area is locked.", "Admin area locked. Enter your authenticator code."),
+}
+
+
+# ---------------------------------------------------------------- routes
+
+@app.get("/admin/status", tags=["Admin"], include_in_schema=False, summary="Admin access status",
+          description="Whether the signed-in user is an admin and whether the admin area is unlocked for this session.", responses=E_ADMIN)
+def admin_status(request: Request, authorization: str | None = Header(None)):
+    user, jti = session_user_and_jti(request, authorization)
+    is_admin = bool(getattr(user, "is_admin", False)) and user.is_verified
+    admin = read_admin_token(request.cookies.get("admin_token")) if is_admin else None
+    unlocked = bool(admin and admin.get("uid") == user.id and admin.get("sid") == jti
+                    and admin.get("pv") == password_version(user.hashed_password))
+    return {
+        "is_admin": is_admin,
+        "unlocked": unlocked,
+        "expires_at": admin.get("exp") if unlocked else None,
+        "encryption_configured": _settings_cipher() is not None,
+        "session_minutes": ADMIN_SESSION_MINUTES,
+    }
+
+
+@app.post("/admin/unlock", tags=["Admin"], include_in_schema=False, summary="Unlock the admin area with an authenticator code",
+          description="Checks a 6-digit authenticator code and sets a 30-minute `admin_token` cookie tied to this sign-in. Each code works once; 5 wrong codes lock for 15 minutes.",
+          responses={**_ok({"unlocked": True, "expires_at": 1767225600}), **E_ADMIN, **E_RATE})
+def admin_unlock(body: AdminCodeRequest, request: Request, response: Response, authorization: str | None = Header(None)):
+    user, jti = session_user_and_jti(request, authorization)
+    if not getattr(user, "is_admin", False) or not user.is_verified:
+        raise HTTPException(status_code=403, detail="Not authorized.")
+    if _settings_cipher() is None:
+        raise HTTPException(status_code=503, detail="Admin is not configured on the server (SETTINGS_ENCRYPTION_KEY).")
+    try:
+        _check_admin_code(user.id, body.code)
+    except HTTPException as error:
+        if error.status_code == 401:
+            audit(user, "unlock_failed", request)
+        raise
+    token, expires = create_admin_token(user, jti)
+    response.set_cookie(value=token, max_age=ADMIN_SESSION_MINUTES * 60, **_admin_cookie_kwargs())
+    audit(user, "unlock", request)
+    return {"unlocked": True, "expires_at": expires}
+
+
+@app.post("/admin/lock", tags=["Admin"], include_in_schema=False, summary="Lock the admin area",
+          description="Clears the admin cookie. The normal sign-in stays.", responses=_ok({"unlocked": False}))
+def admin_lock(response: Response):
+    kwargs = _admin_cookie_kwargs()
+    response.delete_cookie(**{k: v for k, v in kwargs.items()})
+    return {"unlocked": False}
+
+
+@app.get("/admin/overview", tags=["Admin"], include_in_schema=False, summary="Dashboard numbers",
+          description="Users, answers saved, AI calls and deep research runs today against the daily caps.", responses=E_ADMIN)
+def admin_overview(request: Request, authorization: str | None = Header(None)):
+    require_admin(request, authorization)
+    now = _utcnow().replace(tzinfo=None)
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    day = _utcnow().strftime("%Y%m%d")
+    db = SessionLocal()
+    try:
+        users = db.query(User)
+        data = {
+            "users": {
+                "total": users.count(),
+                "verified": users.filter(User.is_verified.is_(True)).count(),
+                "new_7_days": users.filter(User.created_at >= now - timedelta(days=7)).count(),
+                "active_today": users.filter(User.last_login_at >= today).count(),
+                "disabled": users.filter(User.is_disabled.is_(True)).count(),
+                "admins": users.filter(User.is_admin.is_(True)).count(),
+            },
+            "answers": {
+                "today": db.query(SearchHistory).filter(SearchHistory.created_at >= today).count(),
+                "last_7_days": db.query(SearchHistory).filter(SearchHistory.created_at >= now - timedelta(days=7)).count(),
+            },
+        }
+    finally:
+        db.close()
+    data["ai"] = {
+        "calls_today": counter_get(f"ai:g:{day}"), "daily_cap": AI_DAILY_LIMIT_GLOBAL,
+        "guest_cap": AI_DAILY_LIMIT_GUEST, "user_cap": AI_DAILY_LIMIT_USER,
+    }
+    data["deep"] = {
+        "runs_today": counter_get(f"deep:g:{day}"), "daily_cap": DEEP_DAILY_LIMIT_GLOBAL,
+        "guest_cap": DEEP_DAILY_LIMIT_GUEST, "user_cap": DEEP_DAILY_LIMIT_USER,
+    }
+    data["counters_shared"] = redis_client is not None
+    return data
+
+
+def _user_row(user: "User", answers: int) -> dict:
+    return {
+        "id": user.id, "email": user.email, "full_name": user.full_name, "is_verified": bool(user.is_verified),
+        "is_admin": bool(user.is_admin), "is_disabled": bool(user.is_disabled),
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+        "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
+        "answers": answers,
+    }
+
+
+@app.get("/admin/users", tags=["Admin"], include_in_schema=False, summary="List users",
+          description="Paged user list with optional search on email or name, newest first.", responses=E_ADMIN)
+def admin_users(request: Request, q: str = Query(default="", max_length=255), page: int = Query(default=1, ge=1, le=10000),
+                page_size: int = Query(default=25, ge=1, le=100), authorization: str | None = Header(None)):
+    require_admin(request, authorization)
+    from sqlalchemy import func, or_
+
+    db = SessionLocal()
+    try:
+        query = db.query(User)
+        term = q.strip().lower()
+        if term:
+            like = "%" + term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            query = query.filter(or_(func.lower(User.email).like(like, escape="\\"),
+                                     func.lower(User.full_name).like(like, escape="\\")))
+        total = query.count()
+        users = query.order_by(User.created_at.desc(), User.id.desc()).offset((page - 1) * page_size).limit(page_size).all()
+        ids = [u.id for u in users]
+        counts = dict(db.query(SearchHistory.user_id, func.count(SearchHistory.id))
+                      .filter(SearchHistory.user_id.in_(ids)).group_by(SearchHistory.user_id).all()) if ids else {}
+        return {"total": total, "page": page, "page_size": page_size,
+                "users": [_user_row(u, int(counts.get(u.id, 0))) for u in users]}
+    finally:
+        db.close()
+
+
+def _target_user(db, user_id: int) -> "User":
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    return user
+
+
+@app.post("/admin/users/{user_id}/disable", tags=["Admin"], include_in_schema=False, summary="Disable an account (reversible)",
+          description="Blocks sign-in and ends the user's sessions. Reversible. Admin accounts cannot be disabled here.", responses=E_ADMIN)
+def admin_disable_user(user_id: int, request: Request, authorization: str | None = Header(None)):
+    admin = require_admin(request, authorization)
+    db = SessionLocal()
+    try:
+        user = _target_user(db, user_id)
+        if user.id == admin.id or user.is_admin:
+            raise HTTPException(status_code=400, detail="Admin accounts cannot be disabled here.")
+        user.is_disabled = True
+        user.tokens_valid_after = _utcnow().replace(tzinfo=None)  # ends their sessions now
+        db.commit()
+        audit(admin, "user_disable", request, target=user.email)
+        return {"id": user.id, "is_disabled": True}
+    finally:
+        db.close()
+
+
+@app.post("/admin/users/{user_id}/enable", tags=["Admin"], include_in_schema=False, summary="Re-enable an account",
+          description="Allows a disabled account to sign in again.", responses=E_ADMIN)
+def admin_enable_user(user_id: int, request: Request, authorization: str | None = Header(None)):
+    admin = require_admin(request, authorization)
+    db = SessionLocal()
+    try:
+        user = _target_user(db, user_id)
+        user.is_disabled = False
+        db.commit()
+        audit(admin, "user_enable", request, target=user.email)
+        return {"id": user.id, "is_disabled": False}
+    finally:
+        db.close()
+
+
+@app.post("/admin/users/{user_id}/logout-all", tags=["Admin"], include_in_schema=False, summary="Sign a user out everywhere",
+          description="Ends every session of this user.", responses=E_ADMIN)
+def admin_logout_user(user_id: int, request: Request, authorization: str | None = Header(None)):
+    admin = require_admin(request, authorization)
+    if user_id == admin.id:
+        raise HTTPException(status_code=400, detail="Use \"Log out of all devices\" in your own settings instead.")
+    db = SessionLocal()
+    try:
+        user = _target_user(db, user_id)
+        user.tokens_valid_after = _utcnow().replace(tzinfo=None)
+        db.commit()
+        audit(admin, "user_logout_all", request, target=user.email)
+        return {"id": user.id, "signed_out": True}
+    finally:
+        db.close()
+
+
+@app.post("/admin/users/{user_id}/resend-verification", tags=["Admin"], include_in_schema=False, summary="Resend the verification email",
+          description="Sends a new verification link to an unverified account (email limits apply).",
+          responses=E_ADMIN)
+def admin_resend_verification(user_id: int, request: Request, background_tasks: BackgroundTasks,
+                              authorization: str | None = Header(None)):
+    admin = require_admin(request, authorization)
+    db = SessionLocal()
+    try:
+        user = _target_user(db, user_id)
+        if user.is_verified:
+            raise HTTPException(status_code=400, detail="This account is already verified.")
+        if not email_allowed("verify", user.email):
+            raise HTTPException(status_code=429, detail="Too many emails to this address. Try again later.")
+        token = secrets.token_urlsafe(32)
+        user.verification_token = hash_token(token)
+        user.verification_token_expires_at = _utcnow() + timedelta(hours=VERIFICATION_TOKEN_HOURS)
+        db.commit()
+        background_tasks.add_task(send_verification_email, user.email, token, user.full_name)
+        audit(admin, "user_resend_verification", request, target=user.email)
+        return {"id": user.id, "sent": True}
+    finally:
+        db.close()
+
+
+@app.get("/admin/audit", tags=["Admin"], include_in_schema=False, summary="Admin audit log",
+          description="Every admin action, newest first. Key values are never recorded.", responses=E_ADMIN)
+def admin_audit(request: Request, page: int = Query(default=1, ge=1, le=10000),
+                page_size: int = Query(default=50, ge=1, le=200), authorization: str | None = Header(None)):
+    require_admin(request, authorization)
+    db = SessionLocal()
+    try:
+        query = db.query(AdminAuditLog)
+        total = query.count()
+        rows = query.order_by(AdminAuditLog.id.desc()).offset((page - 1) * page_size).limit(page_size).all()
+        return {"total": total, "page": page, "page_size": page_size, "entries": [
+            {"id": r.id, "admin_email": r.admin_email, "action": r.action, "target": r.target, "detail": r.detail,
+             "ip": r.ip, "created_at": r.created_at.isoformat() if r.created_at else None} for r in rows]}
+    finally:
+        db.close()
+
+
+@app.get("/admin/keys", tags=["Admin"], include_in_schema=False, summary="API key status (values are never returned)",
+          description="Each managed key's source (panel, env or none) and last 4 characters. Values are never returned.", responses=E_ADMIN)
+def admin_keys(request: Request, authorization: str | None = Header(None)):
+    require_admin(request, authorization)
+    db = SessionLocal()
+    try:
+        rows = {r.name: r for r in db.query(AppSetting).filter(AppSetting.name.in_(list(MANAGED_KEYS))).all()}
+    finally:
+        db.close()
+    panel = _load_panel_keys()
+    keys = []
+    for name, meta in MANAGED_KEYS.items():
+        env_value = globals().get(name, "") or ""
+        row = rows.get(name)
+        if name in panel:
+            source, last4 = "panel", row.last4 if row else ""
+        elif env_value:
+            source, last4 = "env", _last4(env_value)
+        else:
+            source, last4 = "none", ""
+        keys.append({"name": name, "label": meta["label"], "source": source, "last4": last4 or None,
+                     "updated_at": row.updated_at.isoformat() if row and row.updated_at else None,
+                     "env_set": bool(env_value)})
+    return {"keys": keys, "editable": _settings_cipher() is not None}
+
+
+@app.post("/admin/keys/{name}", tags=["Admin"], include_in_schema=False, summary="Replace an API key (tested first, write-only)",
+          description="Needs a fresh authenticator code. The key is tested with the provider first; a rejected key is not saved. Stored encrypted (AES-256-GCM) and used at once, no restart.",
+          responses={**E_ADMIN, **_err(400, "The provider rejected the key, so it was not saved.",
+                                         "The provider rejected this key. Nothing was changed.")})
+async def admin_set_key(name: str, body: AdminKeyRequest, request: Request, authorization: str | None = Header(None)):
+    admin = require_admin(request, authorization)
+    if name not in MANAGED_KEYS:
+        raise HTTPException(status_code=404, detail="Unknown key.")
+    if _settings_cipher() is None:
+        raise HTTPException(status_code=503, detail="Key editing needs SETTINGS_ENCRYPTION_KEY on the server.")
+    value = body.value.strip()
+    if any(ch.isspace() for ch in value) or not value.isprintable():
+        raise HTTPException(status_code=400, detail="A key cannot contain spaces or line breaks.")
+    _check_admin_code(admin.id, body.code)
+    try:
+        await asyncio.wait_for(asyncio.to_thread(MANAGED_KEYS[name]["test"], value), timeout=20)
+    except Exception as error:
+        print(f"Key test failed for {name}:", type(error).__name__)  # never the key or the provider's message
+        audit(admin, "key_test_failed", request, target=name)
+        raise HTTPException(status_code=400, detail="The provider rejected this key, or could not be reached. "
+                                                    "Nothing was changed.")
+    db = SessionLocal()
+    try:
+        row = db.query(AppSetting).filter(AppSetting.name == name).first()
+        if row is None:
+            row = AppSetting(name=name)
+            db.add(row)
+        row.value_encrypted = encrypt_setting(name, value)
+        row.last4 = _last4(value)
+        row.updated_at = _utcnow().replace(tzinfo=None)
+        row.updated_by = admin.id
+        db.commit()
+    finally:
+        db.close()
+    reset_panel_key_cache()
+    audit(admin, "key_set", request, target=name, detail=f"ends in {_last4(value)}" if _last4(value) else None)
+    return {"name": name, "source": "panel", "last4": _last4(value) or None}
+
+
+@app.post("/admin/keys/{name}/clear", tags=["Admin"], include_in_schema=False, summary="Remove the panel value (the server configuration value is used again)",
+          description="Needs a fresh authenticator code. removes the panel value so the server configuration value is used again.",
+          responses=E_ADMIN)
+def admin_clear_key(name: str, body: AdminCodeRequest, request: Request, authorization: str | None = Header(None)):
+    admin = require_admin(request, authorization)
+    if name not in MANAGED_KEYS:
+        raise HTTPException(status_code=404, detail="Unknown key.")
+    _check_admin_code(admin.id, body.code)
+    db = SessionLocal()
+    try:
+        db.query(AppSetting).filter(AppSetting.name == name).delete()
+        db.commit()
+    finally:
+        db.close()
+    reset_panel_key_cache()
+    audit(admin, "key_clear", request, target=name)
+    return {"name": name, "source": "env" if globals().get(name) else "none"}
