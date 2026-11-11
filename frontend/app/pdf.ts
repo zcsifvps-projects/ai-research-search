@@ -602,7 +602,9 @@ export function exportPaperPdf(input: { appName: string; paper: PdfPaper; deepDi
   rows.push(["Source", paper.description || "Unknown"]);
   if (paper.doi) rows.push(["DOI", `https://doi.org/${paper.doi}`]);
   if (typeof paper.similarity_score === "number") {
-    rows.push(["Relevance", `${(paper.similarity_score * 100).toFixed(1)}% match to your search`]);
+    // The search API reports a percentage (0 to 100); older saved papers may hold a 0 to 1 fraction.
+    const pct = paper.similarity_score > 1 ? paper.similarity_score : paper.similarity_score * 100;
+    rows.push(["Relevance", `${pct.toFixed(1)}% match to your search`]);
   }
   w.infoBox(rows);
 
@@ -627,4 +629,66 @@ export function exportPaperPdf(input: { appName: string; paper: PdfPaper; deepDi
 
   w.finish(input.appName, "Paper brief");
   w.doc.save(filename(paper.title, "paper"));
+}
+
+export type ComparisonRow = {
+  paper_id: number;
+  title: string;
+  publication_year: number | null;
+  study_type: string;
+  population: string;
+  sample_size: string;
+  methods: string;
+  main_finding: string;
+  limitations: string;
+};
+
+export const COMPARISON_FIELDS: [keyof ComparisonRow, string][] = [
+  ["study_type", "Study type"],
+  ["population", "Population"],
+  ["sample_size", "Sample size"],
+  ["methods", "Methods"],
+  ["main_finding", "Main finding"],
+  ["limitations", "Limitations"],
+];
+
+/** Markdown table: one row per field, one column per paper. Used by the PDF and by "Copy as table". */
+export function comparisonMarkdown(rows: ComparisonRow[]): string {
+  const cell = (v: unknown) => String(v ?? "").replace(/\|/g, "/").replace(/\s+/g, " ").trim() || "-";
+  const header = `| | ${rows.map((r) => `[${r.paper_id}]`).join(" | ")} |`;
+  const divider = `|---|${rows.map(() => "---").join("|")}|`;
+  const lines = COMPARISON_FIELDS.map(([key, label]) => `| **${label}** | ${rows.map((r) => cell(r[key])).join(" | ")} |`);
+  return [header, divider, ...lines].join("\n");
+}
+
+export function exportComparisonPdf(input: { appName: string; summary: string; rows: ComparisonRow[] }) {
+  const w = new Writer();
+  w.title("Paper Comparison");
+  w.infoBox([
+    ["Papers", `${input.rows.length} compared`],
+    ["Generated", new Date().toLocaleString()],
+  ]);
+
+  w.sectionTitle("Summary");
+  w.markdown(input.summary);
+
+  w.gap(2);
+  w.sectionTitle("Side by side");
+  w.markdown(comparisonMarkdown(input.rows));
+
+  w.gap(2);
+  w.sectionTitle("Papers");
+  w.markdown(
+    input.rows
+      .map((r) => `- **[${r.paper_id}]** ${r.title}${r.publication_year ? ` (${r.publication_year})` : ""}`)
+      .join("\n"),
+  );
+
+  w.gap(3);
+  w.runs(
+    [{ text: "AI-generated from paper abstracts. \"Not stated\" means the abstract does not say. Verify against the full papers.", style: "italic" }],
+    { size: 8, color: MUTED },
+  );
+  w.finish(input.appName, "Paper comparison");
+  w.doc.save(filename(input.rows.map((r) => r.title).join(" vs ").slice(0, 60), "comparison"));
 }

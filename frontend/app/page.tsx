@@ -5,9 +5,18 @@ import { buildBibtex } from "./bibtex";
 import { Markdown } from "./markdown";
 import { AnimatePresence, animate, motion, useMotionValue, useReducedMotion } from "motion/react";
 import { ModalPanel, ModalShell, SPRING, SlideUp, projectMomentum, useIsDesktop } from "./motion";
+import { buildCsv, downloadCsv } from "./csv";
+import type { ComparisonRow } from "./pdf";
 import {
+  ArrowDown,
   ArrowRight,
+  ArrowUp,
+  ArrowUpDown,
   BookOpen,
+  Download,
+  Lightbulb,
+  Scale,
+  Table2,
   Bookmark,
   BookmarkCheck,
   Check,
@@ -131,6 +140,29 @@ function PaperBadges({ paper }: { paper: Result }) {
   );
 }
 
+// Takeaways are stored by paper identity (DOI, else title), so they survive new searches and history reloads.
+function paperKey(paper: Result): string {
+  return (paper.doi || paper.title || "").trim().toLowerCase();
+}
+
+function hasEvidence(paper: Result): boolean {
+  const abstract = (paper.abstract || "").trim();
+  return Boolean(abstract) && abstract.toLowerCase() !== "no abstract available." && !paper.is_retracted;
+}
+
+type TakeawayItem = { paper_id: number; takeaway: string };
+type TableSortKey = "rank" | "title" | "year" | "citations";
+type Comparison = { summary: string; rows: ComparisonRow[] };
+
+const COMPARE_LABELS: [keyof ComparisonRow, string][] = [
+  ["study_type", "Study type"],
+  ["population", "Population"],
+  ["sample_size", "Sample size"],
+  ["methods", "Methods"],
+  ["main_finding", "Main finding"],
+  ["limitations", "Limitations"],
+];
+
 type Citation = {
   paper_id: number;
   title: string;
@@ -224,6 +256,18 @@ export default function Home() {
 
   // Feature 2: Select Papers into Question Context (Context Scoping)
   const [selectedPaperIds, setSelectedPaperIds] = useState<number[]>([]);
+
+  // Phase 2: takeaways, table view, compare
+  const [takeaways, setTakeaways] = useState<Record<string, string>>({});
+  const [takeawaysLoading, setTakeawaysLoading] = useState(false);
+  const [takeawaysError, setTakeawaysError] = useState("");
+  const [tableOpen, setTableOpen] = useState(false);
+  const [tableSort, setTableSort] = useState<{ key: TableSortKey; dir: "asc" | "desc" }>({ key: "rank", dir: "asc" });
+  const [compareOpen, setCompareOpen] = useState(false);
+  const [compareLoading, setCompareLoading] = useState(false);
+  const [compareError, setCompareError] = useState("");
+  const [comparison, setComparison] = useState<Comparison | null>(null);
+  const [compareCopied, setCompareCopied] = useState(false);
 
   // Feature 3: Bookmarks / My Library
   const [bookmarks, setBookmarks] = useState<BookmarkItem[]>([]);
@@ -1111,6 +1155,7 @@ export default function Home() {
       }
 
       const askData = await askRes.json();
+      rememberTakeaways(askData.takeaways, fetchedResults);
       const assistantMessage: Message = {
         id: (Date.now() + 2).toString(),
         role: "assistant",
@@ -1189,6 +1234,7 @@ export default function Home() {
       }
 
       const askData = await askRes.json();
+      rememberTakeaways(askData.takeaways, papersToPass);
       const assistantMessage: Message = {
         id: (Date.now() + 1).toString(),
         role: "assistant",
@@ -1280,6 +1326,199 @@ export default function Home() {
       prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
     );
   }
+
+  // ------------------------------------------------------------
+  // Takeaways (from /ask for free, or POST /takeaways in batches of 10)
+  // ------------------------------------------------------------
+
+  // A key holding "" means "asked, but no takeaway came back", so it is not requested again.
+  function rememberTakeaways(items: TakeawayItem[] | undefined, papers: Result[], attempted: Result[] = []) {
+    const list = Array.isArray(items) ? items : [];
+    if (list.length === 0 && attempted.length === 0) return;
+    setTakeaways((prev) => {
+      const next = { ...prev };
+      for (const paper of attempted) {
+        if (!(paperKey(paper) in next)) next[paperKey(paper)] = "";
+      }
+      for (const item of list) {
+        const paper = papers[item.paper_id - 1];
+        if (paper && typeof item.takeaway === "string" && item.takeaway.trim()) {
+          next[paperKey(paper)] = item.takeaway.trim();
+        }
+      }
+      return next;
+    });
+  }
+
+  const papersMissingTakeaways = results
+    .map((paper, idx) => ({ paper, id: idx + 1 }))
+    .filter(({ paper }) => hasEvidence(paper) && !(paperKey(paper) in takeaways));
+
+  async function handleGetTakeaways() {
+    if (takeawaysLoading) return;
+    const batch = papersMissingTakeaways.slice(0, 10);
+    if (batch.length === 0) return;
+    setTakeawaysLoading(true);
+    setTakeawaysError("");
+    try {
+      const res = await fetch(`${apiBaseUrl}/takeaways`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          papers: batch.map(({ paper, id }) => ({
+            paper_id: id,
+            title: (paper.title || "Untitled").slice(0, 500),
+            abstract: (paper.abstract || "").slice(0, 10000),
+            publication_year: paper.publication_year,
+            is_retracted: Boolean(paper.is_retracted),
+          })),
+        }),
+      });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(typeof errData.detail === "string" ? errData.detail : "Could not get takeaways.");
+      }
+      const data = await res.json();
+      rememberTakeaways(data.takeaways, results, batch.map(({ paper }) => paper));
+    } catch (err) {
+      setTakeawaysError(err instanceof Error ? err.message : "Could not get takeaways.");
+    } finally {
+      setTakeawaysLoading(false);
+    }
+  }
+
+  // ------------------------------------------------------------
+  // Compare 2 to 5 selected papers (POST /compare)
+  // ------------------------------------------------------------
+
+  const selectedForCompare = selectedPaperIds.filter((id) => id >= 1 && id <= results.length).sort((a, b) => a - b);
+  const canCompare = selectedForCompare.length >= 2 && selectedForCompare.length <= 5;
+
+  async function handleCompare() {
+    if (!canCompare || compareLoading) return;
+    setCompareOpen(true);
+    setCompareLoading(true);
+    setCompareError("");
+    setComparison(null);
+    setCompareCopied(false);
+    try {
+      const res = await fetch(`${apiBaseUrl}/compare`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          papers: selectedForCompare.map((id) => {
+            const paper = results[id - 1];
+            return {
+              paper_id: id,
+              title: (paper.title || "Untitled").slice(0, 500),
+              abstract: (paper.abstract || "").slice(0, 10000),
+              publication_year: paper.publication_year,
+              is_retracted: Boolean(paper.is_retracted),
+            };
+          }),
+        }),
+      });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(typeof errData.detail === "string" ? errData.detail : "Could not compare these papers.");
+      }
+      const data = await res.json();
+      setComparison({ summary: String(data.summary || ""), rows: Array.isArray(data.rows) ? data.rows : [] });
+    } catch (err) {
+      setCompareError(err instanceof Error ? err.message : "Could not compare these papers.");
+    } finally {
+      setCompareLoading(false);
+    }
+  }
+
+  async function handleCopyComparison() {
+    if (!comparison) return;
+    try {
+      const { comparisonMarkdown } = await import("./pdf");
+      await navigator.clipboard.writeText(`${comparison.summary}\n\n${comparisonMarkdown(comparison.rows)}`);
+      setCompareCopied(true);
+      setTimeout(() => setCompareCopied(false), 2000);
+    } catch {
+      setCompareError("Could not copy to the clipboard.");
+    }
+  }
+
+  async function handleExportComparisonPdf() {
+    if (!comparison) return;
+    try {
+      const { exportComparisonPdf } = await import("./pdf");
+      exportComparisonPdf({ appName: APP_NAME, summary: comparison.summary, rows: comparison.rows });
+    } catch {
+      setCompareError("Could not create the PDF. Please try again.");
+    }
+  }
+
+  // ------------------------------------------------------------
+  // Table view (sorted in the browser) and CSV export
+  // ------------------------------------------------------------
+
+  const sortedTableRows = results
+    .map((paper, idx) => ({ paper, id: idx + 1 }))
+    .sort((a, b) => {
+      const dir = tableSort.dir === "asc" ? 1 : -1;
+      switch (tableSort.key) {
+        case "title":
+          return dir * (a.paper.title || "").localeCompare(b.paper.title || "");
+        case "year":
+          return dir * ((a.paper.publication_year ?? -1) - (b.paper.publication_year ?? -1));
+        case "citations":
+          return dir * ((a.paper.cited_by_count ?? -1) - (b.paper.cited_by_count ?? -1));
+        default:
+          return dir * (a.id - b.id);
+      }
+    });
+
+  function toggleTableSort(key: TableSortKey) {
+    setTableSort((prev) =>
+      prev.key === key
+        ? { key, dir: prev.dir === "asc" ? "desc" : "asc" }
+        : { key, dir: key === "title" || key === "rank" ? "asc" : "desc" }
+    );
+  }
+
+  function handleExportCsv() {
+    const yesNo = (v: boolean | null | undefined) => (v === true ? "yes" : v === false ? "no" : "unknown");
+    const header = [
+      "#", "Title", "Authors", "Year", "Published in", "Database", "DOI", "Citations",
+      "Study type", "Open access", "Preprint", "Retracted", "Field", "Takeaway",
+    ];
+    const rows = sortedTableRows.map(({ paper, id }) => [
+      id,
+      paper.title,
+      paper.authors.join("; "),
+      paper.publication_year ?? "",
+      paper.description,
+      paper.database ?? "",
+      paper.doi ? (paper.doi.startsWith("http") ? paper.doi : `https://doi.org/${paper.doi}`) : "",
+      paper.cited_by_count ?? "",
+      (paper.study_types || []).map((t) => STUDY_TYPE_LABELS[t] || t).join("; "),
+      yesNo(paper.is_open_access),
+      yesNo(paper.is_preprint),
+      paper.is_retracted ? "yes" : "no",
+      paper.field ?? "",
+      takeaways[paperKey(paper)] || "",
+    ]);
+    downloadCsv(query || "papers", buildCsv(header, rows));
+  }
+
+  // Esc closes the compare overlay first, then the table.
+  useEffect(() => {
+    if (!tableOpen && !compareOpen) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key !== "Escape") return;
+      if (compareOpen) setCompareOpen(false);
+      else setTableOpen(false);
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [tableOpen, compareOpen]);
 
   const displayName = getDisplayName(user);
   const userInitials = getInitials(user);
@@ -2463,16 +2702,55 @@ export default function Home() {
                 ) : (
                   /* PAPERS RESULTS LIST */
                   <div className="flex-1 flex flex-col h-full overflow-hidden">
-                    <div className="p-4 border-b border-[var(--border-color)] flex items-center justify-between shrink-0">
-                      <div className="flex items-center gap-2">
-                        <BookOpen className="w-4 h-4 text-[var(--accent)]" />
-                        <span className="font-semibold text-xs text-[var(--text-primary)]">
-                          Retrieved Papers ({results.length})
-                        </span>
+                    <div className="p-4 border-b border-[var(--border-color)] shrink-0 space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <BookOpen className="w-4 h-4 text-[var(--accent)]" />
+                          <span className="font-semibold text-xs text-[var(--text-primary)]">
+                            Retrieved Papers ({results.length})
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setTableOpen(true)}
+                          className="px-2 py-1 rounded-lg border border-[var(--border-color)] bg-[var(--bg-surface)] hover:bg-[var(--bg-surface-elevated)] text-[11px] font-medium text-[var(--text-secondary)] flex items-center gap-1 transition"
+                          title="Open all papers in a sortable table"
+                        >
+                          <Table2 className="w-3.5 h-3.5" />
+                          <span>Table view</span>
+                        </button>
                       </div>
-                      <span className="text-[11px] text-[var(--text-muted)]">
-                        Select checkboxes to scope context
-                      </span>
+                      <div className="flex flex-wrap items-center gap-2">
+                        {canCompare ? (
+                          <button
+                            type="button"
+                            onClick={handleCompare}
+                            className="px-2 py-1 rounded-lg bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-[11px] font-semibold flex items-center gap-1 transition"
+                          >
+                            <Scale className="w-3.5 h-3.5" />
+                            <span>Compare ({selectedForCompare.length})</span>
+                          </button>
+                        ) : (
+                          <span className="text-[11px] text-[var(--text-muted)]">
+                            {selectedForCompare.length > 5
+                              ? "Select at most 5 papers to compare"
+                              : "Tick papers to scope questions, or 2 to 5 to compare"}
+                          </span>
+                        )}
+                        {papersMissingTakeaways.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={handleGetTakeaways}
+                            disabled={takeawaysLoading}
+                            className="px-2 py-1 rounded-lg border border-[var(--border-color)] bg-[var(--bg-surface)] hover:bg-[var(--bg-surface-elevated)] disabled:opacity-60 text-[11px] font-medium text-[var(--text-secondary)] flex items-center gap-1 transition"
+                            title="One AI call for the next 10 papers without a takeaway"
+                          >
+                            <Lightbulb className="w-3.5 h-3.5" />
+                            <span>{takeawaysLoading ? "Getting takeaways..." : `Get takeaways (${Math.min(10, papersMissingTakeaways.length)})`}</span>
+                          </button>
+                        )}
+                      </div>
+                      {takeawaysError && <div className="text-[11px] text-red-600">{takeawaysError}</div>}
                     </div>
 
                     <div ref={papersScrollRef} className="flex-1 overflow-y-auto p-4 space-y-3">
@@ -2548,6 +2826,13 @@ export default function Home() {
                               <PaperBadges paper={paper} />
                             </div>
 
+                            {takeaways[paperKey(paper)] && (
+                              <p className="mt-2 text-xs text-[var(--text-primary)] leading-relaxed flex gap-1.5">
+                                <Lightbulb className="w-3.5 h-3.5 mt-0.5 shrink-0 text-[var(--accent)]" />
+                                <span>{takeaways[paperKey(paper)]}</span>
+                              </p>
+                            )}
+
                             <p className="mt-2 text-xs text-[var(--text-secondary)] line-clamp-2 leading-relaxed">
                               {paper.abstract || "No abstract preview available."}
                             </p>
@@ -2579,6 +2864,306 @@ export default function Home() {
           )}
         </div>
       </main>
+
+      {/* ======================================================== */}
+      {/* 2b. TABLE VIEW OVERLAY (Phase 2) */}
+      {/* ======================================================== */}
+      <AnimatePresence>
+      {tableOpen && (
+        <ModalShell
+          key="tableOpen"
+          className="fixed inset-0 z-50 flex items-stretch justify-center bg-black/50 backdrop-blur-xs p-2 sm:p-4"
+          onClick={() => setTableOpen(false)}
+        >
+          <ModalPanel
+            role="dialog"
+            aria-modal="true"
+            aria-label="Papers table"
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-7xl bg-[var(--bg-surface)] border border-[var(--border-color)] rounded-2xl shadow-2xl overflow-hidden flex flex-col"
+          >
+            <div className="p-3 sm:p-4 border-b border-[var(--border-color)] flex flex-wrap items-center gap-2 shrink-0">
+              <Table2 className="w-5 h-5 text-[var(--accent)]" />
+              <h3 className="font-serif-heading text-base font-bold text-[var(--text-primary)] mr-auto">
+                Papers ({results.length})
+              </h3>
+              {canCompare && (
+                <button
+                  type="button"
+                  onClick={handleCompare}
+                  className="px-2.5 py-1.5 rounded-lg bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-xs font-semibold flex items-center gap-1 transition"
+                >
+                  <Scale className="w-3.5 h-3.5" />
+                  <span>Compare ({selectedForCompare.length})</span>
+                </button>
+              )}
+              {papersMissingTakeaways.length > 0 && (
+                <button
+                  type="button"
+                  onClick={handleGetTakeaways}
+                  disabled={takeawaysLoading}
+                  className="px-2.5 py-1.5 rounded-lg border border-[var(--border-color)] hover:bg-[var(--bg-surface-elevated)] disabled:opacity-60 text-xs font-medium text-[var(--text-secondary)] flex items-center gap-1 transition"
+                >
+                  <Lightbulb className="w-3.5 h-3.5" />
+                  <span>{takeawaysLoading ? "Getting takeaways..." : `Get takeaways (${Math.min(10, papersMissingTakeaways.length)})`}</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={handleExportCsv}
+                className="px-2.5 py-1.5 rounded-lg border border-[var(--border-color)] hover:bg-[var(--bg-surface-elevated)] text-xs font-medium text-[var(--text-secondary)] flex items-center gap-1 transition"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>Export CSV</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setTableOpen(false)}
+                aria-label="Close table"
+                className="p-1.5 rounded-lg hover:bg-[var(--bg-surface-elevated)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            {takeawaysError && (
+              <div className="px-4 py-2 text-xs text-red-600 border-b border-[var(--border-color)]">{takeawaysError}</div>
+            )}
+
+            <div className="flex-1 overflow-auto">
+              <table className="w-full min-w-[960px] text-xs text-left border-collapse">
+                <thead className="sticky top-0 z-10 bg-[var(--bg-surface-elevated)] text-[var(--text-secondary)]">
+                  <tr>
+                    <th className="p-2 w-8" aria-label="Select" />
+                    {(
+                      [
+                        ["rank", "#", "w-10"],
+                        ["title", "Title", "min-w-[260px]"],
+                        ["year", "Year", "w-16"],
+                        ["citations", "Citations", "w-20"],
+                      ] as [TableSortKey, string, string][]
+                    ).map(([key, label, width]) => (
+                      <th key={key} className={`p-2 font-semibold ${width}`}>
+                        <button
+                          type="button"
+                          onClick={() => toggleTableSort(key)}
+                          className="flex items-center gap-1 hover:text-[var(--accent)] transition"
+                        >
+                          <span>{label}</span>
+                          {tableSort.key === key ? (
+                            tableSort.dir === "asc" ? <ArrowUp className="w-3 h-3" /> : <ArrowDown className="w-3 h-3" />
+                          ) : (
+                            <ArrowUpDown className="w-3 h-3 opacity-40" />
+                          )}
+                        </button>
+                      </th>
+                    ))}
+                    <th className="p-2 font-semibold w-28">Study type</th>
+                    <th className="p-2 font-semibold w-28">Status</th>
+                    <th className="p-2 font-semibold w-36">Source</th>
+                    <th className="p-2 font-semibold min-w-[240px]">Takeaway</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sortedTableRows.map(({ paper, id }) => {
+                    const selected = selectedPaperIds.includes(id);
+                    const takeaway = takeaways[paperKey(paper)];
+                    return (
+                      <tr
+                        key={id}
+                        className={`border-t border-[var(--border-subtle)] align-top ${
+                          selected ? "bg-[var(--accent-light)]/40" : "hover:bg-[var(--bg-surface-elevated)]"
+                        }`}
+                      >
+                        <td className="p-2">
+                          <button
+                            type="button"
+                            onClick={() => togglePaperSelection(id)}
+                            aria-label={selected ? `Unselect paper ${id}` : `Select paper ${id}`}
+                            className="text-[var(--accent)] hover:opacity-80 transition"
+                          >
+                            {selected ? <CheckSquare className="w-4 h-4" /> : <Square className="w-4 h-4 text-[var(--text-muted)]" />}
+                          </button>
+                        </td>
+                        <td className="p-2 font-bold text-[var(--accent)]">[{id}]</td>
+                        <td className="p-2">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSelectedPaperForDetail({ paper, index: id - 1 });
+                              setTableOpen(false);
+                            }}
+                            className="text-left font-semibold text-[var(--text-primary)] hover:text-[var(--accent)] hover:underline transition"
+                          >
+                            {paper.title}
+                          </button>
+                          <div className="mt-0.5 text-[11px] text-[var(--text-muted)] line-clamp-1">
+                            {paper.authors.length > 0 ? paper.authors.slice(0, 3).join(", ") : "Unknown"}
+                            {paper.authors.length > 3 ? " et al." : ""}
+                          </div>
+                        </td>
+                        <td className="p-2 text-[var(--text-secondary)]">{paper.publication_year ?? "-"}</td>
+                        <td className="p-2 text-[var(--text-secondary)]">
+                          {typeof paper.cited_by_count === "number" ? paper.cited_by_count.toLocaleString() : "-"}
+                        </td>
+                        <td className="p-2 text-[var(--text-secondary)]">{primaryStudyType(paper) || "-"}</td>
+                        <td className="p-2">
+                          <div className="flex flex-wrap gap-1">
+                            {paper.is_retracted && (
+                              <span className="px-1.5 py-0.5 rounded-md text-[10px] font-bold uppercase bg-red-600 text-white">Retracted</span>
+                            )}
+                            {paper.is_preprint && (
+                              <span className="px-1.5 py-0.5 rounded-md text-[10px] font-semibold bg-amber-500/15 text-amber-600 border border-amber-500/30">Preprint</span>
+                            )}
+                            {paper.is_open_access === true && (
+                              <span className="px-1.5 py-0.5 rounded-md text-[10px] font-semibold bg-emerald-500/15 text-emerald-600 border border-emerald-500/30">Open access</span>
+                            )}
+                            {!paper.is_retracted && !paper.is_preprint && paper.is_open_access !== true && (
+                              <span className="text-[var(--text-muted)]">-</span>
+                            )}
+                          </div>
+                        </td>
+                        <td className="p-2 text-[var(--text-secondary)]">
+                          <div className="line-clamp-2">{paper.description}</div>
+                          {paper.database && <div className="text-[10px] text-[var(--text-muted)]">via {paper.database}</div>}
+                        </td>
+                        <td className="p-2 text-[var(--text-primary)] leading-relaxed">
+                          {takeaway ? (
+                            takeaway
+                          ) : !hasEvidence(paper) ? (
+                            <span className="text-[var(--text-muted)]">{paper.is_retracted ? "Retracted" : "No abstract"}</span>
+                          ) : paperKey(paper) in takeaways ? (
+                            <span className="text-[var(--text-muted)]">Not available</span>
+                          ) : (
+                            <span className="text-[var(--text-muted)]">Not generated yet</span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <div className="px-4 py-2 border-t border-[var(--border-color)] text-[11px] text-[var(--text-muted)] shrink-0">
+              Click a column title to sort. Ticked papers scope your follow-up questions; tick 2 to 5 to compare. Takeaways are
+              AI-written from abstracts only.
+            </div>
+          </ModalPanel>
+        </ModalShell>
+      )}
+      </AnimatePresence>
+
+      {/* ======================================================== */}
+      {/* 2c. COMPARE OVERLAY (Phase 2) */}
+      {/* ======================================================== */}
+      <AnimatePresence>
+      {compareOpen && (
+        <ModalShell
+          key="compareOpen"
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 backdrop-blur-xs p-2 sm:p-4"
+          onClick={() => setCompareOpen(false)}
+        >
+          <ModalPanel
+            role="dialog"
+            aria-modal="true"
+            aria-label="Paper comparison"
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-6xl max-h-[92vh] bg-[var(--bg-surface)] border border-[var(--border-color)] rounded-2xl shadow-2xl overflow-hidden flex flex-col"
+          >
+            <div className="p-3 sm:p-4 border-b border-[var(--border-color)] flex flex-wrap items-center gap-2 shrink-0">
+              <Scale className="w-5 h-5 text-[var(--accent)]" />
+              <h3 className="font-serif-heading text-base font-bold text-[var(--text-primary)] mr-auto">
+                Compare papers
+              </h3>
+              {comparison && (
+                <>
+                  <button
+                    type="button"
+                    onClick={handleCopyComparison}
+                    className="px-2.5 py-1.5 rounded-lg border border-[var(--border-color)] hover:bg-[var(--bg-surface-elevated)] text-xs font-medium text-[var(--text-secondary)] flex items-center gap-1 transition"
+                  >
+                    {compareCopied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                    <span>{compareCopied ? "Copied" : "Copy as table"}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleExportComparisonPdf}
+                    className="px-2.5 py-1.5 rounded-lg border border-[var(--border-color)] hover:bg-[var(--bg-surface-elevated)] text-xs font-medium text-[var(--text-secondary)] flex items-center gap-1 transition"
+                  >
+                    <FileDown className="w-3.5 h-3.5" />
+                    <span>Export PDF</span>
+                  </button>
+                </>
+              )}
+              <button
+                type="button"
+                onClick={() => setCompareOpen(false)}
+                aria-label="Close comparison"
+                className="p-1.5 rounded-lg hover:bg-[var(--bg-surface-elevated)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-auto p-3 sm:p-4 space-y-4">
+              {compareLoading && (
+                <div className="py-12 text-center text-sm text-[var(--text-secondary)]">
+                  Comparing {selectedForCompare.length} papers from their abstracts...
+                </div>
+              )}
+              {compareError && !compareLoading && (
+                <div className="p-3 rounded-xl border border-red-500/30 bg-red-500/10 text-sm text-red-600">{compareError}</div>
+              )}
+              {comparison && !compareLoading && (
+                <>
+                  <div className="p-4 rounded-xl bg-[var(--bg-primary)] border border-[var(--border-color)] text-sm">
+                    <Markdown text={comparison.summary} compact />
+                  </div>
+                  <div className="overflow-x-auto rounded-xl border border-[var(--border-color)]">
+                    <table className="w-full min-w-[720px] text-xs text-left border-collapse">
+                      <thead className="bg-[var(--bg-surface-elevated)]">
+                        <tr>
+                          <th className="p-2 w-32" />
+                          {comparison.rows.map((row) => (
+                            <th key={row.paper_id} className="p-2 align-top font-semibold text-[var(--text-primary)]">
+                              <span className="text-[var(--accent)]">[{row.paper_id}]</span> {row.title}
+                              {row.publication_year ? (
+                                <span className="font-normal text-[var(--text-muted)]"> ({row.publication_year})</span>
+                              ) : null}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {COMPARE_LABELS.map(([key, label]) => (
+                          <tr key={key} className="border-t border-[var(--border-subtle)] align-top">
+                            <th scope="row" className="p-2 font-semibold text-[var(--text-secondary)]">{label}</th>
+                            {comparison.rows.map((row) => {
+                              const value = String(row[key] ?? "");
+                              return (
+                                <td
+                                  key={row.paper_id}
+                                  className={`p-2 leading-relaxed ${value === "Not stated" ? "text-[var(--text-muted)] italic" : "text-[var(--text-primary)]"}`}
+                                >
+                                  {value || "Not stated"}
+                                </td>
+                              );
+                            })}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <p className="text-[11px] text-[var(--text-muted)]">
+                    AI-written from the abstracts only. &quot;Not stated&quot; means the abstract does not say. Papers without an
+                    abstract and retracted papers are left out.
+                  </p>
+                </>
+              )}
+            </div>
+          </ModalPanel>
+        </ModalShell>
+      )}
+      </AnimatePresence>
 
       {/* ======================================================== */}
       {/* 3. SETTINGS MODAL */}

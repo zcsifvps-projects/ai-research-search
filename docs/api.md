@@ -88,6 +88,8 @@ Shorter or guessable values are rejected with `422`, because the `session_id` is
 | `GET /search` | none | Federated search. Params: `q` (required, max 300), `year_min`, `year_max`, `open_access_only`, `min_citations`, `exclude_preprints`, `study_type`, `field`, `sort`, `search_by` |
 | `POST /ask` | optional | Cited answer from papers. Body: `question`, `results`, `session_id`, `conversation_history` |
 | `POST /deep-dive` | none | Markdown analysis of one paper. Body: `title`, `abstract` |
+| `POST /takeaways` | none | One-sentence takeaway per paper (up to 10). Body: `papers` |
+| `POST /compare` | none | Side-by-side comparison of 2 to 5 papers. Body: `papers` |
 | `GET /history/{session_id}` | optional | Your history (signed in) or the guest session's |
 | `DELETE /history/entry/{id}` | optional | Delete one entry (guests add `?session_id=`) |
 | `DELETE /history/{session_id}` | optional | Clear history |
@@ -126,6 +128,17 @@ Full request and response shapes, with examples for every status code, are in th
   unknown), `study_types` (list), `is_preprint` (`true`, `false` or `null`), `is_retracted` and `field` (`null` when unknown).
 - Retracted papers are kept in results so users can see them, and flagged with `is_retracted: true`.
 
+### Takeaways and comparison
+
+- `/ask` also returns `takeaways`: `[{paper_id, takeaway}]`, one sentence per paper it used (up to 6), in the same AI call.
+- `POST /takeaways` body: `{"papers": [{paper_id, title, abstract, publication_year, is_retracted}]}`, 1 to 10 papers.
+  `paper_id` is the paper's position in `/search` results (from 1) and must be unique. Takeaways are cached per paper for 24 hours,
+  including the ones `/ask` wrote, so only uncached papers use an AI call (and count toward the daily AI limits).
+- `POST /compare` body: the same paper shape, 2 to 5 papers. Returns `summary` (cites papers as `[n]`) and `rows`: one per paper with
+  `paper_id`, `title`, `publication_year`, `study_type`, `population`, `sample_size`, `methods`, `main_finding`, `limitations`.
+  A value the abstract does not state is exactly `Not stated`. Cached for 2 hours.
+- Both leave out papers without an abstract and retracted papers. `/compare` returns 400 if fewer than two remain.
+
 ### How `/ask` stays grounded
 
 - Only the first 6 papers that have an abstract are used. A paper without an abstract is never evidence.
@@ -151,7 +164,7 @@ messages or stack traces.
 
 ## 5. Rate limits
 
-Per client IP, per minute (fixed window): `/ask` 30, `/deep-dive` 20, `/search` 60, `/auth/login` 10, `/auth/register` 10, `/auth/forgot-password` 5,
+Per client IP, per minute (fixed window): `/ask` 30, `/deep-dive` 20, `/takeaways` 20, `/compare` 20, `/search` 60, `/auth/login` 10, `/auth/register` 10, `/auth/forgot-password` 5,
 `/auth/resend-verification` 5, `/auth/reset-password` 10, `/auth/verify-email` 10, other `/auth/*` 30, `/bookmarks` 60, everything else 150.
 Behind a reverse proxy set `TRUSTED_PROXY_COUNT=1`, otherwise all users share the proxy's IP. The per-minute limiter is per process: run one worker
 (the account lockout, email caps and daily AI caps use Redis when `REDIS_URL` is reachable, so they are shared across workers).

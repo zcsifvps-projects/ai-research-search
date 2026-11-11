@@ -607,6 +607,8 @@ class RateLimiterMiddleware(BaseHTTPMiddleware):
         self.limits = {
             "/ask": (30, 60),
             "/deep-dive": (20, 60),
+            "/takeaways": (20, 60),
+            "/compare": (20, 60),
             "/search": (60, 60),
             "/auth/login": (10, 60),
             "/auth/register": (10, 60),
@@ -969,6 +971,23 @@ class AskRequest(BaseModel):
 class DeepDiveRequest(BaseModel):
     title: str = Field(max_length=500, examples=[EXAMPLE_PAPER["title"]])
     abstract: str = Field(max_length=10000, examples=[EXAMPLE_PAPER["abstract"]])
+
+
+class PaperInput(BaseModel):
+    """One paper sent to /takeaways or /compare. paper_id is its position in the /search results (from 1)."""
+    paper_id: int = Field(ge=1, le=1000)
+    title: str = Field(max_length=500)
+    abstract: str | None = Field(default=None, max_length=10000)
+    publication_year: int | None = Field(default=None, ge=0, le=3000)
+    is_retracted: bool = False
+
+
+class TakeawaysRequest(BaseModel):
+    papers: list[PaperInput] = Field(min_length=1, max_length=10)
+
+
+class CompareRequest(BaseModel):
+    papers: list[PaperInput] = Field(min_length=2, max_length=5)
 
 
 class BookmarkCreateRequest(BaseModel):
@@ -2830,11 +2849,19 @@ def set_in_search_cache(cache_key: str, data: dict, ttl: int = SEARCH_CACHE_TTL)
 
 def generate_ask_cache_key(question: str, papers: list[dict], conversation_history: list[dict]) -> str:
     raw = json.dumps({
+        "v": 2,  # v2 answers include takeaways; older cached answers are not reused
         "q": question.strip().lower(),
         "p": [(p.get("title", ""), (p.get("abstract") or "")[:200]) for p in papers],
         "h": [(h.get("question", ""), h.get("answer", "")) for h in conversation_history],
     }, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def takeaway_cache_key(title: str, abstract: str) -> str:
+    """Per-paper key. Uses the first 300 abstract characters so /ask (which trims abstracts to 400) and
+    /takeaways (which sends more) share entries."""
+    raw = json.dumps([str(title or "").strip().lower(), str(abstract or "").strip()[:300]])
+    return "tk:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 # ============================================================
@@ -3232,9 +3259,14 @@ def parse_ai_json(content: str | None, required_key: str) -> dict:
     if content.endswith("```"):
         content = content[:-3]
     result = json.loads(content.strip())
-    if not isinstance(result, dict) or not isinstance(result.get(required_key), str) or not result[required_key].strip():
+    if not isinstance(result, dict):
         raise ValueError(f"AI response is missing '{required_key}'.")
-    return result
+    value = result.get(required_key)
+    if isinstance(value, str) and value.strip():
+        return result
+    if isinstance(value, list) and value:
+        return result
+    raise ValueError(f"AI response is missing '{required_key}'.")
 
 
 def gemini_safe_schema(schema):
@@ -3328,8 +3360,21 @@ ASK_SYSTEM_PROMPT = (
     "Answer ONLY from the supplied papers. If they do not contain enough information to answer, say so plainly; "
     "never invent findings, statistics, papers or citations. "
     "Cite papers using [1], [2], etc. matching their paper_id. "
-    "Return a valid JSON object with 'answer' (string in markdown) and 'citations' (list of {paper_id, title})."
+    "Also give every supplied paper a one-sentence takeaway (at most 30 words) stating its main finding from its "
+    "abstract only; if the abstract states no finding, the takeaway is exactly 'Not stated in the abstract.' "
+    "Return a valid JSON object with 'answer' (string in markdown), 'citations' (list of {paper_id, title}) and "
+    "'takeaways' (list of {paper_id, takeaway})."
 )
+
+TAKEAWAY_ITEM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "paper_id": {"type": "integer"},
+        "takeaway": {"type": "string"},
+    },
+    "required": ["paper_id", "takeaway"],
+    "additionalProperties": False,
+}
 
 ASK_SCHEMA = {
     "type": "object",
@@ -3347,10 +3392,26 @@ ASK_SCHEMA = {
                 "additionalProperties": False,
             },
         },
+        "takeaways": {"type": "array", "items": TAKEAWAY_ITEM_SCHEMA},
     },
-    "required": ["answer", "citations"],
+    "required": ["answer", "citations", "takeaways"],
     "additionalProperties": False,
 }
+
+MAX_TAKEAWAY_CHARS = 300
+
+
+def clean_takeaways(raw, valid_ids) -> list[dict]:
+    """Keep one takeaway per known paper_id, trimmed. Anything the model invents is dropped."""
+    out, seen = [], set()
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        pid, text = item.get("paper_id"), item.get("takeaway")
+        if pid in valid_ids and pid not in seen and isinstance(text, str) and text.strip():
+            seen.add(pid)
+            out.append({"paper_id": pid, "takeaway": text.strip()[:MAX_TAKEAWAY_CHARS]})
+    return out
 
 
 def sanitize_paper_for_storage(paper: dict) -> dict:
@@ -3383,11 +3444,12 @@ def sanitize_paper_for_storage(paper: dict) -> dict:
     summary="Ask a question about papers",
     description="Send the question and the papers from `/search` (up to 50; the first 6 with an abstract are used). The answer is written "
                 "**only from those abstracts** and cites them as `[1]`, `[2]`... by `paper_id` (their position in `results`, starting at 1). "
-                "Citations the model invents are dropped. Include earlier turns in `conversation_history` for follow-ups. "
+                "Citations the model invents are dropped. `takeaways` gives a one-sentence finding for each paper used. Include earlier turns in `conversation_history` for follow-ups. "
                 "Identity comes from the cookie only: a `user_id` in the body is ignored. Signed-in answers are saved to your account, "
                 "guest answers to `session_id`. If the first AI attempt fails it is retried once with fewer papers.",
     responses={
-        **_ok({"answer": "One night of sleep loss reduces next-day recall [1].", "citations": [{"paper_id": 1, "title": EXAMPLE_PAPER["title"]}]}),
+        **_ok({"answer": "One night of sleep loss reduces next-day recall [1].", "citations": [{"paper_id": 1, "title": EXAMPLE_PAPER["title"]}],
+               "takeaways": [{"paper_id": 1, "takeaway": "One night of sleep loss cut next-day recall by 20%."}]}),
         **_err(400, "Empty question, or none of the papers has an abstract to base an answer on.",
                "None of these papers include an abstract, so there is nothing to base an answer on. Try a different search."),
         **E_RATE, **E_AI,
@@ -3493,7 +3555,12 @@ async def ask(
             pid = citation.get("paper_id") if isinstance(citation, dict) else None
             if pid in valid_titles:
                 valid_citations.append({"paper_id": pid, "title": valid_titles[pid]})
-        result = {"answer": result["answer"], "citations": valid_citations}
+        takeaways = clean_takeaways(result.get("takeaways"), set(valid_titles))
+        result = {"answer": result["answer"], "citations": valid_citations, "takeaways": takeaways}
+        for item in takeaways:
+            # Reused by POST /takeaways, so these papers are never charged again.
+            paper = next(p for p in papers if p["paper_id"] == item["paper_id"])
+            set_in_search_cache(takeaway_cache_key(paper["title"], paper["abstract"]), {"t": item["takeaway"]}, ttl=86400)
 
         save_search_history(
             request.session_id,
@@ -3576,3 +3643,197 @@ async def deep_dive(request: DeepDiveRequest, req: Request, authorization: str |
     except Exception as error:
         print("Deep dive failed:", error)
         raise HTTPException(status_code=502, detail=GENERIC_AI_ERROR)
+
+
+# ============================================================
+# TAKEAWAYS AND COMPARISON (shared helpers)
+# ============================================================
+
+NOT_STATED = "Not stated"
+
+
+def usable_papers(papers: list[PaperInput], abstract_chars: int) -> list[dict]:
+    """Papers that can be evidence: an abstract is present and the paper is not retracted."""
+    if len({p.paper_id for p in papers}) != len(papers):
+        raise HTTPException(status_code=400, detail="Each paper_id may appear only once.")
+    out = []
+    for p in papers:
+        abstract = (p.abstract or "").strip()
+        if not abstract or abstract.lower() == "no abstract available." or p.is_retracted:
+            continue
+        out.append({
+            "paper_id": p.paper_id,
+            "title": p.title.strip()[:300] or "Untitled",
+            "publication_year": p.publication_year,
+            "abstract": abstract[:abstract_chars],
+        })
+    return out
+
+
+# ============================================================
+# ONE-LINE TAKEAWAYS (up to 10 papers per call, cached per paper)
+# ============================================================
+
+TAKEAWAYS_SYSTEM_PROMPT = (
+    "You summarise academic papers. For EVERY supplied paper write one sentence (at most 30 words) stating its "
+    "main finding, using ONLY that paper's abstract. Never invent results, numbers or details. If the abstract "
+    "states no finding, the takeaway is exactly 'Not stated in the abstract.' "
+    "Return a valid JSON object with 'takeaways' (list of {paper_id, takeaway})."
+)
+
+TAKEAWAYS_SCHEMA = {
+    "type": "object",
+    "properties": {"takeaways": {"type": "array", "items": TAKEAWAY_ITEM_SCHEMA}},
+    "required": ["takeaways"],
+    "additionalProperties": False,
+}
+
+
+@app.post(
+    "/takeaways",
+    tags=["AI"],
+    summary="One-line takeaways for papers",
+    description="Send up to 10 papers (`paper_id` = position in `/search` results). Returns a one-sentence takeaway per paper, written "
+                "only from its abstract. Papers without an abstract, or retracted, get none. Takeaways are cached per paper "
+                "(including those `/ask` already wrote), and only uncached papers use an AI call. Open to guests.",
+    responses={**_ok({"takeaways": [{"paper_id": 1, "takeaway": "One night of sleep loss cut next-day recall by 20%."}]}),
+               **E_RATE, **E_AI},
+)
+async def takeaways(request: TakeawaysRequest, req: Request, authorization: str | None = Header(None)):
+    papers = usable_papers(request.papers, 1200)
+    found, missing = {}, []
+    for p in papers:
+        cached = get_from_search_cache(takeaway_cache_key(p["title"], p["abstract"]))
+        if cached and isinstance(cached.get("t"), str):
+            found[p["paper_id"]] = cached["t"]
+        else:
+            missing.append(p)
+
+    if missing:
+        gemini_client, groq_client = get_ai_clients()
+        enforce_ai_quota(req, optional_user_id(req, authorization))
+        user_prompt = f"Papers:\n{json.dumps(missing, indent=2)}"
+        retry_prompt = "Papers:\n" + json.dumps([{**p, "abstract": p["abstract"][:400]} for p in missing])
+        try:
+            result = await asyncio.to_thread(
+                generate_structured_ai,
+                gemini_client,
+                groq_client,
+                TAKEAWAYS_SYSTEM_PROMPT,
+                user_prompt,
+                retry_prompt,
+                TAKEAWAYS_SCHEMA,
+                "takeaways",
+            )
+        except Exception as error:
+            print("Takeaways failed:", error)
+            raise HTTPException(status_code=502, detail=GENERIC_AI_ERROR)
+        by_id = {p["paper_id"]: p for p in missing}
+        for item in clean_takeaways(result.get("takeaways"), set(by_id)):
+            found[item["paper_id"]] = item["takeaway"]
+            paper = by_id[item["paper_id"]]
+            set_in_search_cache(takeaway_cache_key(paper["title"], paper["abstract"]), {"t": item["takeaway"]},
+                                ttl=86400)
+
+    return {"takeaways": [{"paper_id": p["paper_id"], "takeaway": found[p["paper_id"]]}
+                          for p in papers if p["paper_id"] in found]}
+
+
+# ============================================================
+# COMPARE 2 TO 5 PAPERS
+# ============================================================
+
+COMPARE_FIELDS = ("study_type", "population", "sample_size", "methods", "main_finding", "limitations")
+
+COMPARE_SYSTEM_PROMPT = (
+    "You compare academic papers using ONLY their titles and abstracts. For EVERY supplied paper fill: study_type, "
+    "population (who or what was studied), sample_size, methods, main_finding and limitations, each in at most "
+    f"25 words. If the abstract does not state something, write exactly '{NOT_STATED}'. Never invent details, numbers "
+    "or papers. Then write 'summary': 2 to 3 sentences on how the papers agree or differ, citing them as [1], [2] by "
+    "their paper_id. Return a valid JSON object with 'summary' and 'papers' (list of objects with paper_id and the "
+    "six fields)."
+)
+
+COMPARE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "papers": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"paper_id": {"type": "integer"}, **{f: {"type": "string"} for f in COMPARE_FIELDS}},
+                "required": ["paper_id", *COMPARE_FIELDS],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["summary", "papers"],
+    "additionalProperties": False,
+}
+
+
+@app.post(
+    "/compare",
+    tags=["AI"],
+    summary="Compare 2 to 5 papers",
+    description="Send 2 to 5 papers (`paper_id` = position in `/search` results). Returns one row per paper (study type, population, "
+                "sample size, methods, main finding, limitations), written only from the abstracts, with `Not stated` where the "
+                "abstract is silent, plus a short summary citing the papers as `[n]`. Papers without an abstract, or retracted, "
+                "are left out; at least two must remain. Cached. Open to guests.",
+    responses={
+        **_ok({"summary": "Both trials found better recall after sleep [1][2].",
+               "rows": [{"paper_id": 1, "title": EXAMPLE_PAPER["title"], "publication_year": 2024,
+                         **{f: NOT_STATED for f in COMPARE_FIELDS}}]}),
+        **_err(400, "Fewer than two papers have an abstract.",
+               "Compare needs at least two papers with an abstract. Retracted papers are left out."),
+        **E_RATE, **E_AI,
+    },
+)
+async def compare(request: CompareRequest, req: Request, authorization: str | None = Header(None)):
+    papers = usable_papers(request.papers, 1500)
+    if len(papers) < 2:
+        raise HTTPException(status_code=400,
+                            detail="Compare needs at least two papers with an abstract. Retracted papers are left out.")
+
+    cache_key = "cmp:" + hashlib.sha256(json.dumps(
+        [(p["paper_id"], p["title"].lower(), p["abstract"][:1000]) for p in papers]).encode("utf-8")).hexdigest()
+    cached = get_from_search_cache(cache_key)
+    if cached is not None:
+        return cached
+
+    gemini_client, groq_client = get_ai_clients()
+    enforce_ai_quota(req, optional_user_id(req, authorization))
+    user_prompt = f"Papers:\n{json.dumps(papers, indent=2)}"
+    retry_prompt = "Papers:\n" + json.dumps([{**p, "abstract": p["abstract"][:500]} for p in papers])
+    try:
+        result = await asyncio.to_thread(
+            generate_structured_ai,
+            gemini_client,
+            groq_client,
+            COMPARE_SYSTEM_PROMPT,
+            user_prompt,
+            retry_prompt,
+            COMPARE_SCHEMA,
+            "summary",
+        )
+    except Exception as error:
+        print("Compare failed:", error)
+        raise HTTPException(status_code=502, detail=GENERIC_AI_ERROR)
+
+    by_id = {}
+    for item in result.get("papers") or []:
+        if isinstance(item, dict) and item.get("paper_id") in {p["paper_id"] for p in papers}:
+            by_id.setdefault(item["paper_id"], item)
+    rows = []
+    for p in papers:
+        item = by_id.get(p["paper_id"], {})
+        row = {"paper_id": p["paper_id"], "title": p["title"], "publication_year": p["publication_year"]}
+        for f in COMPARE_FIELDS:
+            value = item.get(f)
+            row[f] = value.strip()[:400] if isinstance(value, str) and value.strip() else NOT_STATED
+        rows.append(row)
+
+    response = {"summary": str(result["summary"]).strip()[:2000], "rows": rows}
+    set_in_search_cache(cache_key, response, ttl=7200)
+    return response
