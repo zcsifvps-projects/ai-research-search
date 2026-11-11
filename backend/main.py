@@ -136,6 +136,9 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
 SEMANTIC_SCHOLAR_API_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "").strip()
 CORE_API_KEY = os.getenv("CORE_API_KEY", "").strip()
+# PubMed (NCBI E-utilities) works without a key at 3 requests/second; a free key raises it to 10.
+NCBI_API_KEY = os.getenv("NCBI_API_KEY", "").strip()
+NCBI_EMAIL = os.getenv("NCBI_EMAIL", "").strip()
 
 # SMTP Configuration
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp-relay.brevo.com").strip()
@@ -531,7 +534,7 @@ def send_welcome_email(to_email: str, full_name: str | None = None):
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #E4DCCB; border-radius: 12px; background-color: #FAF6EF;">
       <h2 style="color: #7C2A2A; margin-top: 0;">{greeting}</h2>
       <p style="color: #221D18; font-size: 14px; line-height: 1.6;">Your email is verified and your account is active.</p>
-      <p style="color: #221D18; font-size: 14px; line-height: 1.6;">Search five academic databases at once: OpenAlex, Semantic Scholar, arXiv, Crossref and CORE.</p>
+      <p style="color: #221D18; font-size: 14px; line-height: 1.6;">Search seven academic databases at once: OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed and Europe PMC.</p>
       <div style="text-align: center; margin: 30px 0;">
         <a href="{APP_URL}" style="background-color: #7C2A2A; color: #ffffff; padding: 12px 28px; text-decoration: none; border-radius: 8px; font-weight: bold; font-size: 14px; display: inline-block;">Start Researching</a>
       </div>
@@ -711,6 +714,12 @@ EXAMPLE_PAPER = {
     "abstract": "We show that one night of sleep loss reduces next-day recall by 20 percent.",
     "similarity_score": 0.83,
     "is_open_access": True,
+    "database": "OpenAlex",
+    "cited_by_count": 42,
+    "study_types": ["rct", "clinical_trial"],
+    "is_preprint": False,
+    "is_retracted": False,
+    "field": "Psychology",
 }
 EXAMPLE_BOOKMARK = {
     "id": 3, "user_id": 7, "title": EXAMPLE_PAPER["title"], "authors": EXAMPLE_PAPER["authors"],
@@ -719,7 +728,7 @@ EXAMPLE_BOOKMARK = {
 }
 
 API_DESCRIPTION = """
-__APP_NAME__ searches five academic databases at once (**OpenAlex, Semantic Scholar, arXiv, Crossref, CORE**) and
+__APP_NAME__ searches seven academic databases at once (**OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed, Europe PMC**) and
 writes a short answer **only from the abstracts of the papers it found**, with citations back to those papers.
 
 ## Typical flow
@@ -781,7 +790,7 @@ More: see `docs/api.md` in the repository for copy-paste examples in curl, JavaS
 TAGS_METADATA = [
     {"name": "System", "description": "Liveness and root."},
     {"name": "Auth", "description": "Accounts and sessions. Sets or clears the `access_token` cookie."},
-    {"name": "Search", "description": "Federated search across five academic databases."},
+    {"name": "Search", "description": "Federated search across seven academic databases."},
     {"name": "AI", "description": "Answers and paper analysis grounded in abstracts. Open to guests, rate limited."},
     {"name": "History", "description": "Past questions and answers, per signed-in user or per guest `session_id`."},
     {"name": "Library", "description": "Saved papers. Requires a verified account."},
@@ -1809,9 +1818,17 @@ def normalize_result(
     source="Unknown source",
     doi=None,
     is_open_access=None,
+    database=None,
+    cited_by_count=None,
+    study_types=None,
+    is_preprint=None,
+    is_retracted=False,
+    field=None,
 ):
-    """Common paper shape. is_open_access is True/False when the source states it, None when unknown."""
-    return {
+    """Common paper shape. is_open_access / is_preprint are True/False when the source states it, None when
+    unknown. cited_by_count is None when the source does not report citations (never guessed as 0).
+    study_types holds canonical values from STUDY_TYPES; title-based detection is added on top."""
+    paper = {
         "title": (title or "Untitled").strip(),
         "authors": authors or [],
         "abstract": abstract.strip() if abstract else None,
@@ -1819,7 +1836,114 @@ def normalize_result(
         "description": source or "Unknown source",
         "doi": doi,
         "is_open_access": is_open_access,
+        "database": database or source or "Unknown",
+        "cited_by_count": cited_by_count if isinstance(cited_by_count, int) and cited_by_count >= 0 else None,
+        "study_types": [],
+        "is_preprint": is_preprint,
+        "is_retracted": bool(is_retracted),
+        "field": field if field in FIELDS_OF_STUDY else None,
     }
+    paper["study_types"] = classify_study_types(paper["title"], study_types or [])
+    return paper
+
+
+# ============================================================
+# STUDY TYPES AND FIELDS OF STUDY
+# ============================================================
+
+# Canonical study types accepted by GET /search?study_type=...
+STUDY_TYPES = ("meta_analysis", "systematic_review", "review", "rct", "clinical_trial", "case_report")
+
+# Best-effort detection from the title, on top of what each source declares.
+_TITLE_STUDY_PATTERNS = [
+    ("meta_analysis", re.compile(r"\bmeta[\s-]?analy", re.IGNORECASE)),
+    ("systematic_review", re.compile(r"\bsystematic (literature )?review", re.IGNORECASE)),
+    ("rct", re.compile(r"\brandomi[sz]ed[\s,-]+(\w+[\s-]+){0,3}(controlled )?trial", re.IGNORECASE)),
+    ("clinical_trial", re.compile(r"\b(clinical|randomi[sz]ed)[\s,-]+(\w+[\s-]+){0,3}trial", re.IGNORECASE)),
+    ("case_report", re.compile(r"\bcase report", re.IGNORECASE)),
+]
+
+
+def classify_study_types(title: str, declared: list[str]) -> list[str]:
+    found = [t for t in declared if t in STUDY_TYPES]
+    for name, pattern in _TITLE_STUDY_PATTERNS:
+        if pattern.search(title or ""):
+            found.append(name)
+    # Implied types: an RCT is a clinical trial; meta-analyses and systematic reviews are reviews.
+    if "rct" in found:
+        found.append("clinical_trial")
+    if "meta_analysis" in found or "systematic_review" in found:
+        found.append("review")
+    return [t for t in STUDY_TYPES if t in found]
+
+
+# PubMed / Europe PMC publication types -> canonical study types.
+_PUBLICATION_TYPE_MAP = {
+    "meta-analysis": "meta_analysis",
+    "systematic review": "systematic_review",
+    "review": "review",
+    "review-article": "review",
+    "randomized controlled trial": "rct",
+    "clinical trial": "clinical_trial",
+    "controlled clinical trial": "clinical_trial",
+    "case reports": "case_report",
+    "case-report": "case_report",
+}
+
+
+def map_publication_types(names) -> list[str]:
+    out = []
+    for name in names or []:
+        key = str(name).strip().lower()
+        if key.startswith("clinical trial"):
+            key = "clinical trial"
+        if key in _PUBLICATION_TYPE_MAP:
+            out.append(_PUBLICATION_TYPE_MAP[key])
+    return out
+
+
+# Field of study filter. Each canonical field maps to OpenAlex field ids and Semantic Scholar field names.
+FIELDS_OF_STUDY = {
+    "Medicine": {"openalex": ["27", "29", "35", "36"], "s2": ["Medicine"]},
+    "Biology": {"openalex": ["13", "24"], "s2": ["Biology"]},
+    "Neuroscience": {"openalex": ["28"], "s2": []},
+    "Psychology": {"openalex": ["32"], "s2": ["Psychology"]},
+    "Computer Science": {"openalex": ["17"], "s2": ["Computer Science"]},
+    "Engineering": {"openalex": ["22", "15", "21"], "s2": ["Engineering"]},
+    "Physics": {"openalex": ["31"], "s2": ["Physics"]},
+    "Chemistry": {"openalex": ["16"], "s2": ["Chemistry"]},
+    "Mathematics": {"openalex": ["26", "18"], "s2": ["Mathematics"]},
+    "Materials Science": {"openalex": ["25"], "s2": ["Materials Science"]},
+    "Environmental Science": {"openalex": ["23"], "s2": ["Environmental Science"]},
+    "Earth Sciences": {"openalex": ["19"], "s2": ["Geology", "Geography"]},
+    "Agriculture": {"openalex": ["11", "34"], "s2": ["Agricultural and Food Sciences"]},
+    "Pharmacology": {"openalex": ["30"], "s2": []},
+    "Economics": {"openalex": ["20"], "s2": ["Economics"]},
+    "Business": {"openalex": ["14"], "s2": ["Business"]},
+    "Social Sciences": {"openalex": ["33"], "s2": ["Sociology", "Political Science", "Education", "Law", "Linguistics"]},
+    "Arts and Humanities": {"openalex": ["12"], "s2": ["Art", "Philosophy", "History"]},
+}
+
+_OPENALEX_FIELD_TO_NAME = {fid: name for name, m in FIELDS_OF_STUDY.items() for fid in m["openalex"]}
+_S2_FIELD_TO_NAME = {s2: name for name, m in FIELDS_OF_STUDY.items() for s2 in m["s2"]}
+
+
+def openalex_field_name(work: dict) -> str | None:
+    field = ((work.get("primary_topic") or {}).get("field") or {})
+    fid = str(field.get("id") or "").rstrip("/").rsplit("/", 1)[-1]
+    return _OPENALEX_FIELD_TO_NAME.get(fid)
+
+
+def s2_field_name(paper: dict) -> str | None:
+    for item in paper.get("s2FieldsOfStudy") or []:
+        name = _S2_FIELD_TO_NAME.get((item or {}).get("category"))
+        if name:
+            return name
+    for category in paper.get("fieldsOfStudy") or []:
+        name = _S2_FIELD_TO_NAME.get(category)
+        if name:
+            return name
+    return None
 
 
 # ============================================================
@@ -1914,23 +2038,68 @@ def get_abstract(work):
 # OPENALEX
 # ============================================================
 
-async def search_openalex(client, q, year_min=None, year_max=None, oa_only=False):
+def openalex_filter_parts(year_min=None, year_max=None, oa_only=False, filters=None):
+    """OpenAlex applies these itself, so result slots are not wasted on papers we then discard."""
+    parts = []
+    if year_min is not None:
+        parts.append(f"publication_year:>{year_min - 1}")
+    if year_max is not None:
+        parts.append(f"publication_year:<{year_max + 1}")
+    if oa_only:
+        parts.append("is_oa:true")
+    flt = filters or {}
+    if flt.get("min_citations"):
+        parts.append(f"cited_by_count:>{flt['min_citations'] - 1}")
+    if flt.get("exclude_preprints"):
+        parts.append("type:!preprint")
+    if flt.get("study_type") in ("review", "systematic_review", "meta_analysis"):
+        parts.append("type:review")
+    if flt.get("field") in FIELDS_OF_STUDY:
+        parts.append("primary_topic.field.id:" + "|".join(FIELDS_OF_STUDY[flt["field"]]["openalex"]))
+    return parts
+
+
+def parse_openalex_work(work: dict) -> dict:
+    primary_location = work.get("primary_location") or {}
+    source = primary_location.get("source") or {}
+    authors = [
+        a.get("author", {}).get("display_name")
+        for a in work.get("authorships", [])
+        if a.get("author", {}).get("display_name")
+    ]
+    work_type = (work.get("type") or "").lower()
+    return normalize_result(
+        title=work.get("title"),
+        authors=authors,
+        # No abstract means None. Never invent one: the AI must only be given real evidence.
+        abstract=get_abstract(work),
+        year=work.get("publication_year"),
+        source=source.get("display_name") or "OpenAlex",
+        doi=work.get("doi"),
+        is_open_access=bool((work.get("open_access") or {}).get("is_oa")),
+        database="OpenAlex",
+        cited_by_count=work.get("cited_by_count"),
+        study_types=["review"] if work_type == "review" else [],
+        is_preprint=(work_type == "preprint") if work_type else None,
+        is_retracted=bool(work.get("is_retracted")),
+        field=openalex_field_name(work),
+    )
+
+
+async def search_openalex(client, q, year_min=None, year_max=None, oa_only=False, filters=None, mode="topic"):
     url = "https://api.openalex.org/works"
     params = {
-        "search": q.rstrip("?"),
         "per-page": 15,
         "mailto": CONTACT_EMAIL,
     }
-    # Filters are applied by OpenAlex itself, so the result slots are not wasted on papers we then discard.
-    filters = []
-    if year_min is not None:
-        filters.append(f"publication_year:>{year_min - 1}")
-    if year_max is not None:
-        filters.append(f"publication_year:<{year_max + 1}")
-    if oa_only:
-        filters.append("is_oa:true")
-    if filters:
-        params["filter"] = ",".join(filters)
+    filter_parts = openalex_filter_parts(year_min, year_max, oa_only, filters)
+    if mode == "title":
+        # Commas separate OpenAlex filters, so they are removed from the title text.
+        filter_parts.append("title.search:" + q.rstrip("?").replace(",", " "))
+    else:
+        params["search"] = q.rstrip("?")
+    if filter_parts:
+        params["filter"] = ",".join(filter_parts)
     headers = {
         "User-Agent": f"{APP_UA_NAME}/1.0 (mailto:{CONTACT_EMAIL})"
     }
@@ -1942,34 +2111,47 @@ async def search_openalex(client, q, year_min=None, year_max=None, oa_only=False
             return []
         response.raise_for_status()
         data = response.json()
-        results = []
-
-        for work in data.get("results", []):
-            primary_location = work.get("primary_location") or {}
-            source = primary_location.get("source") or {}
-            authors = [
-                a.get("author", {}).get("display_name")
-                for a in work.get("authorships", [])
-                if a.get("author", {}).get("display_name")
-            ]
-            # No abstract means None. Never invent one: the AI must only be given real evidence.
-            abstract = get_abstract(work)
-
-            results.append(
-                normalize_result(
-                    title=work.get("title"),
-                    authors=authors,
-                    abstract=abstract,
-                    year=work.get("publication_year"),
-                    source=source.get("display_name") or "OpenAlex",
-                    doi=work.get("doi"),
-                    is_open_access=bool((work.get("open_access") or {}).get("is_oa")),
-                )
-            )
-
-        return results
+        return [parse_openalex_work(work) for work in data.get("results", [])]
     except Exception as error:
         print("OpenAlex search note:", error)
+        return []
+
+
+async def search_openalex_by_author(client, name, year_min=None, year_max=None, oa_only=False, filters=None):
+    """Find the best-matching author, then their works (most cited first)."""
+    headers = {"User-Agent": f"{APP_UA_NAME}/1.0 (mailto:{CONTACT_EMAIL})"}
+    try:
+        response = await client.get(
+            "https://api.openalex.org/authors",
+            params={"search": name, "per-page": 1, "mailto": CONTACT_EMAIL},
+            headers=headers,
+            timeout=10.0,
+        )
+        if response.status_code == 429:
+            print("OpenAlex rate limited (429). Skipping.")
+            return []
+        response.raise_for_status()
+        authors = response.json().get("results") or []
+        if not authors:
+            return []
+        author_id = str(authors[0].get("id") or "").rstrip("/").rsplit("/", 1)[-1]
+        if not re.fullmatch(r"A\d+", author_id):
+            return []
+        filter_parts = [f"author.id:{author_id}"] + openalex_filter_parts(year_min, year_max, oa_only, filters)
+        response = await client.get(
+            "https://api.openalex.org/works",
+            params={"filter": ",".join(filter_parts), "sort": "cited_by_count:desc", "per-page": 25,
+                    "mailto": CONTACT_EMAIL},
+            headers=headers,
+            timeout=10.0,
+        )
+        if response.status_code == 429:
+            print("OpenAlex rate limited (429). Skipping.")
+            return []
+        response.raise_for_status()
+        return [parse_openalex_work(work) for work in response.json().get("results", [])]
+    except Exception as error:
+        print("OpenAlex author search note:", error)
         return []
 
 
@@ -1977,18 +2159,39 @@ async def search_openalex(client, q, year_min=None, year_max=None, oa_only=False
 # SEMANTIC SCHOLAR
 # ============================================================
 
-async def search_semantic_scholar(client, q, year_min=None, year_max=None, oa_only=False):
+_S2_STUDY_TYPE_PARAM = {
+    "review": "Review",
+    "systematic_review": "Review",
+    "meta_analysis": "MetaAnalysis",
+    "rct": "ClinicalTrial",
+    "clinical_trial": "ClinicalTrial",
+    "case_report": "CaseReport",
+}
+_S2_TYPE_TO_STUDY = {"Review": "review", "MetaAnalysis": "meta_analysis", "ClinicalTrial": "clinical_trial",
+                     "CaseReport": "case_report"}
+_PREPRINT_VENUES = ("arxiv", "biorxiv", "medrxiv", "ssrn", "preprints", "research square", "chemrxiv", "psyarxiv")
+
+
+async def search_semantic_scholar(client, q, year_min=None, year_max=None, oa_only=False, filters=None):
     url = "https://api.semanticscholar.org/graph/v1/paper/search"
     params = {
         "query": q.rstrip("?"),
         "limit": 10,
-        "fields": "title,authors,abstract,year,externalIds,venue,isOpenAccess,openAccessPdf",
+        "fields": "title,authors,abstract,year,externalIds,venue,isOpenAccess,openAccessPdf,"
+                  "citationCount,publicationTypes,s2FieldsOfStudy",
     }
     if year_min is not None or year_max is not None:
         # Semantic Scholar range syntax: "2023-", "-2020", "2020-2023"
         params["year"] = f"{year_min if year_min is not None else ''}-{year_max if year_max is not None else ''}"
     if oa_only:
         params["openAccessPdf"] = ""  # flag parameter: only papers with a public PDF
+    flt = filters or {}
+    if flt.get("min_citations"):
+        params["minCitationCount"] = str(flt["min_citations"])
+    if flt.get("study_type") in _S2_STUDY_TYPE_PARAM:
+        params["publicationTypes"] = _S2_STUDY_TYPE_PARAM[flt["study_type"]]
+    if flt.get("field") in FIELDS_OF_STUDY and FIELDS_OF_STUDY[flt["field"]]["s2"]:
+        params["fieldsOfStudy"] = ",".join(FIELDS_OF_STUDY[flt["field"]]["s2"])
 
     headers = {}
     if SEMANTIC_SCHOLAR_API_KEY:
@@ -2009,6 +2212,8 @@ async def search_semantic_scholar(client, q, year_min=None, year_max=None, oa_on
             abstract = paper.get("abstract")
             if not abstract:
                 continue
+            venue = (paper.get("venue") or "").lower()
+            declared = [_S2_TYPE_TO_STUDY[t] for t in (paper.get("publicationTypes") or []) if t in _S2_TYPE_TO_STUDY]
 
             results.append(
                 normalize_result(
@@ -2019,6 +2224,11 @@ async def search_semantic_scholar(client, q, year_min=None, year_max=None, oa_on
                     source=paper.get("venue") or "Semantic Scholar",
                     doi=external_ids.get("DOI"),
                     is_open_access=bool(paper.get("isOpenAccess") or paper.get("openAccessPdf")),
+                    database="Semantic Scholar",
+                    cited_by_count=paper.get("citationCount"),
+                    study_types=declared,
+                    is_preprint=True if any(v in venue for v in _PREPRINT_VENUES) else None,
+                    field=s2_field_name(paper),
                 )
             )
 
@@ -2030,10 +2240,12 @@ async def search_semantic_scholar(client, q, year_min=None, year_max=None, oa_on
 
 
 # ============================================================
-# ARXIV (every arXiv paper is open access)
+# ARXIV (every arXiv paper is open access, and a preprint)
 # ============================================================
 
-async def search_arxiv(client, q, year_min=None, year_max=None, oa_only=False):
+async def search_arxiv(client, q, year_min=None, year_max=None, oa_only=False, filters=None):
+    if (filters or {}).get("exclude_preprints"):
+        return []
     url = "https://export.arxiv.org/api/query"
     search_query = f"all:{q.rstrip('?')}"
     if year_min is not None or year_max is not None:
@@ -2083,6 +2295,8 @@ async def search_arxiv(client, q, year_min=None, year_max=None, oa_only=False):
                     source="arXiv",
                     doi=doi,
                     is_open_access=True,
+                    database="arXiv",
+                    is_preprint=True,
                 )
             )
         return results
@@ -2095,12 +2309,46 @@ async def search_arxiv(client, q, year_min=None, year_max=None, oa_only=False):
 # CROSSREF (does not say whether a paper is open access: is_open_access stays None)
 # ============================================================
 
-async def search_crossref(client, q, year_min=None, year_max=None, oa_only=False):
+def parse_crossref_work(work: dict, require_abstract: bool = True) -> dict | None:
+    titles = work.get("title") or []
+    title = titles[0] if titles else "Untitled"
+    authors = []
+    for author in (work.get("author") or []):
+        name = f"{author.get('given', '') or ''} {author.get('family', '') or ''}".strip()
+        if name:
+            authors.append(name)
+    abstract = re.sub(r"<[^>]+>", "", work.get("abstract") or "").strip() or None
+    if require_abstract and not abstract:
+        return None
+    year = None
+    for date_field in ("published-print", "published-online", "published", "posted"):
+        date_parts = (work.get(date_field) or {}).get("date-parts") or []
+        if date_parts and date_parts[0] and date_parts[0][0]:
+            year = date_parts[0][0]
+            break
+    container_titles = work.get("container-title") or []
+    work_type = (work.get("type") or "").lower()
+    return normalize_result(
+        title=title,
+        authors=authors,
+        abstract=abstract,
+        year=year,
+        source=container_titles[0] if container_titles else "Crossref",
+        doi=work.get("DOI"),
+        is_open_access=None,
+        database="Crossref",
+        cited_by_count=work.get("is-referenced-by-count"),
+        is_preprint=(work_type == "posted-content") if work_type else None,
+    )
+
+
+async def search_crossref(client, q, year_min=None, year_max=None, oa_only=False, filters=None):
     url = "https://api.crossref.org/works"
     params = {
         "query": q.rstrip("?"),
         "rows": 10,
-        "select": "title,author,abstract,published-print,published-online,DOI,container-title",
+        "select": "title,author,abstract,published-print,published-online,DOI,container-title,type,"
+                  "is-referenced-by-count",
     }
     date_filters = []
     if year_min is not None:
@@ -2117,41 +2365,7 @@ async def search_crossref(client, q, year_min=None, year_max=None, oa_only=False
         response.raise_for_status()
         data = response.json()
         items = data.get("message", {}).get("items", [])
-        results = []
-        for work in items:
-            titles = work.get("title") or []
-            title = titles[0] if titles else "Untitled"
-            authors = []
-            for author in (work.get("author") or []):
-                name = f"{author.get('given', '') or ''} {author.get('family', '') or ''}".strip()
-                if name:
-                    authors.append(name)
-            abstract = work.get("abstract")
-            if not abstract:
-                continue
-            abstract = re.sub(r"<[^>]+>", "", abstract).strip()
-            if not abstract:
-                continue
-            year = None
-            for date_field in ("published-print", "published-online"):
-                date_parts = (work.get(date_field) or {}).get("date-parts") or []
-                if date_parts and date_parts[0]:
-                    year = date_parts[0][0]
-                    break
-            container_titles = work.get("container-title") or []
-            source = container_titles[0] if container_titles else "Crossref"
-            results.append(
-                normalize_result(
-                    title=title,
-                    authors=authors,
-                    abstract=abstract,
-                    year=year,
-                    source=source,
-                    doi=work.get("DOI"),
-                    is_open_access=None,
-                )
-            )
-        return results
+        return [p for p in (parse_crossref_work(work) for work in items) if p]
     except Exception as error:
         print(f"Crossref search failed: {error}")
         return []
@@ -2161,7 +2375,7 @@ async def search_crossref(client, q, year_min=None, year_max=None, oa_only=False
 # CORE (an aggregator of open-access repositories: every record is open access)
 # ============================================================
 
-async def search_core(client, q, year_min=None, year_max=None, oa_only=False):
+async def search_core(client, q, year_min=None, year_max=None, oa_only=False, filters=None):
     if not CORE_API_KEY:
         print("CORE_API_KEY not configured. Skipping CORE.")
         return []
@@ -2196,6 +2410,8 @@ async def search_core(client, q, year_min=None, year_max=None, oa_only=False):
                     source="CORE",
                     doi=work.get("doi"),
                     is_open_access=True,
+                    database="CORE",
+                    cited_by_count=work.get("citationCount"),
                 )
             )
         return results
@@ -2205,12 +2421,237 @@ async def search_core(client, q, year_min=None, year_max=None, oa_only=False):
 
 
 # ============================================================
+# PUBMED (NCBI E-utilities: esearch finds ids, efetch returns the records)
+# ============================================================
+
+NCBI_EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+_PUBMED_STUDY_TERMS = {
+    "meta_analysis": "meta-analysis[pt]",
+    "systematic_review": "systematic review[pt]",
+    "review": "review[pt]",
+    "rct": "randomized controlled trial[pt]",
+    "clinical_trial": "clinical trial[pt]",
+    "case_report": "case reports[pt]",
+}
+
+
+def ncbi_params() -> dict:
+    params = {"tool": APP_UA_NAME}
+    email = NCBI_EMAIL or CONTACT_EMAIL
+    if email:
+        params["email"] = email
+    if NCBI_API_KEY:
+        params["api_key"] = NCBI_API_KEY
+    return params
+
+
+def _xml_text(element) -> str:
+    return re.sub(r"\s+", " ", "".join(element.itertext())).strip() if element is not None else ""
+
+
+def parse_pubmed_article(article) -> dict | None:
+    title = _xml_text(article.find(".//ArticleTitle"))
+    sections = []
+    for part in article.findall(".//Abstract/AbstractText"):
+        text = _xml_text(part)
+        if text:
+            label = part.get("Label")
+            sections.append(f"{label}: {text}" if label else text)
+    abstract = "\n".join(sections)
+    if not title or not abstract:
+        return None
+    authors = []
+    for author in article.findall(".//AuthorList/Author"):
+        collective = author.findtext("CollectiveName")
+        name = collective or f"{author.findtext('ForeName') or ''} {author.findtext('LastName') or ''}".strip()
+        if name:
+            authors.append(name)
+    year = None
+    for path in (".//Journal/JournalIssue/PubDate/Year", ".//Journal/JournalIssue/PubDate/MedlineDate",
+                 ".//ArticleDate/Year"):
+        match = re.search(r"\d{4}", article.findtext(path) or "")
+        if match:
+            year = int(match.group(0))
+            break
+    doi = None
+    for article_id in article.findall(".//ArticleIdList/ArticleId"):
+        if article_id.get("IdType") == "doi" and article_id.text:
+            doi = article_id.text.strip()
+            break
+    if not doi:
+        for location in article.findall(".//ELocationID"):
+            if location.get("EIdType") == "doi" and location.text:
+                doi = location.text.strip()
+                break
+    publication_types = [_xml_text(pt) for pt in article.findall(".//PublicationTypeList/PublicationType")]
+    lowered = [pt.lower() for pt in publication_types]
+    return normalize_result(
+        title=title,
+        authors=authors,
+        abstract=abstract,
+        year=year,
+        source=_xml_text(article.find(".//Journal/Title")) or "PubMed",
+        doi=doi,
+        is_open_access=None,
+        database="PubMed",
+        study_types=map_publication_types(publication_types),
+        is_preprint="preprint" in lowered,
+        is_retracted="retracted publication" in lowered,
+    )
+
+
+async def search_pubmed(client, q, year_min=None, year_max=None, oa_only=False, filters=None):
+    flt = filters or {}
+    term = f"({q.rstrip('?')})"
+    if flt.get("study_type") in _PUBMED_STUDY_TERMS:
+        term += f" AND {_PUBMED_STUDY_TERMS[flt['study_type']]}"
+    if flt.get("exclude_preprints"):
+        term += " NOT preprint[pt]"
+    params = {**ncbi_params(), "db": "pubmed", "term": term, "retmax": 10, "retmode": "json", "sort": "relevance"}
+    if year_min is not None or year_max is not None:
+        params.update({"datetype": "pdat", "mindate": year_min if year_min is not None else 1800,
+                       "maxdate": year_max if year_max is not None else 3000})
+    try:
+        response = await client.get(f"{NCBI_EUTILS}/esearch.fcgi", params=params, timeout=10.0)
+        if response.status_code == 429:
+            print("PubMed rate limit reached (429). Skipping.")
+            return []
+        response.raise_for_status()
+        ids = [i for i in ((response.json().get("esearchresult") or {}).get("idlist") or []) if str(i).isdigit()]
+        if not ids:
+            return []
+        response = await client.get(
+            f"{NCBI_EUTILS}/efetch.fcgi",
+            params={**ncbi_params(), "db": "pubmed", "id": ",".join(ids), "retmode": "xml"},
+            timeout=15.0,
+        )
+        if response.status_code == 429:
+            print("PubMed rate limit reached (429). Skipping.")
+            return []
+        response.raise_for_status()
+        root = ET.fromstring(response.text)
+        return [p for p in (parse_pubmed_article(a) for a in root.findall(".//PubmedArticle")) if p]
+    except Exception as error:
+        print(f"PubMed search failed: {error}")
+        return []
+
+
+# ============================================================
+# EUROPE PMC (no key needed; covers PubMed plus preprints and full-text archives)
+# ============================================================
+
+_EUROPEPMC_STUDY_TERMS = {
+    "meta_analysis": 'PUB_TYPE:"Meta-Analysis"',
+    "systematic_review": 'PUB_TYPE:"Systematic Review"',
+    "review": 'PUB_TYPE:"review"',
+    "rct": 'PUB_TYPE:"Randomized Controlled Trial"',
+    "clinical_trial": 'PUB_TYPE:"Clinical Trial"',
+    "case_report": 'PUB_TYPE:"Case Reports"',
+}
+
+
+def parse_europepmc_record(record: dict) -> dict | None:
+    abstract = re.sub(r"<[^>]+>", " ", record.get("abstractText") or "")
+    abstract = re.sub(r"\s+", " ", abstract).strip()
+    title = re.sub(r"<[^>]+>", "", record.get("title") or "").strip()
+    if not title or not abstract:
+        return None
+    authors = [a.strip() for a in (record.get("authorString") or "").rstrip(".").split(",") if a.strip()]
+    year = int(record["pubYear"]) if str(record.get("pubYear") or "").isdigit() else None
+    journal = ((record.get("journalInfo") or {}).get("journal") or {}).get("title") or record.get("journalTitle")
+    publication_types = (record.get("pubTypeList") or {}).get("pubType") or []
+    if isinstance(publication_types, str):
+        publication_types = [publication_types]
+    cited = record.get("citedByCount")
+    return normalize_result(
+        title=title,
+        authors=authors[:50],
+        abstract=abstract,
+        year=year,
+        source=journal or "Europe PMC",
+        doi=record.get("doi"),
+        is_open_access=(record.get("isOpenAccess") == "Y"),
+        database="Europe PMC",
+        cited_by_count=int(cited) if str(cited or "").isdigit() else None,
+        study_types=map_publication_types(publication_types),
+        is_preprint=(record.get("source") == "PPR") or ("preprint" in [str(p).lower() for p in publication_types]),
+        is_retracted="retracted publication" in [str(p).lower() for p in publication_types],
+    )
+
+
+async def search_europepmc(client, q, year_min=None, year_max=None, oa_only=False, filters=None):
+    flt = filters or {}
+    parts = [f"({q.rstrip('?')})"]
+    if year_min is not None or year_max is not None:
+        parts.append(f"PUB_YEAR:[{year_min if year_min is not None else 1800} TO "
+                     f"{year_max if year_max is not None else 3000}]")
+    if oa_only:
+        parts.append("OPEN_ACCESS:y")
+    if flt.get("study_type") in _EUROPEPMC_STUDY_TERMS:
+        parts.append(_EUROPEPMC_STUDY_TERMS[flt["study_type"]])
+    query = " AND ".join(parts)
+    if flt.get("exclude_preprints"):
+        query += " NOT SRC:PPR"
+    params = {"query": query, "format": "json", "resultType": "core", "pageSize": 10}
+    try:
+        response = await client.get("https://www.ebi.ac.uk/europepmc/webservices/rest/search",
+                                    params=params, timeout=10.0)
+        if response.status_code == 429:
+            print("Europe PMC rate limit reached (429). Skipping.")
+            return []
+        response.raise_for_status()
+        records = (response.json().get("resultList") or {}).get("result") or []
+        return [p for p in (parse_europepmc_record(r) for r in records) if p]
+    except Exception as error:
+        print(f"Europe PMC search failed: {error}")
+        return []
+
+
+# ============================================================
+# DOI LOOKUP (a query that is just a DOI is fetched directly)
+# ============================================================
+
+DOI_PATTERN = re.compile(r"10\.\d{4,9}/\S+", re.IGNORECASE)
+
+
+def extract_doi_query(query: str) -> str | None:
+    """Return the DOI when the whole query is a DOI (bare, doi: prefixed, or a doi.org link)."""
+    candidate = normalize_doi(query.strip())
+    if candidate and DOI_PATTERN.fullmatch(candidate) and len(candidate) <= 255:
+        return candidate.rstrip(".,;")
+    return None
+
+
+async def lookup_doi(client, doi: str) -> list[dict]:
+    from urllib.parse import quote
+
+    encoded = quote(doi, safe="/()._-;:")
+    headers = {"User-Agent": f"{APP_UA_NAME}/1.0 (mailto:{CONTACT_EMAIL})"}
+    try:
+        response = await client.get(f"https://api.openalex.org/works/doi:{encoded}",
+                                    params={"mailto": CONTACT_EMAIL}, headers=headers, timeout=10.0)
+        if response.status_code == 200:
+            return [parse_openalex_work(response.json())]
+    except Exception as error:
+        print("OpenAlex DOI lookup note:", error)
+    try:
+        response = await client.get(f"https://api.crossref.org/works/{encoded}", headers=headers, timeout=10.0)
+        if response.status_code == 200:
+            paper = parse_crossref_work(response.json().get("message") or {}, require_abstract=False)
+            return [paper] if paper else []
+    except Exception as error:
+        print("Crossref DOI lookup note:", error)
+    return []
+
+
+# ============================================================
 # DOI / TITLE DEDUPLICATION
 # ============================================================
 
 def deduplicate_results(results):
     """Drop duplicates (same DOI, else same title) but merge what each source knows: if any source says
-    the paper is open access it is, and a missing abstract/year is filled from the duplicate."""
+    the paper is open access (or retracted) it is, the highest citation count wins, study types are combined,
+    and a missing abstract/year/field is filled from the duplicate."""
     unique_results = []
     by_doi = {}
     by_title = {}
@@ -2228,6 +2669,19 @@ def deduplicate_results(results):
                 kept["abstract"] = result["abstract"]
             if kept.get("publication_year") is None and result.get("publication_year") is not None:
                 kept["publication_year"] = result["publication_year"]
+            if result.get("is_retracted"):
+                kept["is_retracted"] = True
+            if kept.get("is_preprint") is None and result.get("is_preprint") is not None:
+                kept["is_preprint"] = result["is_preprint"]
+            if isinstance(result.get("cited_by_count"), int) and (
+                kept.get("cited_by_count") is None or result["cited_by_count"] > kept["cited_by_count"]
+            ):
+                kept["cited_by_count"] = result["cited_by_count"]
+            if result.get("study_types"):
+                merged = set(kept.get("study_types") or []) | set(result["study_types"])
+                kept["study_types"] = [t for t in STUDY_TYPES if t in merged]
+            if not kept.get("field") and result.get("field"):
+                kept["field"] = result["field"]
             continue
         unique_results.append(result)
         if doi:
@@ -2235,6 +2689,47 @@ def deduplicate_results(results):
         elif title:
             by_title[title] = result
     return unique_results
+
+
+# ============================================================
+# RESULT FILTERS AND SORTING
+# ============================================================
+
+def apply_result_filters(results, year_min=None, year_max=None, oa_only=False, filters=None):
+    """Safety net: enforce every filter again on the merged list (sources can be loose, and some sources
+    cannot filter at all). Papers whose value is unknown are dropped for that filter, never guessed."""
+    flt = filters or {}
+    kept = []
+    for r in results:
+        y = r.get("publication_year")
+        if year_min is not None and (y is None or y < year_min):
+            continue
+        if year_max is not None and (y is None or y > year_max):
+            continue
+        if oa_only and r.get("is_open_access") is not True:
+            continue  # only papers a source confirmed as open access
+        if flt.get("min_citations"):
+            cited = r.get("cited_by_count")
+            if not isinstance(cited, int) or cited < flt["min_citations"]:
+                continue
+        if flt.get("exclude_preprints") and r.get("is_preprint") is True:
+            continue
+        if flt.get("study_type") and flt["study_type"] not in (r.get("study_types") or []):
+            continue
+        if flt.get("field") and r.get("field") != flt["field"]:
+            continue
+        kept.append(r)
+    return kept
+
+
+def sort_results(results, sort="relevance"):
+    if sort == "newest":
+        return sorted(results, key=lambda p: (p.get("publication_year") is not None, p.get("publication_year") or 0),
+                      reverse=True)
+    if sort == "most_cited":
+        return sorted(results, key=lambda p: (isinstance(p.get("cited_by_count"), int), p.get("cited_by_count") or 0),
+                      reverse=True)
+    return results
 
 
 # ============================================================
@@ -2349,15 +2844,21 @@ def generate_ask_cache_key(question: str, papers: list[dict], conversation_histo
 @app.get(
     "/search",
     tags=["Search"],
-    summary="Search five academic databases",
-    description="Searches OpenAlex, Semantic Scholar, arXiv, Crossref and CORE (CORE needs a server-side key), merges duplicates "
-                "by DOI or title, and ranks by semantic similarity when the embedding model is enabled. Open to guests.\n\n"
+    summary="Search seven academic databases",
+    description="Searches OpenAlex, Semantic Scholar, arXiv, Crossref, CORE (CORE needs a server-side key), PubMed and Europe PMC, "
+                "merges duplicates by DOI or title, and ranks by semantic similarity when the embedding model is enabled. "
+                "Open to guests.\n\n"
                 "`year_min` / `year_max` restrict the publication year (inclusive). `open_access_only=true` returns only papers a "
-                "source confirmed as open access (`is_open_access: true`). Papers without an abstract may be returned with "
+                "source confirmed as open access (`is_open_access: true`). `min_citations`, `exclude_preprints`, `study_type` "
+                "(" + ", ".join(STUDY_TYPES) + ") and `field` narrow the results further; a paper whose value is unknown is "
+                "left out by that filter. `sort` is `relevance` (default), `newest` or `most_cited`.\n\n"
+                "`search_by` is `topic` (default), `title` or `author`; the prefixes `author:`, `title:` and `doi:` in `q` do the "
+                "same. A query that is only a DOI is looked up directly. Papers without an abstract may be returned with "
                 "`abstract: null`; they are never used as evidence by `/ask`.",
     responses={
-        **_ok({"query": "sleep and memory", "count": 1, "source_counts": {"OpenAlex": 1}, "results": [EXAMPLE_PAPER]}),
-        **_err(400, "Empty query.", "Query cannot be empty."),
+        **_ok({"query": "sleep and memory", "count": 1, "search_mode": "topic", "source_counts": {"OpenAlex": 1},
+               "results": [EXAMPLE_PAPER]}),
+        **_err(400, "Empty query or unknown filter value.", "Query cannot be empty."),
         **E_RATE,
     },
 )
@@ -2366,6 +2867,12 @@ async def search(
     year_min: int | None = Query(default=None, ge=0, le=3000),
     year_max: int | None = Query(default=None, ge=0, le=3000),
     open_access_only: bool = False,
+    min_citations: int | None = Query(default=None, ge=0, le=1_000_000),
+    exclude_preprints: bool = False,
+    study_type: str | None = Query(default=None, max_length=40),
+    field: str | None = Query(default=None, max_length=60),
+    sort: str = Query(default="relevance", pattern="^(relevance|newest|most_cited)$"),
+    search_by: str = Query(default="topic", pattern="^(topic|title|author)$"),
 ):
 
     if not q.strip():
@@ -2377,14 +2884,41 @@ async def search(
             ),
         )
 
+    if study_type is not None and study_type not in STUDY_TYPES:
+        raise HTTPException(status_code=400, detail="Unknown study type.")
+    if field is not None and field not in FIELDS_OF_STUDY:
+        raise HTTPException(status_code=400, detail="Unknown field of study.")
+
     query = q.strip()
-    cache_key = f"{query.lower()}:{year_min}:{year_max}:{open_access_only}"
+
+    # Work out what the user typed: a DOI, an author, a title or a topic.
+    mode, term = search_by, query
+    prefix = re.match(r"^(author|title|doi)\s*:\s*(.+)$", query, re.IGNORECASE)
+    if prefix and prefix.group(1).lower() in ("author", "title"):
+        mode, term = prefix.group(1).lower(), prefix.group(2).strip()
+    doi = extract_doi_query(query)
+    if doi:
+        mode, term = "doi", doi
+    elif prefix and prefix.group(1).lower() == "doi":
+        raise HTTPException(status_code=400, detail="That does not look like a valid DOI.")
+    if not term:
+        raise HTTPException(status_code=400, detail="Search query cannot be empty.")
+
+    filters = {
+        "min_citations": min_citations or None,
+        "exclude_preprints": exclude_preprints,
+        "study_type": study_type,
+        "field": field,
+    }
+    cache_key = json.dumps(
+        [mode, term.lower(), year_min, year_max, open_access_only, min_citations, exclude_preprints,
+         study_type, field, sort],
+        separators=(",", ":"),
+    )
 
     cached_response = get_from_search_cache(cache_key)
     if cached_response is not None:
         return cached_response
-
-    academic_keyword = clean_academic_query(query)
 
     timeout = httpx.Timeout(
         30.0,
@@ -2401,25 +2935,40 @@ async def search(
             },
         ) as client:
 
-            # Year and open-access filters are sent to each source so its result slots go to matching papers.
-            f = {"year_min": year_min, "year_max": year_max, "oa_only": open_access_only}
-            tasks = [
-                search_openalex(client, academic_keyword, **f),
-                search_semantic_scholar(client, academic_keyword, **f),
-                search_arxiv(client, academic_keyword, **f),
-                search_core(client, academic_keyword, **f),
-            ]
-            if not open_access_only:
-                # Crossref cannot tell us whether a paper is open access, so it is skipped for OA-only searches.
-                tasks.append(search_crossref(client, academic_keyword, **f))
+            # Filters are sent to each source so its result slots go to matching papers.
+            f = {"year_min": year_min, "year_max": year_max, "oa_only": open_access_only, "filters": filters}
 
-            # If user query has distinct keywords, also search raw query
-            if academic_keyword != query:
-                tasks.extend([
-                    search_semantic_scholar(client, query, **f),
-                    search_openalex(client, query, **f),
-                    search_arxiv(client, query, **f),
-                ])
+            if mode == "doi":
+                tasks = [lookup_doi(client, term)]
+            elif mode == "author":
+                tasks = [search_openalex_by_author(client, term, **f)]
+            elif mode == "title":
+                tasks = [
+                    search_openalex(client, term, mode="title", **f),
+                    search_semantic_scholar(client, term, **f),
+                ]
+            else:
+                academic_keyword = clean_academic_query(term)
+                tasks = [
+                    search_openalex(client, academic_keyword, **f),
+                    search_semantic_scholar(client, academic_keyword, **f),
+                    search_arxiv(client, academic_keyword, **f),
+                    search_core(client, academic_keyword, **f),
+                    search_europepmc(client, academic_keyword, **f),
+                ]
+                if not open_access_only:
+                    # Crossref and PubMed cannot tell us whether a paper is open access, so they are skipped
+                    # for OA-only searches.
+                    tasks.append(search_crossref(client, academic_keyword, **f))
+                    tasks.append(search_pubmed(client, academic_keyword, **f))
+
+                # If user query has distinct keywords, also search raw query
+                if academic_keyword != term:
+                    tasks.extend([
+                        search_semantic_scholar(client, term, **f),
+                        search_openalex(client, term, **f),
+                        search_arxiv(client, term, **f),
+                    ])
 
             gathered = await asyncio.gather(*tasks, return_exceptions=True)
             all_results = []
@@ -2439,51 +2988,35 @@ async def search(
     )
 
     # --------------------------------------------------------
-    # Filters (Year and Open Access)
+    # Filters (a direct DOI lookup is returned as found)
     # --------------------------------------------------------
-    # Safety net: enforce the filters again on the merged list (sources can be loose about dates).
-    if year_min is not None or year_max is not None or open_access_only:
-        filtered = []
-        for r in results:
-            y = r.get("publication_year")
-            if year_min is not None and (y is None or y < year_min):
-                continue
-            if year_max is not None and (y is None or y > year_max):
-                continue
-            if open_access_only and r.get("is_open_access") is not True:
-                continue  # only papers a source confirmed as open access
-            filtered.append(r)
-        results = filtered
+    if mode != "doi":
+        results = apply_result_filters(results, year_min, year_max, open_access_only, filters)
 
     # --------------------------------------------------------
     # Semantic Re-Ranking (FastEmbed Local Embeddings)
     # --------------------------------------------------------
-    results = rerank_papers_by_similarity(
-        query,
-        results,
-    )
+    if mode in ("topic", "title"):
+        results = rerank_papers_by_similarity(
+            term,
+            results,
+        )
+    else:
+        # Author results keep OpenAlex's most-cited order; a DOI lookup has one paper.
+        for result in results:
+            result.setdefault("similarity_score", None)
 
+    results = sort_results(results, sort)
+
+    # Papers per database (not per journal).
     source_counts = {}
-
     for result in results:
-
-        source = (
-            result.get(
-                "description"
-            )
-            or "Unknown source"
-        )
-
-        source_counts[source] = (
-            source_counts.get(
-                source,
-                0,
-            )
-            + 1
-        )
+        database = result.get("database") or result.get("description") or "Unknown source"
+        source_counts[database] = source_counts.get(database, 0) + 1
 
     response_data = {
         "query": query,
+        "search_mode": mode,
         "count": len(results),
         "source_counts": source_counts,
         "results": results,
@@ -2825,6 +3358,8 @@ def sanitize_paper_for_storage(paper: dict) -> dict:
     authors = paper.get("authors")
     year = paper.get("publication_year")
     score = paper.get("similarity_score")
+    cited = paper.get("cited_by_count")
+    study_types = paper.get("study_types")
     return {
         "title": str(paper.get("title") or "Untitled")[:500],
         "authors": [str(a)[:200] for a in authors[:50]] if isinstance(authors, list) else [],
@@ -2833,6 +3368,12 @@ def sanitize_paper_for_storage(paper: dict) -> dict:
         "doi": str(paper["doi"])[:255] if paper.get("doi") else None,
         "abstract": str(paper["abstract"])[:5000] if paper.get("abstract") else None,
         "similarity_score": score if isinstance(score, (int, float)) else None,
+        "database": str(paper.get("database") or "")[:50] or None,
+        "cited_by_count": cited if isinstance(cited, int) and not isinstance(cited, bool) and cited >= 0 else None,
+        "study_types": [t for t in STUDY_TYPES if t in study_types] if isinstance(study_types, list) else [],
+        "is_preprint": paper["is_preprint"] if isinstance(paper.get("is_preprint"), bool) else None,
+        "is_retracted": paper.get("is_retracted") is True,
+        "field": paper["field"] if paper.get("field") in FIELDS_OF_STUDY else None,
     }
 
 
@@ -2873,6 +3414,8 @@ async def ask(
         abstract = result.get("abstract")
         if not isinstance(abstract, str) or not abstract.strip():
             continue  # no abstract = no evidence to ground an answer in
+        if result.get("is_retracted") is True:
+            continue  # a retracted paper is never used as evidence (it still shows in the results, flagged)
         clean_abstract = abstract.strip()
         # Truncate to stay safely within token limits (e.g. Groq TPM)
         if len(clean_abstract) > 400:

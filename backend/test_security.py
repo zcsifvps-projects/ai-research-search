@@ -276,6 +276,13 @@ def test_ask_without_abstracts_is_rejected_not_hallucinated(monkeypatch):
     assert TestClient(main.app).post("/ask", json=body).status_code == 400
 
 
+def test_ask_never_uses_a_retracted_paper_as_evidence(monkeypatch):
+    use_fake_ai(monkeypatch, gemini=FakeGemini(text=GOOD_JSON))
+    body = {"question": "Anything?", "session_id": "guest-session-0001-abcd",
+            "results": [{"title": "Retracted", "abstract": "Bad data.", "is_retracted": True}]}
+    assert TestClient(main.app).post("/ask", json=body).status_code == 400
+
+
 def test_ask_input_limits(monkeypatch):
     use_fake_ai(monkeypatch, gemini=FakeGemini(text=GOOD_JSON))
     c = TestClient(main.app)

@@ -126,13 +126,28 @@ def paper(title, year, oa, doi=None, abstract="An abstract."):
 
 @pytest.fixture()
 def fake_sources(monkeypatch):
-    seen = {"calls": []}
+    seen = {"calls": [], "filters": [], "queries": []}
 
     def make(name, papers):
-        async def fake(client, q, year_min=None, year_max=None, oa_only=False):
+        async def fake(client, q, year_min=None, year_max=None, oa_only=False, filters=None, **kwargs):
             seen["calls"].append((name, year_min, year_max, oa_only))
+            seen["filters"].append((name, filters))
+            seen["queries"].append((name, q, kwargs.get("mode")))
             return [dict(p) for p in papers]
         return fake
+
+    async def fake_doi(client, doi):
+        seen["calls"].append(("doi", doi))
+        return [paper("Found by DOI", 2020, None, doi)]
+
+    async def fake_author(client, name, year_min=None, year_max=None, oa_only=False, filters=None):
+        seen["calls"].append(("author", name))
+        return [paper("By author", 2021, True, "10.1/auth")]
+
+    monkeypatch.setattr(main, "lookup_doi", fake_doi)
+    monkeypatch.setattr(main, "search_openalex_by_author", fake_author)
+    monkeypatch.setattr(main, "search_pubmed", make("pubmed", []))
+    monkeypatch.setattr(main, "search_europepmc", make("europepmc", []))
 
     monkeypatch.setattr(main, "search_openalex", make("openalex", [
         paper("Old open", 2015, True, "10.1/old"), paper("New open", 2025, True, "10.1/new"),

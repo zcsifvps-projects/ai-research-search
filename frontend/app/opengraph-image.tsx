@@ -50,9 +50,9 @@ export default function OpenGraphImage() {
           <div style={{ fontSize: 52, fontWeight: 700, color: ACCENT, lineHeight: 1.15 }}>
             &amp; Literature Discovery
           </div>
-          <div style={{ marginTop: 36, fontSize: 26, color: "#6E6459" }}>Search five academic databases at once:</div>
-          <div style={{ marginTop: 10, fontSize: 24, fontWeight: 700, color: INK }}>
-            OpenAlex • Semantic Scholar • arXiv • Crossref • CORE
+          <div style={{ marginTop: 36, fontSize: 26, color: "#6E6459" }}>Search seven academic databases at once:</div>
+          <div style={{ marginTop: 10, fontSize: 22, fontWeight: 700, color: INK }}>
+            OpenAlex • Semantic Scholar • arXiv • Crossref • CORE • PubMed • Europe PMC
           </div>
         </div>
       </div>

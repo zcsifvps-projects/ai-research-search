@@ -55,7 +55,81 @@ type Result = {
   doi: string | null;
   abstract: string | null;
   similarity_score?: number | null;
+  is_open_access?: boolean | null;
+  database?: string | null;
+  cited_by_count?: number | null;
+  study_types?: string[];
+  is_preprint?: boolean | null;
+  is_retracted?: boolean;
+  field?: string | null;
 };
+
+const STUDY_TYPE_LABELS: Record<string, string> = {
+  meta_analysis: "Meta-analysis",
+  systematic_review: "Systematic review",
+  review: "Review",
+  rct: "RCT",
+  clinical_trial: "Clinical trial",
+  case_report: "Case report",
+};
+
+const FIELD_OPTIONS = [
+  "Medicine",
+  "Biology",
+  "Neuroscience",
+  "Psychology",
+  "Computer Science",
+  "Engineering",
+  "Physics",
+  "Chemistry",
+  "Mathematics",
+  "Materials Science",
+  "Environmental Science",
+  "Earth Sciences",
+  "Agriculture",
+  "Pharmacology",
+  "Economics",
+  "Business",
+  "Social Sciences",
+  "Arts and Humanities",
+];
+
+type SortOption = "relevance" | "newest" | "most_cited";
+type SearchBy = "topic" | "title" | "author";
+
+// The most specific study type the backend reported (the list is ordered most specific first).
+function primaryStudyType(paper: Result): string | null {
+  const first = paper.study_types?.[0];
+  return first ? STUDY_TYPE_LABELS[first] || null : null;
+}
+
+function PaperBadges({ paper }: { paper: Result }) {
+  const studyType = primaryStudyType(paper);
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {paper.is_retracted && (
+        <span className="px-1.5 py-0.5 rounded-md text-[10px] font-bold uppercase tracking-wide bg-red-600 text-white">
+          Retracted
+        </span>
+      )}
+      {paper.is_preprint && (
+        <span className="px-1.5 py-0.5 rounded-md text-[10px] font-semibold bg-amber-500/15 text-amber-600 border border-amber-500/30">
+          Preprint
+        </span>
+      )}
+      {studyType && (
+        <span className="px-1.5 py-0.5 rounded-md text-[10px] font-semibold bg-[var(--accent-light)] text-[var(--accent)] border border-[var(--accent)]/20">
+          {studyType}
+        </span>
+      )}
+      {typeof paper.cited_by_count === "number" && (
+        <span className="text-[10px] text-[var(--text-muted)]">
+          {paper.cited_by_count.toLocaleString()} {paper.cited_by_count === 1 ? "citation" : "citations"}
+        </span>
+      )}
+    </div>
+  );
+}
 
 type Citation = {
   paper_id: number;
@@ -115,6 +189,20 @@ export default function Home() {
   // Filters & Citations
   const [yearFilter, setYearFilter] = useState<"all" | "3" | "5" | "10">("all");
   const [openAccessOnly, setOpenAccessOnly] = useState<boolean>(false);
+  const [showMoreFilters, setShowMoreFilters] = useState<boolean>(false);
+  const [studyTypeFilter, setStudyTypeFilter] = useState<string>("");
+  const [fieldFilter, setFieldFilter] = useState<string>("");
+  const [minCitations, setMinCitations] = useState<string>("");
+  const [excludePreprints, setExcludePreprints] = useState<boolean>(false);
+  const [sortBy, setSortBy] = useState<SortOption>("relevance");
+  const [searchBy, setSearchBy] = useState<SearchBy>("topic");
+  const activeExtraFilters =
+    (studyTypeFilter ? 1 : 0) +
+    (fieldFilter ? 1 : 0) +
+    (minCitations ? 1 : 0) +
+    (excludePreprints ? 1 : 0) +
+    (sortBy !== "relevance" ? 1 : 0) +
+    (searchBy !== "topic" ? 1 : 0);
   const [copiedBibtexIndex, setCopiedBibtexIndex] = useState<number | null>(null);
   const [copiedAnswerId, setCopiedAnswerId] = useState<string | null>(null);
 
@@ -946,7 +1034,7 @@ export default function Home() {
     setResults([]);
     setSelectedPaperForDetail(null);
     setSelectedPaperIds([]);
-    setLoadingStep("Querying OpenAlex, Semantic Scholar, arXiv, Crossref, and CORE...");
+    setLoadingStep("Querying OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed, and Europe PMC...");
 
     const userMessage: Message = {
       id: Date.now().toString(),
@@ -968,6 +1056,12 @@ export default function Home() {
         open_access_only: openAccessOnly.toString(),
       });
       if (yearMin) searchParams.append("year_min", yearMin.toString());
+      if (studyTypeFilter) searchParams.append("study_type", studyTypeFilter);
+      if (fieldFilter) searchParams.append("field", fieldFilter);
+      if (minCitations) searchParams.append("min_citations", minCitations);
+      if (excludePreprints) searchParams.append("exclude_preprints", "true");
+      if (sortBy !== "relevance") searchParams.append("sort", sortBy);
+      if (searchBy !== "topic") searchParams.append("search_by", searchBy);
 
       const searchRes = await fetch(`${apiBaseUrl}/search?${searchParams.toString()}`, {
         credentials: "include",
@@ -987,7 +1081,7 @@ export default function Home() {
           {
             id: (Date.now() + 1).toString(),
             role: "assistant",
-            content: "No matching academic papers found across OpenAlex, Semantic Scholar, arXiv, Crossref, or CORE. Try adjusting your search query or filters.",
+            content: "No matching academic papers found across OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed, or Europe PMC. Try adjusting your search query or filters.",
             timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
           },
         ]);
@@ -1648,7 +1742,7 @@ export default function Home() {
                 </h1>
 
                 <p className="text-base text-[var(--text-secondary)] max-w-lg mx-auto">
-                  Search five academic databases at once: OpenAlex, Semantic Scholar, arXiv, Crossref and CORE.
+                  Search seven academic databases at once: OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed and Europe PMC.
                 </p>
 
                 {/* Primary Search Bar */}
@@ -1708,7 +1802,131 @@ export default function Home() {
                       <Check className={`w-3 h-3 ${openAccessOnly ? "opacity-100" : "opacity-0"}`} />
                       <span>Open Access</span>
                     </button>
+                    <button
+                      type="button"
+                      onClick={() => setShowMoreFilters(!showMoreFilters)}
+                      aria-expanded={showMoreFilters}
+                      className={`px-2.5 py-1 rounded-full border transition flex items-center gap-1 ${
+                        showMoreFilters || activeExtraFilters > 0
+                          ? "bg-[var(--accent-light)] text-[var(--accent)] border-[var(--accent)]/40"
+                          : "bg-[var(--bg-surface)] border-[var(--border-color)] hover:bg-[var(--bg-surface-elevated)]"
+                      }`}
+                    >
+                      <Filter className="w-3 h-3" />
+                      <span>More filters{activeExtraFilters > 0 ? ` (${activeExtraFilters})` : ""}</span>
+                    </button>
                   </div>
+
+                  {showMoreFilters && (
+                    <div className="mt-3 p-4 rounded-2xl border border-[var(--border-color)] bg-[var(--bg-surface)] text-xs text-[var(--text-secondary)] text-left grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <label className="flex flex-col gap-1">
+                        <span className="font-medium">Search by</span>
+                        <select
+                          value={searchBy}
+                          onChange={(e) => setSearchBy(e.target.value as SearchBy)}
+                          className="px-2.5 py-2 rounded-lg border border-[var(--border-color)] bg-[var(--bg-primary)] text-[var(--text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--accent)]"
+                        >
+                          <option value="topic">Topic or question</option>
+                          <option value="title">Paper title</option>
+                          <option value="author">Author name</option>
+                        </select>
+                      </label>
+                      <label className="flex flex-col gap-1">
+                        <span className="font-medium">Sort by</span>
+                        <select
+                          value={sortBy}
+                          onChange={(e) => setSortBy(e.target.value as SortOption)}
+                          className="px-2.5 py-2 rounded-lg border border-[var(--border-color)] bg-[var(--bg-primary)] text-[var(--text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--accent)]"
+                        >
+                          <option value="relevance">Relevance</option>
+                          <option value="newest">Newest first</option>
+                          <option value="most_cited">Most cited</option>
+                        </select>
+                      </label>
+                      <label className="flex flex-col gap-1">
+                        <span className="font-medium">Study type</span>
+                        <select
+                          value={studyTypeFilter}
+                          onChange={(e) => setStudyTypeFilter(e.target.value)}
+                          className="px-2.5 py-2 rounded-lg border border-[var(--border-color)] bg-[var(--bg-primary)] text-[var(--text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--accent)]"
+                        >
+                          <option value="">Any study type</option>
+                          {Object.entries(STUDY_TYPE_LABELS).map(([value, label]) => (
+                            <option key={value} value={value}>
+                              {label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="flex flex-col gap-1">
+                        <span className="font-medium">Field of study</span>
+                        <select
+                          value={fieldFilter}
+                          onChange={(e) => setFieldFilter(e.target.value)}
+                          className="px-2.5 py-2 rounded-lg border border-[var(--border-color)] bg-[var(--bg-primary)] text-[var(--text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--accent)]"
+                        >
+                          <option value="">Any field</option>
+                          {FIELD_OPTIONS.map((f) => (
+                            <option key={f} value={f}>
+                              {f}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="flex flex-col gap-1">
+                        <span className="font-medium">Minimum citations</span>
+                        <select
+                          value={minCitations}
+                          onChange={(e) => setMinCitations(e.target.value)}
+                          className="px-2.5 py-2 rounded-lg border border-[var(--border-color)] bg-[var(--bg-primary)] text-[var(--text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--accent)]"
+                        >
+                          <option value="">No minimum</option>
+                          <option value="10">10+</option>
+                          <option value="50">50+</option>
+                          <option value="100">100+</option>
+                          <option value="500">500+</option>
+                        </select>
+                      </label>
+                      <div className="flex flex-col gap-1">
+                        <span className="font-medium">Preprints</span>
+                        <button
+                          type="button"
+                          onClick={() => setExcludePreprints(!excludePreprints)}
+                          aria-pressed={excludePreprints}
+                          className={`px-2.5 py-2 rounded-lg border transition flex items-center gap-1.5 ${
+                            excludePreprints
+                              ? "bg-[var(--accent)] text-white border-[var(--accent)]"
+                              : "bg-[var(--bg-primary)] border-[var(--border-color)] hover:bg-[var(--bg-surface-elevated)]"
+                          }`}
+                        >
+                          <Check className={`w-3 h-3 ${excludePreprints ? "opacity-100" : "opacity-0"}`} />
+                          <span>Exclude preprints</span>
+                        </button>
+                      </div>
+                      <p className="sm:col-span-2 text-[11px] text-[var(--text-muted)] leading-relaxed">
+                        Papers whose study type, field or citation count is unknown are left out by those filters. Tip: you can
+                        also type <span className="font-mono">author:</span> or <span className="font-mono">title:</span> before
+                        your search, or paste a DOI.
+                      </p>
+                      {activeExtraFilters > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setStudyTypeFilter("");
+                            setFieldFilter("");
+                            setMinCitations("");
+                            setExcludePreprints(false);
+                            setSortBy("relevance");
+                            setSearchBy("topic");
+                          }}
+                          className="sm:col-span-2 justify-self-start flex items-center gap-1 text-[var(--accent)] hover:underline"
+                        >
+                          <RotateCcw className="w-3 h-3" />
+                          <span>Clear these filters</span>
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </form>
               </div>
 
@@ -1778,7 +1996,7 @@ export default function Home() {
                         ))}
                       </div>
                       <p className="mt-3 text-[11px] text-[var(--text-muted)]">
-                        Real-time discovery across five academic databases.
+                        Real-time discovery across seven academic databases.
                       </p>
                     </div>
                   </div>
@@ -1786,7 +2004,7 @@ export default function Home() {
 
                 <div className="pt-6 pb-6 border-t border-[var(--border-subtle)] flex flex-col sm:flex-row items-center justify-between text-[11px] text-[var(--text-muted)] gap-2">
                   <div>© 2026 {APP_NAME}. All rights reserved.</div>
-                  <div>Federated academic discovery across five academic databases.</div>
+                  <div>Federated academic discovery across seven academic databases.</div>
                   <div>
                     Developed by{" "}
                     <a
@@ -2155,11 +2373,57 @@ export default function Home() {
                         <div className="space-y-4 text-xs">
                           <div className="p-4 rounded-xl bg-[var(--bg-primary)] border border-[var(--border-color)] space-y-3">
                             <div className="flex justify-between py-1 border-b border-[var(--border-subtle)]">
-                              <span className="text-[var(--text-secondary)] font-medium">Source Database:</span>
+                              <span className="text-[var(--text-secondary)] font-medium">Published In:</span>
                               <span className="font-semibold text-[var(--text-primary)]">
                                 {selectedPaperForDetail.paper.description}
                               </span>
                             </div>
+                            {selectedPaperForDetail.paper.database && (
+                              <div className="flex justify-between py-1 border-b border-[var(--border-subtle)]">
+                                <span className="text-[var(--text-secondary)] font-medium">Found Via:</span>
+                                <span className="font-semibold text-[var(--text-primary)]">
+                                  {selectedPaperForDetail.paper.database}
+                                </span>
+                              </div>
+                            )}
+                            <div className="flex justify-between py-1 border-b border-[var(--border-subtle)]">
+                              <span className="text-[var(--text-secondary)] font-medium">Citations:</span>
+                              <span className="font-semibold text-[var(--text-primary)]">
+                                {typeof selectedPaperForDetail.paper.cited_by_count === "number"
+                                  ? selectedPaperForDetail.paper.cited_by_count.toLocaleString()
+                                  : "Unknown"}
+                              </span>
+                            </div>
+                            <div className="flex justify-between py-1 border-b border-[var(--border-subtle)]">
+                              <span className="text-[var(--text-secondary)] font-medium">Study Type:</span>
+                              <span className="font-semibold text-[var(--text-primary)] text-right">
+                                {selectedPaperForDetail.paper.study_types && selectedPaperForDetail.paper.study_types.length > 0
+                                  ? selectedPaperForDetail.paper.study_types
+                                      .map((t) => STUDY_TYPE_LABELS[t] || t)
+                                      .join(", ")
+                                  : "Not stated"}
+                              </span>
+                            </div>
+                            {selectedPaperForDetail.paper.field && (
+                              <div className="flex justify-between py-1 border-b border-[var(--border-subtle)]">
+                                <span className="text-[var(--text-secondary)] font-medium">Field:</span>
+                                <span className="font-semibold text-[var(--text-primary)]">
+                                  {selectedPaperForDetail.paper.field}
+                                </span>
+                              </div>
+                            )}
+                            {(selectedPaperForDetail.paper.is_retracted || selectedPaperForDetail.paper.is_preprint) && (
+                              <div className="flex justify-between items-center py-1 border-b border-[var(--border-subtle)]">
+                                <span className="text-[var(--text-secondary)] font-medium">Status:</span>
+                                <PaperBadges
+                                  paper={{
+                                    ...selectedPaperForDetail.paper,
+                                    study_types: [],
+                                    cited_by_count: null,
+                                  }}
+                                />
+                              </div>
+                            )}
                             <div className="flex justify-between py-1 border-b border-[var(--border-subtle)]">
                               <span className="text-[var(--text-secondary)] font-medium">Publication Year:</span>
                               <span className="font-semibold text-[var(--text-primary)]">
@@ -2278,6 +2542,10 @@ export default function Home() {
                             <div className="mt-1 text-[11px] text-[var(--text-secondary)] truncate">
                               {paper.authors.length > 0 ? paper.authors.join(", ") : "Unknown"}
                               {paper.publication_year && ` (${paper.publication_year})`}
+                            </div>
+
+                            <div className="mt-1.5">
+                              <PaperBadges paper={paper} />
                             </div>
 
                             <p className="mt-2 text-xs text-[var(--text-secondary)] line-clamp-2 leading-relaxed">
@@ -2569,7 +2837,7 @@ export default function Home() {
                   </p>
                   <h4 className="font-bold text-[var(--text-primary)]">Third-Party Academic APIs</h4>
                   <p>
-                    Queries are dispatched to public academic APIs (OpenAlex, Semantic Scholar, arXiv, Crossref, and CORE) to retrieve research metadata.
+                    Queries are dispatched to public academic APIs (OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed, and Europe PMC) to retrieve research metadata.
                   </p>
                 </>
               )}

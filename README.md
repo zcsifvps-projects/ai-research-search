@@ -43,7 +43,7 @@ The AI synthesis feature is deliberately constrained: only papers with abstracts
 
 | Area | Purpose |
 |---|---|
-| Academic search | Federated search across OpenAlex, Semantic Scholar, arXiv, Crossref, and CORE |
+| Academic search | Federated search across OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed, and Europe PMC, with study type, citation, preprint and field filters, sorting, and author, title and DOI search |
 | Filtering | Publication-year range and confirmed open-access filtering |
 | AI question answering | Synthesize a concise response from retrieved paper abstracts |
 | Paper deep dive | Generate a structured analysis from a paper title and abstract |

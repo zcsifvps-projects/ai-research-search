@@ -1,6 +1,6 @@
 # ImoSmart API guide
 
-A REST API over JSON. Search five academic databases at once, then get an answer written **only from the papers' abstracts**, with citations.
+A REST API over JSON. Search seven academic databases at once, then get an answer written **only from the papers' abstracts**, with citations.
 
 - **Reference (interactive):** `/docs` (Swagger UI, "Try it out") and `/redoc` (searchable reference with a side menu).
   They are served when `ENABLE_DOCS=true` (always on with `DEV_MODE=true`). The raw schema is at `/openapi.json`.
@@ -85,7 +85,7 @@ Shorter or guessable values are rejected with `422`, because the `session_id` is
 | Method and path | Auth | Purpose |
 |---|---|---|
 | `GET /health` | none | Database-backed health check (`{"status":"healthy"}` or 503) |
-| `GET /search` | none | Federated search. Params: `q` (required, max 300), `year_min`, `year_max`, `open_access_only` |
+| `GET /search` | none | Federated search. Params: `q` (required, max 300), `year_min`, `year_max`, `open_access_only`, `min_citations`, `exclude_preprints`, `study_type`, `field`, `sort`, `search_by` |
 | `POST /ask` | optional | Cited answer from papers. Body: `question`, `results`, `session_id`, `conversation_history` |
 | `POST /deep-dive` | none | Markdown analysis of one paper. Body: `title`, `abstract` |
 | `GET /history/{session_id}` | optional | Your history (signed in) or the guest session's |
@@ -107,8 +107,24 @@ Full request and response shapes, with examples for every status code, are in th
 
 - `year_min` / `year_max`: inclusive publication years. Papers with an unknown year are dropped when a year filter is set.
 - `open_access_only=true`: only papers a source confirmed as open access. OpenAlex uses its open-access flag, Semantic Scholar needs a free PDF,
-  arXiv and CORE are always open access. Crossref cannot say, so it is skipped for these searches. Having a DOI does **not** make a paper open access.
-- Each result has `is_open_access` (`true`, `false` or `null` when the source did not say).
+  arXiv and CORE are always open access, Europe PMC uses its open-access flag. Crossref and PubMed cannot say, so they are skipped for these
+  searches. Having a DOI does **not** make a paper open access.
+- `min_citations`: drops papers below the count. Papers whose source gave no citation count (arXiv, PubMed) are dropped too.
+- `exclude_preprints=true`: drops papers a source marked as a preprint, and skips arXiv.
+- `study_type`: one of `meta_analysis`, `systematic_review`, `review`, `rct`, `clinical_trial`, `case_report`. Types come from the source
+  (OpenAlex, Semantic Scholar, PubMed, Europe PMC) plus title detection ("randomized controlled trial", "meta-analysis", ...). An RCT also
+  counts as a clinical trial; a meta-analysis or systematic review also counts as a review.
+- `field`: one of `Medicine`, `Biology`, `Neuroscience`, `Psychology`, `Computer Science`, `Engineering`, `Physics`, `Chemistry`,
+  `Mathematics`, `Materials Science`, `Environmental Science`, `Earth Sciences`, `Agriculture`, `Pharmacology`, `Economics`, `Business`,
+  `Social Sciences`, `Arts and Humanities`. Only OpenAlex and Semantic Scholar report a field, so other papers are left out.
+- Unknown `study_type` or `field` values return 400.
+- `sort`: `relevance` (default), `newest` or `most_cited`. Papers with an unknown year or citation count go last.
+- `search_by`: `topic` (default), `title` or `author`. The prefixes `author:` and `title:` in `q` do the same. A `q` that is only a DOI
+  (bare, `doi:` or a doi.org link) is looked up directly and filters are not applied.
+- The response has `search_mode` (`topic`, `title`, `author` or `doi`) and `source_counts` (papers per database).
+- Each result has `is_open_access` (`true`, `false` or `null` when the source did not say), `database`, `cited_by_count` (`null` when
+  unknown), `study_types` (list), `is_preprint` (`true`, `false` or `null`), `is_retracted` and `field` (`null` when unknown).
+- Retracted papers are kept in results so users can see them, and flagged with `is_retracted: true`.
 
 ### How `/ask` stays grounded
 
