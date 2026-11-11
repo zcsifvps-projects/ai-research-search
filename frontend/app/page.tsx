@@ -1,7 +1,8 @@
 "use client";
 
-import jsPDF from "jspdf";
 import { APP_NAME } from "./brand";
+import { buildBibtex } from "./bibtex";
+import { Markdown } from "./markdown";
 import { AnimatePresence, animate, motion, useMotionValue, useReducedMotion } from "motion/react";
 import { ModalPanel, ModalShell, SPRING, SlideUp, projectMomentum, useIsDesktop } from "./motion";
 import {
@@ -234,6 +235,8 @@ export default function Home() {
   // History
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [confirmClearHistory, setConfirmClearHistory] = useState(false);
+  const [clearingHistory, setClearingHistory] = useState(false);
 
   const chatEndRef = useRef<HTMLDivElement>(null);
   const accountMenuRef = useRef<HTMLDivElement>(null);
@@ -892,6 +895,23 @@ export default function Home() {
     }
   }
 
+  async function handleClearAllHistory() {
+    setClearingHistory(true);
+    try {
+      // Signed in: clears the whole account history. Guest: clears this browser's session.
+      const res = await fetch(`${apiBaseUrl}/history/${encodeURIComponent(getSessionId())}`, {
+        method: "DELETE",
+        credentials: "include",
+      });
+      if (res.ok) setHistory([]);
+    } catch {
+      // ignore
+    } finally {
+      setClearingHistory(false);
+      setConfirmClearHistory(false);
+    }
+  }
+
   // ============================================================
   // SEARCH & QUESTION WORKFLOW
   // ============================================================
@@ -1120,16 +1140,7 @@ export default function Home() {
   }
 
   function handleCopyBibtex(index: number, paper: Result) {
-    const firstAuthor = (paper.authors[0] || "Unknown").split(" ").pop()?.toLowerCase() || "author";
-    const year = paper.publication_year || new Date().getFullYear();
-    const citeKey = `${firstAuthor}${year}`;
-    const bibtex = `@article{${citeKey},
-  title={${paper.title}},
-  author={${paper.authors.join(" and ")}},
-  year={${year}},
-  doi={${paper.doi || "N/A"}}
-}`;
-    navigator.clipboard.writeText(bibtex);
+    navigator.clipboard.writeText(buildBibtex(paper));
     setCopiedBibtexIndex(index);
     setTimeout(() => setCopiedBibtexIndex(null), 2500);
   }
@@ -1140,38 +1151,34 @@ export default function Home() {
     setTimeout(() => setCopiedAnswerId(null), 2500);
   }
 
-  function handleExportPDF(message: Message) {
-    const doc = new jsPDF();
-    doc.setFont("helvetica", "bold");
-    doc.setFontSize(16);
-    doc.text(`${APP_NAME} Synthesis Report`, 14, 20);
-
-    doc.setFontSize(10);
-    doc.setFont("helvetica", "normal");
-    doc.text(`Generated: ${new Date().toLocaleDateString()} | Query: ${query}`, 14, 28);
-
-    doc.setFontSize(11);
-    const splitText = doc.splitTextToSize(message.content, 180);
-    doc.text(splitText, 14, 38);
-
-    if (message.citations && message.citations.length > 0) {
-      let yPos = 38 + splitText.length * 5 + 10;
-      doc.setFont("helvetica", "bold");
-      doc.setFontSize(12);
-      doc.text("Cited References:", 14, yPos);
-      yPos += 6;
-
-      doc.setFont("helvetica", "normal");
-      doc.setFontSize(10);
-      message.citations.forEach((c) => {
-        const citText = `[${c.paper_id}] ${c.title}`;
-        const splitCit = doc.splitTextToSize(citText, 180);
-        doc.text(splitCit, 14, yPos);
-        yPos += splitCit.length * 5;
+  async function handleExportPDF(message: Message) {
+    // The question is the user message right before this answer (the search box may have changed since).
+    const at = messages.findIndex((m) => m.id === message.id);
+    const asked = messages.slice(0, at === -1 ? messages.length : at).reverse().find((m) => m.role === "user");
+    try {
+      const { exportSynthesisPdf } = await import("./pdf");
+      exportSynthesisPdf({
+        appName: APP_NAME,
+        question: asked?.content || query,
+        answer: message.content,
+        citations: message.citations || [],
+        papers: results,
+        scopedCount: message.scopedPaperIds?.length,
       });
+    } catch (err) {
+      console.error("PDF export failed", err);
+      setError("Could not create the PDF. Please try again.");
     }
+  }
 
-    doc.save(`research_synthesis_${Date.now()}.pdf`);
+  async function handleExportPaperPDF(index: number, paper: Result) {
+    try {
+      const { exportPaperPdf } = await import("./pdf");
+      exportPaperPdf({ appName: APP_NAME, paper, deepDive: deepDives[index] });
+    } catch (err) {
+      console.error("PDF export failed", err);
+      setError("Could not create the PDF. Please try again.");
+    }
   }
 
   function togglePaperSelection(id: number) {
@@ -1327,6 +1334,42 @@ export default function Home() {
                       </button>
                     </div>
                   ))
+                )}
+
+                {!historyLoading && history.length > 0 && (
+                  <div className="px-2 pt-2">
+                    {confirmClearHistory ? (
+                      <div className="rounded-lg border border-[var(--border-color)] bg-[var(--bg-surface-elevated)] p-2.5 space-y-2">
+                        <p className="text-xs text-[var(--text-primary)]">
+                          Delete all {history.length} saved search{history.length === 1 ? "" : "es"}? This cannot be undone.
+                        </p>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={handleClearAllHistory}
+                            disabled={clearingHistory}
+                            className="flex-1 px-2 py-1.5 rounded-md bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white text-xs font-medium transition"
+                          >
+                            {clearingHistory ? "Deleting..." : "Delete all"}
+                          </button>
+                          <button
+                            onClick={() => setConfirmClearHistory(false)}
+                            disabled={clearingHistory}
+                            className="flex-1 px-2 py-1.5 rounded-md border border-[var(--border-color)] text-xs text-[var(--text-primary)] hover:bg-[var(--bg-surface)] transition"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => setConfirmClearHistory(true)}
+                        className="flex items-center gap-1.5 text-[11px] text-[var(--text-muted)] hover:text-red-600 transition"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                        <span>Clear all history</span>
+                      </button>
+                    )}
+                  </div>
                 )}
               </div>
             )}
@@ -1793,7 +1836,11 @@ export default function Home() {
                             : "bg-[var(--bg-surface)] text-[var(--text-primary)] border border-[var(--border-color)] shadow-sm"
                         }`}
                       >
-                        <div className="whitespace-pre-wrap">{m.content}</div>
+                        {m.role === "assistant" ? (
+                          <Markdown text={m.content} />
+                        ) : (
+                          <div className="whitespace-pre-wrap">{m.content}</div>
+                        )}
 
                         {/* Citations block for assistant response */}
                         {m.citations && m.citations.length > 0 && (
@@ -2067,6 +2114,20 @@ export default function Home() {
                               )}
                             </button>
 
+                            <button
+                              onClick={() =>
+                                handleExportPaperPDF(
+                                  selectedPaperForDetail.index,
+                                  selectedPaperForDetail.paper
+                                )
+                              }
+                              className="flex items-center gap-1.5 px-3 py-2 bg-[var(--bg-surface-elevated)] hover:bg-[var(--border-color)] text-[var(--text-primary)] text-xs font-medium rounded-lg border border-[var(--border-color)] transition"
+                              title="Download this paper's details, abstract, deep dive and BibTeX as a PDF"
+                            >
+                              <FileDown className="w-3.5 h-3.5" />
+                              <span>Export PDF</span>
+                            </button>
+
                             {selectedPaperForDetail.paper.doi && (
                               <a
                                 href={`https://doi.org/${selectedPaperForDetail.paper.doi}`}
@@ -2086,9 +2147,7 @@ export default function Home() {
                                 <Compass className="w-4 h-4" />
                                 <span>Deep Dive Synthesis:</span>
                               </div>
-                              <p className="whitespace-pre-wrap leading-relaxed">
-                                {deepDives[selectedPaperForDetail.index]}
-                              </p>
+                              <Markdown text={deepDives[selectedPaperForDetail.index]} compact />
                             </div>
                           )}
                         </>
