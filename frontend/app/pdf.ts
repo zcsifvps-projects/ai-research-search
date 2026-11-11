@@ -13,7 +13,7 @@ import type { Blockquote, Code, Heading, List, ListItem, Nodes, PhrasingContent,
 import { fromMarkdown } from "mdast-util-from-markdown";
 import { gfmFromMarkdown } from "mdast-util-gfm";
 import { gfm } from "micromark-extension-gfm";
-import { buildBibtex, type PdfPaper } from "./bibtex";
+import { buildBibtex, doiUrl, type PdfPaper } from "./bibtex";
 import { normalizeMarkdown } from "./markdown-utils";
 
 
@@ -571,7 +571,7 @@ export function exportSynthesisPdf(input: {
       const runs: Run[] = [{ text: paper?.title || c.title, style: "bold" }];
       if (paper) {
         runs.push({ text: `\n${referenceLine(paper)}`, style: "normal", color: MUTED });
-        if (paper.doi) runs.push({ text: `\nhttps://doi.org/${paper.doi}`, style: "normal", color: ACCENT });
+        if (paper.doi) runs.push({ text: `\n${doiUrl(paper.doi)}`, style: "normal", color: ACCENT });
       }
       w.runs(runs, { x: MARGIN_X + tagW, width: CONTENT_W - tagW, size: 9.5 });
       w.gap(2.5);
@@ -587,7 +587,9 @@ export function exportSynthesisPdf(input: {
   w.doc.save(filename(input.question, "research-synthesis"));
 }
 
-export function exportPaperPdf(input: { appName: string; paper: PdfPaper; deepDive?: string }) {
+export type Glance = { study_type: string; population: string; sample_size: string; main_finding: string };
+
+export function exportPaperPdf(input: { appName: string; paper: PdfPaper; deepDive?: string; glance?: Glance | null }) {
   const { paper } = input;
   const w = new Writer();
   w.title(paper.title || "Untitled paper", 16);
@@ -600,13 +602,23 @@ export function exportPaperPdf(input: { appName: string; paper: PdfPaper; deepDi
   const rows: [string, string][] = [];
   rows.push(["Year", paper.publication_year ? String(paper.publication_year) : "Not stated"]);
   rows.push(["Source", paper.description || "Unknown"]);
-  if (paper.doi) rows.push(["DOI", `https://doi.org/${paper.doi}`]);
+  if (paper.doi) rows.push(["DOI", doiUrl(paper.doi)]);
   if (typeof paper.similarity_score === "number") {
     // The search API reports a percentage (0 to 100); older saved papers may hold a 0 to 1 fraction.
     const pct = paper.similarity_score > 1 ? paper.similarity_score : paper.similarity_score * 100;
     rows.push(["Relevance", `${pct.toFixed(1)}% match to your search`]);
   }
   w.infoBox(rows);
+
+  if (input.glance) {
+    w.sectionTitle("At a glance");
+    w.infoBox([
+      ["Study type", input.glance.study_type],
+      ["Who or what", input.glance.population],
+      ["Sample size", input.glance.sample_size],
+      ["Main finding", input.glance.main_finding],
+    ]);
+  }
 
   w.sectionTitle("Abstract");
   if (paper.abstract) {

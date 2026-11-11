@@ -352,7 +352,7 @@ def test_deep_dive_works_and_does_not_leak(monkeypatch):
     r = c.post("/deep-dive", json={"title": "Paper", "abstract": "No abstract available."})
     assert r.status_code == 200 and "No abstract" in r.json()["deep_dive"]
     use_fake_ai(monkeypatch, gemini=FakeGemini(error=RuntimeError("boom /etc/secret")))
-    r = c.post("/deep-dive", json={"title": "Paper", "abstract": "Some abstract text."})
+    r = c.post("/deep-dive", json={"title": "Paper", "abstract": "A different abstract text."})
     assert r.status_code == 502 and "/etc/secret" not in r.text
 
 

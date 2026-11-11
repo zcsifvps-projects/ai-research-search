@@ -1,12 +1,12 @@
 "use client";
 
 import { APP_NAME } from "./brand";
-import { buildBibtex } from "./bibtex";
+import { buildBibtex, doiUrl } from "./bibtex";
 import { Markdown } from "./markdown";
 import { AnimatePresence, animate, motion, useMotionValue, useReducedMotion } from "motion/react";
 import { ModalPanel, ModalShell, SPRING, SlideUp, projectMomentum, useIsDesktop } from "./motion";
 import { buildCsv, downloadCsv } from "./csv";
-import type { ComparisonRow } from "./pdf";
+import type { ComparisonRow, Glance } from "./pdf";
 import {
   ArrowDown,
   ArrowRight,
@@ -352,7 +352,8 @@ export default function Home() {
 
   // Deep dive states
   const [deepDiveLoading, setDeepDiveLoading] = useState<Record<number, boolean>>({});
-  const [deepDives, setDeepDives] = useState<Record<number, string>>({});
+  const [deepDives, setDeepDives] = useState<Record<string, { text: string; glance: Glance | null }>>({});
+  const [deepDiveErrors, setDeepDiveErrors] = useState<Record<string, string>>({});
 
   // Infinite Scroll / Load More Papers
   const [visiblePapers, setVisiblePapers] = useState(10);
@@ -1096,9 +1097,7 @@ export default function Home() {
       const rawConsent = localStorage.getItem("scholarpulse-cookie-consent");
       if (rawConsent) {
         const stored = JSON.parse(rawConsent);
-        // Saved choices live in localStorage, which only exists in the browser. Reading it while rendering would
-        // make the server and browser HTML differ (a hydration error), so it is read once here after mount.
-        // eslint-disable-next-line react-hooks/set-state-in-effect
+        // Saved choices live in localStorage, which only exists in the browser, so they are read after mount.
         setCookiePrefs({ essential: true, preferences: Boolean(stored?.preferences) });
         setCookieDecided(true);
       } else {
@@ -1513,8 +1512,10 @@ export default function Home() {
   }
 
   async function handleDeepDive(index: number, paper: Result) {
-    if (deepDives[index]) return;
+    const key = paperKey(paper);
+    if (deepDives[key]) return;
     setDeepDiveLoading((prev) => ({ ...prev, [index]: true }));
+    setDeepDiveErrors((prev) => ({ ...prev, [key]: "" }));
 
     try {
       const res = await fetch(`${apiBaseUrl}/deep-dive`, {
@@ -1527,11 +1528,18 @@ export default function Home() {
         }),
       });
 
-      if (!res.ok) throw new Error("Deep dive generation failed.");
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(typeof errData.detail === "string" ? errData.detail : "Unable to analyze this paper right now.");
+      }
       const data = await res.json();
-      setDeepDives((prev) => ({ ...prev, [index]: data.deep_dive || data.analysis || "Analysis complete." }));
-    } catch {
-      setDeepDives((prev) => ({ ...prev, [index]: "Unable to analyze this paper right now. Please try again." }));
+      setDeepDives((prev) => ({
+        ...prev,
+        [key]: { text: data.deep_dive || "Analysis complete.", glance: data.glance || null },
+      }));
+    } catch (err) {
+      // Not stored as an analysis, so the button can be pressed again.
+      setDeepDiveErrors((prev) => ({ ...prev, [key]: errorMessage(err, "Unable to analyze this paper right now.") }));
     } finally {
       setDeepDiveLoading((prev) => ({ ...prev, [index]: false }));
     }
@@ -1572,7 +1580,8 @@ export default function Home() {
   async function handleExportPaperPDF(index: number, paper: Result) {
     try {
       const { exportPaperPdf } = await import("./pdf");
-      exportPaperPdf({ appName: APP_NAME, paper, deepDive: deepDives[index] });
+      const analysis = deepDives[paperKey(paper)];
+      exportPaperPdf({ appName: APP_NAME, paper, deepDive: analysis?.text, glance: analysis?.glance });
     } catch (err) {
       console.error("PDF export failed", err);
       setError("Could not create the PDF. Please try again.");
@@ -1754,7 +1763,7 @@ export default function Home() {
       paper.publication_year ?? "",
       paper.description,
       paper.database ?? "",
-      paper.doi ? (paper.doi.startsWith("http") ? paper.doi : `https://doi.org/${paper.doi}`) : "",
+      paper.doi ? doiUrl(paper.doi) : "",
       paper.cited_by_count ?? "",
       (paper.study_types || []).map((t) => STUDY_TYPE_LABELS[t] || t).join("; "),
       yesNo(paper.is_open_access),
@@ -2918,7 +2927,7 @@ export default function Home() {
 
                             {selectedPaperForDetail.paper.doi && (
                               <a
-                                href={`https://doi.org/${selectedPaperForDetail.paper.doi}`}
+                                href={doiUrl(selectedPaperForDetail.paper.doi)}
                                 target="_blank"
                                 rel="noreferrer"
                                 className="flex items-center gap-1.5 px-3 py-2 bg-[var(--bg-surface-elevated)] hover:bg-[var(--border-color)] text-[var(--text-primary)] text-xs font-medium rounded-lg border border-[var(--border-color)] transition"
@@ -2929,15 +2938,61 @@ export default function Home() {
                             )}
                           </div>
 
-                          {deepDives[selectedPaperForDetail.index] && (
-                            <div className="mt-4 p-4 rounded-xl bg-[var(--accent-light)] border border-[var(--accent)]/30 text-xs text-[var(--text-primary)] space-y-2">
-                              <div className="font-semibold text-[var(--accent)] flex items-center gap-1.5">
-                                <Compass className="w-4 h-4" />
-                                <span>Paper analysis:</span>
-                              </div>
-                              <Markdown text={deepDives[selectedPaperForDetail.index]} compact />
+                          {deepDiveErrors[paperKey(selectedPaperForDetail.paper)] && (
+                            <div className="mt-4 p-3 rounded-xl border border-red-500/30 bg-red-500/10 text-xs text-red-600">
+                              {deepDiveErrors[paperKey(selectedPaperForDetail.paper)]}
                             </div>
                           )}
+                          {(() => {
+                            const analysis = deepDives[paperKey(selectedPaperForDetail.paper)];
+                            if (!analysis) return null;
+                            const paper = selectedPaperForDetail.paper;
+                            // A study type reported by the source wins over the AI's reading of the abstract.
+                            const sourceType = primaryStudyType(paper);
+                            const rows: [string, string][] = analysis.glance
+                              ? [
+                                  ["Study type", sourceType || analysis.glance.study_type],
+                                  ["Who or what was studied", analysis.glance.population],
+                                  ["Sample size", analysis.glance.sample_size],
+                                  ["Main finding", analysis.glance.main_finding],
+                                ]
+                              : [];
+                            return (
+                              <>
+                                {rows.length > 0 && (
+                                  <div className="mt-4 rounded-xl border border-[var(--border-color)] bg-[var(--bg-primary)] overflow-hidden">
+                                    <div className="px-4 py-2 border-b border-[var(--border-color)] text-xs font-semibold text-[var(--text-primary)] flex items-center gap-1.5">
+                                      <Lightbulb className="w-3.5 h-3.5 text-[var(--accent)]" />
+                                      <span>At a glance</span>
+                                    </div>
+                                    <dl className="divide-y divide-[var(--border-subtle)] text-xs">
+                                      {rows.map(([label, value]) => (
+                                        <div key={label} className="px-4 py-2 grid grid-cols-1 sm:grid-cols-[150px_1fr] gap-0.5 sm:gap-3">
+                                          <dt className="text-[var(--text-secondary)] font-medium">{label}</dt>
+                                          <dd
+                                            className={
+                                              value === "Not stated"
+                                                ? "text-[var(--text-muted)] italic"
+                                                : "text-[var(--text-primary)]"
+                                            }
+                                          >
+                                            {value}
+                                          </dd>
+                                        </div>
+                                      ))}
+                                    </dl>
+                                  </div>
+                                )}
+                                <div className="mt-4 p-4 rounded-xl bg-[var(--accent-light)] border border-[var(--accent)]/30 text-xs text-[var(--text-primary)] space-y-2">
+                                  <div className="font-semibold text-[var(--accent)] flex items-center gap-1.5">
+                                    <Compass className="w-4 h-4" />
+                                    <span>Paper analysis:</span>
+                                  </div>
+                                  <Markdown text={analysis.text} compact />
+                                </div>
+                              </>
+                            );
+                          })()}
                         </>
                       ) : (
                         <div className="space-y-4 text-xs">

@@ -87,7 +87,7 @@ Shorter or guessable values are rejected with `422`, because the `session_id` is
 | `GET /health` | none | Database-backed health check (`{"status":"healthy"}` or 503) |
 | `GET /search` | none | Federated search. Params: `q` (required, max 300), `year_min`, `year_max`, `open_access_only`, `min_citations`, `exclude_preprints`, `study_type`, `field`, `sort`, `search_by` |
 | `POST /ask` | optional | Cited answer from papers. Body: `question`, `results`, `session_id`, `conversation_history` |
-| `POST /deep-dive` | none | Markdown analysis of one paper. Body: `title`, `abstract` |
+| `POST /deep-dive` | none | Analysis of one paper plus an "at a glance" summary. Body: `title`, `abstract` |
 | `POST /takeaways` | none | One-sentence takeaway per paper (up to 10). Body: `papers` |
 | `POST /compare` | none | Side-by-side comparison of 2 to 5 papers. Body: `papers` |
 | `POST /deep-research` | optional | 3 to 5 searches and a structured review. Body: `question`, `session_id`, `medical`, filters |
@@ -161,6 +161,13 @@ Full request and response shapes, with examples for every status code, are in th
   `takeaways`, `meter`. Saved to history like `/ask`, cached for 2 hours.
 - Deep research uses 2 AI calls (both count toward the AI caps) and has its own daily cap: `DEEP_DAILY_LIMIT_GUEST` (3),
   `DEEP_DAILY_LIMIT_USER` (20), `DEEP_DAILY_LIMIT_GLOBAL` (300). Over the cap it returns 429 with a message offering a quick answer.
+
+### Paper analysis (`/deep-dive`)
+
+- Returns `deep_dive` (markdown) and `glance`: `study_type`, `population`, `sample_size`, `main_finding`, each at most about
+  25 words and exactly `Not stated` when the abstract does not say. Same AI call, no extra cost.
+- With no abstract it answers without an AI call and `glance` is `null`.
+- Cached per paper (title and abstract) for 24 hours, so analysing the same paper again uses no AI quota.
 
 ### How `/ask` stays grounded
 

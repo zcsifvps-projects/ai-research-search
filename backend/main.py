@@ -3974,15 +3974,39 @@ DEEP_DIVE_SYSTEM_PROMPT = (
     "You are an expert research analyst. Using ONLY the title and abstract provided, write a concise markdown "
     "deep dive with these sections: Summary, Key findings, Methods, Limitations, Why it matters. "
     "If the abstract does not state something, say it is not stated; never invent details. "
-    "Return a valid JSON object with a single key 'deep_dive' (string in markdown)."
+    "Also fill 'glance', a quick summary with four fields of at most 25 words each: study_type (the design, e.g. "
+    "randomised controlled trial, cohort study, meta-analysis), population (who or what was studied), sample_size "
+    "(the number studied, as stated), and main_finding. Use exactly 'Not stated' for anything the abstract does not say. "
+    "Return a valid JSON object with 'deep_dive' (string in markdown) and 'glance'."
 )
+
+GLANCE_FIELDS = ("study_type", "population", "sample_size", "main_finding")
+GLANCE_MAX_CHARS = 300
 
 DEEP_DIVE_SCHEMA = {
     "type": "object",
-    "properties": {"deep_dive": {"type": "string"}},
-    "required": ["deep_dive"],
+    "properties": {
+        "deep_dive": {"type": "string"},
+        "glance": {
+            "type": "object",
+            "properties": {f: {"type": "string"} for f in GLANCE_FIELDS},
+            "required": list(GLANCE_FIELDS),
+            "additionalProperties": False,
+        },
+    },
+    "required": ["deep_dive", "glance"],
     "additionalProperties": False,
 }
+
+
+def clean_glance(raw) -> dict:
+    """Always all four fields; anything missing, empty or not text becomes 'Not stated'."""
+    raw = raw if isinstance(raw, dict) else {}
+    out = {}
+    for f in GLANCE_FIELDS:
+        value = raw.get(f)
+        out[f] = value.strip()[:GLANCE_MAX_CHARS] if isinstance(value, str) and value.strip() else NOT_STATED
+    return out
 
 
 @app.post(
@@ -3990,8 +4014,13 @@ DEEP_DIVE_SCHEMA = {
     tags=["AI"],
     summary="Analyse one paper",
     description="Markdown analysis (summary, key findings, methods, limitations, why it matters) written only from the title and abstract "
-                "you send. With no abstract the endpoint answers without calling the AI. Open to guests.",
-    responses={**_ok({"deep_dive": "## Summary\n..."}), **E_RATE, **E_AI},
+                "you send, plus `glance`: `study_type`, `population`, `sample_size` and `main_finding` (each `Not stated` when the "
+                "abstract does not say). With no abstract the endpoint answers without calling the AI and `glance` is null. "
+                "Cached per paper for 24 hours. Open to guests.",
+    responses={**_ok({"deep_dive": "## Summary\n...", "glance": {"study_type": "Randomised controlled trial",
+                                                                  "population": "Healthy adults", "sample_size": "40",
+                                                                  "main_finding": "Sleep loss cut next-day recall."}}),
+               **E_RATE, **E_AI},
 )
 async def deep_dive(request: DeepDiveRequest, req: Request, authorization: str | None = Header(None)):
     """Guest-friendly, rate limited. Analyses one paper from its title and abstract only."""
@@ -4004,8 +4033,14 @@ async def deep_dive(request: DeepDiveRequest, req: Request, authorization: str |
     if not abstract or abstract.lower() == "no abstract available.":
         return {
             "deep_dive": "No abstract is available for this paper, so a grounded analysis can't be generated. "
-            "Open the paper through its DOI to read the full text."
+            "Open the paper through its DOI to read the full text.",
+            "glance": None,
         }
+
+    cache_key = "dd:" + hashlib.sha256(json.dumps([title.lower(), abstract[:4000]]).encode("utf-8")).hexdigest()
+    cached = get_from_search_cache(cache_key)
+    if cached is not None:
+        return cached
 
     enforce_ai_quota(req, optional_user_id(req, authorization))
 
@@ -4023,7 +4058,9 @@ async def deep_dive(request: DeepDiveRequest, req: Request, authorization: str |
             DEEP_DIVE_SCHEMA,
             "deep_dive",
         )
-        return {"deep_dive": result["deep_dive"]}
+        response = {"deep_dive": result["deep_dive"], "glance": clean_glance(result.get("glance"))}
+        set_in_search_cache(cache_key, response, ttl=86400)
+        return response
     except Exception as error:
         print("Deep dive failed:", error)
         raise HTTPException(status_code=502, detail=GENERIC_AI_ERROR)

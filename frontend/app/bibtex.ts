@@ -10,6 +10,18 @@ export type PdfPaper = {
   similarity_score?: number | null;
 };
 
+/** "10.1/x" from any DOI form: bare, "doi:10.1/x" or a doi.org link (OpenAlex returns links). */
+export function bareDoi(doi: string): string {
+  return doi
+    .trim()
+    .replace(/^https?:\/\/(dx\.)?doi\.org\//i, "")
+    .replace(/^doi:\s*/i, "");
+}
+
+export function doiUrl(doi: string): string {
+  return `https://doi.org/${bareDoi(doi)}`;
+}
+
 function bibValue(value: string): string {
   return (value || "").replace(/[{}\\]/g, "").replace(/\s+/g, " ").trim();
 }
@@ -26,7 +38,7 @@ export function buildBibtex(paper: PdfPaper): string {
     ["author", bibValue(paper.authors.join(" and ")) || "Unknown"],
     ["year", paper.publication_year ? String(paper.publication_year) : ""],
     ["journal", bibValue(paper.description)],
-    ["doi", bibValue(paper.doi || "")],
+    ["doi", bibValue(paper.doi ? bareDoi(paper.doi) : "")],
   ];
   const body = fields
     .filter(([, v]) => v)
