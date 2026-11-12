@@ -195,7 +195,7 @@ class User(Base):
     verification_token_expires_at = Column(DateTime, nullable=True)
     # sessions issued before this moment are rejected ("sign out everywhere")
     tokens_valid_after = Column(DateTime, nullable=True)
-    # Phase 5: admin rights are granted only by backend/make_admin.py; disabled accounts cannot sign in.
+    # Admin rights are granted only by backend/make_admin.py; disabled accounts cannot sign in.
     is_admin = Column(Boolean, nullable=False, default=False, server_default=text("false"))
     is_disabled = Column(Boolean, nullable=False, default=False, server_default=text("false"))
     totp_secret = Column(Text, nullable=True)        # encrypted with SETTINGS_ENCRYPTION_KEY
@@ -2970,7 +2970,7 @@ def takeaway_cache_key(title: str, abstract: str) -> str:
 
 
 # ============================================================
-# SOURCE REGISTRY, ON/OFF SWITCHES AND HEALTH (Phase 6b)
+# SOURCE REGISTRY, ON/OFF SWITCHES AND HEALTH
 # Every paper source is listed here. Admins can switch a source off from the admin panel (saved in the database,
 # no redeploy). Health numbers (calls, failures, speed, results) are kept in memory since the last restart.
 # ============================================================
@@ -4717,7 +4717,7 @@ async def compare(request: CompareRequest, req: Request, authorization: str | No
 
 
 # ============================================================
-# ADMIN (Phase 5)
+# ADMIN
 #
 # Security model:
 # - Admin rights are granted only on the server (backend/make_admin.py). No web route can make someone an admin.
@@ -5363,7 +5363,7 @@ def admin_clear_key(name: str, body: AdminCodeRequest, request: Request, authori
 
 
 # ============================================================
-# COLLECTIONS, SAVED CONVERSATIONS AND SHARE LINKS (Phase 6)
+# COLLECTIONS, SAVED CONVERSATIONS AND SHARE LINKS
 # Verified accounts only, like the library. A shared conversation is read-only, reachable only through an
 # unguessable link (256-bit random token), can be switched off at any time, and never shows who shared it.
 # ============================================================
@@ -5408,8 +5408,8 @@ class Thread(Base):
 
 try:
     Base.metadata.create_all(bind=engine, tables=[Collection.__table__, CollectionItem.__table__, Thread.__table__])
-except Exception as _phase6_tables_error:
-    print("Phase 6 tables note:", _phase6_tables_error)
+except Exception as _library_tables_error:
+    print("Folders and conversations tables note:", _library_tables_error)
 
 
 class CollectionNameRequest(BaseModel):
@@ -5759,7 +5759,7 @@ def open_shared_thread(token: str, response: Response):
 
 
 # ============================================================
-# PDF UPLOADS AND FULL-TEXT CHAT (Phase 8)
+# PDF UPLOADS AND FULL-TEXT CHAT
 #
 # Only the extracted TEXT is kept: the PDF is read in memory and thrown away, never written to disk.
 # Text is split into ~1,200 character sections with page numbers. Questions are answered from the best-matching
@@ -5804,8 +5804,8 @@ class DocumentChunk(Base):
 
 try:
     Base.metadata.create_all(bind=engine, tables=[UploadedDocument.__table__, DocumentChunk.__table__])
-except Exception as _phase8_tables_error:
-    print("Phase 8 tables note:", _phase8_tables_error)
+except Exception as _documents_tables_error:
+    print("Documents tables note:", _documents_tables_error)
 
 
 class PdfRejected(Exception):
@@ -6161,7 +6161,7 @@ async def ask_documents(body: DocumentAskRequest, request: Request, authorizatio
 
 
 # ============================================================
-# CITATION MAP (Phase 8): what a paper cites and what cites it, from OpenAlex
+# CITATION MAP: what a paper cites and what cites it, from OpenAlex
 # ============================================================
 
 GRAPH_SIDE_LIMIT = 15

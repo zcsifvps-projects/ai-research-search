@@ -1,4 +1,4 @@
-"""Tests for Phase 6: folders (collections), saved conversations (threads) and share links."""
+"""Tests for folders (collections), saved conversations (threads) and share links."""
 from fastapi.testclient import TestClient
 
 import main

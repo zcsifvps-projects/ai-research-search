@@ -207,7 +207,7 @@ type Message = {
   citations?: Citation[];
   timestamp: string;
   scopedPaperIds?: number[];
-  // Phase 3: how the answer was made, for the label, the meter and the Go deeper / quick fallback buttons.
+  // How the answer was made, for the label, the meter and the Go deeper / quick fallback buttons.
   mode?: AnswerMode;
   modeLabel?: string;
   subQueries?: string[];
@@ -394,7 +394,7 @@ export default function Home() {
     (excludePreprints ? 1 : 0) +
     (sortBy !== "relevance" ? 1 : 0) +
     (searchBy !== "topic" ? 1 : 0);
-  // Phase 7: the Cite dialog (formatted references, BibTeX, RIS)
+  // The Cite dialog (formatted references, BibTeX, RIS)
   const [citeTarget, setCiteTarget] = useState<Result | null>(null);
   const [citeStyle, setCiteStyle] = useState<CitationStyle | "bibtex">("apa");
   const [citeCopied, setCiteCopied] = useState(false);
@@ -420,7 +420,7 @@ export default function Home() {
   // Feature 2: Select Papers into Question Context (Context Scoping)
   const [selectedPaperIds, setSelectedPaperIds] = useState<number[]>([]);
 
-  // Phase 2: takeaways, table view, compare
+  // Takeaways, table view, compare
   const [takeaways, setTakeaways] = useState<Record<string, string>>({});
   const [takeawaysLoading, setTakeawaysLoading] = useState(false);
   const [takeawaysError, setTakeawaysError] = useState("");
@@ -436,7 +436,7 @@ export default function Home() {
   const [bookmarks, setBookmarks] = useState<BookmarkItem[]>([]);
   const [libraryLoading, setLibraryLoading] = useState(false);
 
-  // Phase 6: folders, saved conversations, share links
+  // Folders, saved conversations, share links
   const [collections, setCollections] = useState<CollectionInfo[]>([]);
   const [activeCollection, setActiveCollection] = useState<number | null>(null);
   const [folderMenuFor, setFolderMenuFor] = useState<number | null>(null);
@@ -450,7 +450,7 @@ export default function Home() {
   const [shareBusy, setShareBusy] = useState(false);
   const [shareCopied, setShareCopied] = useState(false);
 
-  // Phase 8: uploaded PDFs (text only), document chat, citation map
+  // Uploaded PDFs (text only), document chat, citation map
   const [documents, setDocuments] = useState<DocumentInfo[]>([]);
   const [docsSectionOpen, setDocsSectionOpen] = useState(true);
   const [docUploading, setDocUploading] = useState(false);
@@ -1253,7 +1253,7 @@ export default function Home() {
   }
 
   // ============================================================
-  // UPLOADED DOCUMENTS (Phase 8): only the extracted text is kept on the server
+  // UPLOADED DOCUMENTS: only the extracted text is kept on the server
   // ============================================================
 
   async function loadDocuments() {
@@ -1357,7 +1357,7 @@ export default function Home() {
   }
 
   // ============================================================
-  // CITATION MAP (Phase 8)
+  // CITATION MAP
   // ============================================================
 
   async function openCitationMap(paper: Result) {
@@ -4121,7 +4121,7 @@ export default function Home() {
       </main>
 
       {/* ======================================================== */}
-      {/* 2z. DOCUMENT CHAT (Phase 8) */}
+      {/* 2z. DOCUMENT CHAT */}
       {/* ======================================================== */}
       <AnimatePresence>
       {docChatIds && (
@@ -4207,7 +4207,7 @@ export default function Home() {
       </AnimatePresence>
 
       {/* ======================================================== */}
-      {/* 2y. CITATION MAP (Phase 8) */}
+      {/* 2y. CITATION MAP */}
       {/* ======================================================== */}
       <AnimatePresence>
       {graphPaper && (
@@ -4328,7 +4328,7 @@ export default function Home() {
       </AnimatePresence>
 
       {/* ======================================================== */}
-      {/* 2a0. CITE DIALOG (Phase 7) */}
+      {/* 2a0. CITE DIALOG */}
       {/* ======================================================== */}
       <AnimatePresence>
       {citeTarget && (
@@ -4416,7 +4416,7 @@ export default function Home() {
       </AnimatePresence>
 
       {/* ======================================================== */}
-      {/* 2a. SHARE DIALOG (Phase 6) */}
+      {/* 2a. SHARE DIALOG */}
       {/* ======================================================== */}
       <AnimatePresence>
       {shareTarget && (
@@ -4497,7 +4497,7 @@ export default function Home() {
       </AnimatePresence>
 
       {/* ======================================================== */}
-      {/* 2b. TABLE VIEW OVERLAY (Phase 2) */}
+      {/* 2b. TABLE VIEW OVERLAY */}
       {/* ======================================================== */}
       <AnimatePresence>
       {tableOpen && (
@@ -4702,7 +4702,7 @@ export default function Home() {
       </AnimatePresence>
 
       {/* ======================================================== */}
-      {/* 2c. COMPARE OVERLAY (Phase 2) */}
+      {/* 2c. COMPARE OVERLAY */}
       {/* ======================================================== */}
       <AnimatePresence>
       {compareOpen && (

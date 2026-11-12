@@ -1,4 +1,4 @@
-"""Tests for Phase 2: takeaways from /ask, POST /takeaways and POST /compare."""
+"""Tests for takeaways from /ask, POST /takeaways and POST /compare."""
 import json
 
 from fastapi.testclient import TestClient

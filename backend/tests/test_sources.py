@@ -1,4 +1,4 @@
-"""Tests for Phase 6b: new sources (DOAJ, ERIC, OpenAIRE, AJOL), Unpaywall free PDF links, source switches and health."""
+"""Tests for the extra sources (DOAJ, ERIC, OpenAIRE, AJOL), Unpaywall free PDF links, source switches and health."""
 import asyncio
 
 import pytest
@@ -8,7 +8,7 @@ import main
 import make_admin
 from test_search_filters import FakeClient, FakeResponse, fake_sources, paper  # noqa: F401 (fixture)
 from test_security import clean_state  # noqa: F401 (autouse fixture)
-from test_phase5 import code_for, make_admin_client  # noqa: F401
+from test_admin import code_for, make_admin_client  # noqa: F401
 
 
 def run(coro):

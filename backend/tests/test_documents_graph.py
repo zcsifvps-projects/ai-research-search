@@ -1,4 +1,4 @@
-"""Tests for Phase 8: PDF upload (text only), document chat, and the citation map."""
+"""Tests for PDF upload (text only), document chat, and the citation map."""
 import io
 import json
 

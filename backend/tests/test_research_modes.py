@@ -1,4 +1,4 @@
-"""Tests for Phase 3: research mode rules, medical handling, the evidence meter, deep research and its caps."""
+"""Tests for research mode rules, medical handling, the evidence meter, deep research and its caps."""
 import json
 
 import pytest

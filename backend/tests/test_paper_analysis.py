@@ -1,4 +1,4 @@
-"""Tests for Phase 4: the "At a glance" fields on /deep-dive and deep-dive caching."""
+"""Tests for the "At a glance" fields on /deep-dive and deep-dive caching."""
 import json
 
 from fastapi.testclient import TestClient

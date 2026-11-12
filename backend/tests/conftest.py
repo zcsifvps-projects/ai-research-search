@@ -24,5 +24,8 @@ os.environ.update(
         "UNPAYWALL_ENABLED": "false",  # tests never call Unpaywall; its own tests switch it on with fakes
     }
 )
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+BACKEND_DIR = os.path.dirname(TESTS_DIR)
+sys.path.insert(0, BACKEND_DIR)  # main.py and make_admin.py
+sys.path.insert(0, TESTS_DIR)    # shared helpers, e.g. "from test_security import make_user"
 

@@ -1,4 +1,4 @@
-"""Tests for the Phase 1 search features: new result fields, study type / citation / preprint / field filters,
+"""Tests for the search features: new result fields, study type / citation / preprint / field filters,
 sorting, DOI and author search, and the PubMed and Europe PMC sources."""
 import asyncio
 

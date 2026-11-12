@@ -14,6 +14,9 @@ from fastapi.testclient import TestClient
 import main
 
 PASSWORD = "correct-horse-battery"
+# The backend folder (main.py lives there; these tests live in backend/tests).
+BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 PAPERS = [
     {"title": "Paper One", "authors": ["A. Author"], "description": "OpenAlex", "publication_year": 2021,
      "doi": "10.1/one", "abstract": "Sleep deprivation impairs memory consolidation."},
@@ -556,7 +559,7 @@ def _import_main_with(env_overrides, drop=()):
     env.update(env_overrides)
     return subprocess.run(
         [sys.executable, "-c", "import main; print('COOKIE_SECURE=', main.COOKIE_SECURE)"],
-        cwd=os.path.dirname(os.path.abspath(__file__)), env=env, capture_output=True, text=True,
+        cwd=BACKEND_DIR, env=env, capture_output=True, text=True,
     )
 
 
@@ -608,7 +611,7 @@ def _print_setting(env_overrides, expr, drop=()):
     env = {k: v for k, v in os.environ.items() if k not in drop}
     env.update(env_overrides)
     r = subprocess.run([sys.executable, "-c", f"import main; print('VALUE=' + str({expr}))"],
-                       cwd=os.path.dirname(os.path.abspath(__file__)), env=env, capture_output=True, text=True)
+                       cwd=BACKEND_DIR, env=env, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     return [l for l in r.stdout.splitlines() if l.startswith("VALUE=")][0][6:]
 
@@ -627,7 +630,7 @@ def test_explicit_sender_and_contact_email_win():
 
 
 def test_backend_source_contains_no_hardcoded_site_domains():
-    source = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py"), encoding="utf-8").read().lower()
+    source = open(os.path.join(BACKEND_DIR, "main.py"), encoding="utf-8").read().lower()
     for banned in ("scholarpulse.org", "research.org", "example.com", "imosmart"):
         assert banned not in source, f"hardcoded domain found in main.py: {banned}"
 

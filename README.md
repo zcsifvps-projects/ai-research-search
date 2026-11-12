@@ -217,16 +217,33 @@ ai-research-search-main/
 ├── README.md
 ├── .gitignore
 ├── backend/
-│   ├── main.py                  # FastAPI application, models, routes, providers, AI flows
-│   ├── conftest.py              # Isolated pytest environment and temporary SQLite DB
-│   ├── test_search_filters.py   # Provider/filter/deduplication regression tests
-│   ├── test_security.py         # Auth, isolation, rate limit, error and header tests
+│   ├── main.py                  # FastAPI application, models, routes, sources, AI flows
+│   ├── make_admin.py            # Server command: grant/revoke admin, authenticator setup, encryption key
+│   ├── pytest.ini               # Points pytest at tests/
 │   ├── requirements.txt         # Runtime Python dependencies
 │   ├── requirements-dev.txt     # Test dependencies
-│   └── .env.example             # Backend configuration reference
+│   ├── .env.example             # Backend configuration reference
+│   └── tests/
+│       ├── conftest.py              # Isolated test environment and temporary SQLite DB
+│       ├── test_security.py         # Auth, isolation, rate limits, errors, headers
+│       ├── test_ai_provider.py      # What is sent to Gemini and Groq
+│       ├── test_search_filters.py   # Sources, filters, de-duplication
+│       ├── test_search_features.py  # Study type, citations, sorting, DOI/author/title search, PubMed, Europe PMC
+│       ├── test_sources.py          # DOAJ, ERIC, OpenAIRE, AJOL, Unpaywall, source switches and health
+│       ├── test_takeaways_compare.py# Takeaways and paper comparison
+│       ├── test_research_modes.py   # Auto/Quick/Deep/Medical, evidence meter, deep research
+│       ├── test_paper_analysis.py   # "At a glance" and analysis caching
+│       ├── test_admin.py            # Admin access, authenticator codes, audit log, encrypted keys
+│       ├── test_library_sharing.py  # Folders, saved conversations, share links
+│       └── test_documents_graph.py  # PDF uploads, document chat, citation map
 └── frontend/
     ├── app/
     │   ├── page.tsx             # Main research workspace and interactions
+    │   ├── admin/               # Admin dashboard (/admin)
+    │   ├── share/[token]/       # Read-only shared conversation page
+    │   ├── citations.ts         # APA, MLA, Chicago, Harvard, Vancouver, RIS, BibTeX
+    │   ├── pdf.ts               # PDF reports (answers, papers, comparisons)
+    │   ├── csv.ts               # CSV export
     │   ├── layout.tsx           # Global layout and SEO/social metadata
     │   ├── globals.css          # Global styles and design tokens
     │   ├── not-found.tsx        # Not-found page
@@ -873,12 +890,11 @@ Use this table as a release record and update it with the actual environment, da
 
 | Check | Result for the uploaded repository review | Notes |
 |---|---|---|
-| Python syntax compilation | Passed | `python -m compileall -q backend` completed successfully in the review environment. |
-| Backend pytest suite | Blocked | Test collection could not import `google.genai`; installing dependencies was not possible because package-registry DNS/network access was unavailable in that environment. This is not a passing test run. |
-| Frontend ESLint | Not run | npm dependency installation could not be completed in the review environment. |
-| Frontend TypeScript | Not run | Requires installed frontend dependencies. |
-| Frontend production build | Not run | Requires installed dependencies and build-time public URL configuration. |
-| Live integration / deployment | Not verified | No running target environment or production credentials were supplied as part of this code archive. |
+| Backend pytest suite | Passed (12 Nov 2026) | 298 tests, run from `backend/` with `pytest -q`. |
+| Frontend ESLint | Passed (12 Nov 2026) | `npx eslint app` reports no problems. |
+| Frontend TypeScript | Passed (12 Nov 2026) | `npx tsc --noEmit`. |
+| Frontend production build | Passed on the server | `npm run build` on the production host. |
+| Live integration / deployment | Live | Running at the production domain; health check `GET /api/health`. |
 
 ---
 

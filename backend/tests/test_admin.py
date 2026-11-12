@@ -1,4 +1,4 @@
-"""Tests for Phase 5: admin rights, authenticator unlock, audit log, user tools, and encrypted API keys."""
+"""Tests for admin rights, authenticator unlock, audit log, user tools, and encrypted API keys."""
 import time
 
 import pytest
