@@ -45,12 +45,33 @@ scholarpulse-env/bin/python make_admin.py list
 `grant` and `reset-code` print a setup key. In the authenticator app choose "Enter a setup key", type it, and pick
 "Time based". Do not share the setup key; clear the terminal afterwards.
 
+## Sources
+
+The **Sources** tab lists every paper source with an on/off switch. Switching one off is saved in the database and applies at
+once (no restart); at least one search source must stay on. Each card shows, since the API last restarted: searches, errors,
+papers returned, average time, the last error, and whether a needed key is set (with a link to API keys).
+
+| Source | Key | Notes |
+|---|---|---|
+| OpenAlex, arXiv, Crossref, Europe PMC | none | |
+| Semantic Scholar | optional | without a key it is often rate limited |
+| CORE | required | |
+| PubMed | optional | a key raises the request limit |
+| DOAJ | none | open-access journals |
+| ERIC | none | education research; skipped for open-access-only searches |
+| OpenAIRE | none | European research |
+| AJOL | none | African Journals Online, searched through OpenAlex's index of AJOL journals |
+| Unpaywall | contact email | adds "Free PDF" links (legal copies) for the top 15 papers with a DOI; uses `NCBI_EMAIL` or `CONTACT_EMAIL` |
+
+New kinds of sources need code (every API is different); switching sources on and off does not.
+
 ## What the dashboard shows
 
 - **Overview:** users (total, verified, new this week, signed in today, disabled, admins), answers saved today and this
   week, AI calls today and deep research runs today against the daily caps.
 - **Users:** search by email or name, 25 per page. Actions: disable / enable (reversible; admins cannot be disabled
   here), sign out everywhere, resend verification. There is no delete button on purpose.
+- **Sources:** as above.
 - **API keys:** as above.
 - **Audit log:** every unlock, failed unlock, user action and key change, with time, admin and IP address.
 

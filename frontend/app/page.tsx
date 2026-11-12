@@ -76,6 +76,7 @@ type Result = {
   is_preprint?: boolean | null;
   is_retracted?: boolean;
   field?: string | null;
+  pdf_url?: string | null;
 };
 
 const STUDY_TYPE_LABELS: Record<string, string> = {
@@ -1623,7 +1624,7 @@ export default function Home() {
         return;
       }
 
-      setLoadingStep("Querying OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed, and Europe PMC...");
+      setLoadingStep("Searching 11 academic databases, including PubMed, DOAJ and African Journals Online...");
       const filters = currentFilters();
       const searchParams = new URLSearchParams({
         q: searchQuery,
@@ -1656,7 +1657,7 @@ export default function Home() {
           {
             id: newMessageId(),
             role: "assistant",
-            content: "No matching academic papers found across OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed, or Europe PMC. Try adjusting your search query or filters.",
+            content: "No matching academic papers found in any of the 11 databases. Try adjusting your search query or filters.",
             timestamp: now(),
           },
         ]);
@@ -2706,7 +2707,7 @@ export default function Home() {
                 </h1>
 
                 <p className="text-base text-[var(--text-secondary)] max-w-lg mx-auto">
-                  Search seven academic databases at once: OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed and Europe PMC.
+                  Search eleven academic databases at once, including PubMed, DOAJ and African Journals Online.
                 </p>
 
                 {/* Primary Search Bar */}
@@ -2989,7 +2990,7 @@ export default function Home() {
                         ))}
                       </div>
                       <p className="mt-3 text-[11px] text-[var(--text-muted)]">
-                        Real-time discovery across seven academic databases.
+                        Real-time discovery across eleven academic databases.
                       </p>
                     </div>
                   </div>
@@ -2997,7 +2998,7 @@ export default function Home() {
 
                 <div className="pt-6 pb-6 border-t border-[var(--border-subtle)] flex flex-col sm:flex-row items-center justify-between text-[11px] text-[var(--text-muted)] gap-2">
                   <div>© 2026 {APP_NAME}. All rights reserved.</div>
-                  <div>Federated academic discovery across seven academic databases.</div>
+                  <div>Federated academic discovery across eleven academic databases.</div>
                   <div>
                     Developed by{" "}
                     <a
@@ -3421,6 +3422,19 @@ export default function Home() {
                               <span>Export PDF</span>
                             </button>
 
+                            {selectedPaperForDetail.paper.pdf_url && (
+                              <a
+                                href={selectedPaperForDetail.paper.pdf_url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="flex items-center gap-1.5 px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-medium rounded-lg transition"
+                                title="A free, legal copy found by Unpaywall"
+                              >
+                                <FileDown className="w-3.5 h-3.5" />
+                                <span>Free PDF</span>
+                              </a>
+                            )}
+
                             {selectedPaperForDetail.paper.doi && (
                               <a
                                 href={doiUrl(selectedPaperForDetail.paper.doi)}
@@ -3720,9 +3734,21 @@ export default function Home() {
                             </p>
 
                             <div className="mt-3 flex items-center justify-between text-[10px] text-[var(--text-muted)] pt-2 border-t border-[var(--border-subtle)]">
-                              <span className="font-medium text-[var(--text-secondary)]">
+                              <span className="font-medium text-[var(--text-secondary)] truncate">
                                 {paper.description}
                               </span>
+                              {paper.pdf_url && (
+                                <a
+                                  href={paper.pdf_url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  onClick={(e) => e.stopPropagation()}
+                                  className="shrink-0 px-1.5 py-0.5 rounded-md bg-emerald-500/15 text-emerald-700 border border-emerald-500/30 font-semibold hover:bg-emerald-500/25"
+                                  title="A free, legal copy found by Unpaywall"
+                                >
+                                  Free PDF
+                                </a>
+                              )}
                               {paper.similarity_score && (
                                 <span className="font-semibold text-[var(--accent)]">
                                   {paper.similarity_score}% match
@@ -4385,7 +4411,7 @@ export default function Home() {
                   </p>
                   <h4 className="font-bold text-[var(--text-primary)]">Third-Party Academic APIs</h4>
                   <p>
-                    Queries are dispatched to public academic APIs (OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed, and Europe PMC) to retrieve research metadata.
+                    Queries are dispatched to public academic APIs (OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed, Europe PMC, DOAJ, ERIC, OpenAIRE, and African Journals Online, plus Unpaywall for free PDF links) to retrieve research metadata.
                   </p>
                 </>
               )}

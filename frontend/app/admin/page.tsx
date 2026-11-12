@@ -8,7 +8,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { ArrowLeft, KeyRound, Lock, RefreshCw, ScrollText, Shield, Users, BarChart3 } from "lucide-react";
+import { ArrowLeft, KeyRound, Lock, RefreshCw, ScrollText, Shield, Users, BarChart3, Database } from "lucide-react";
 import { APP_NAME } from "../brand";
 
 const API = process.env.NEXT_PUBLIC_API_URL as string;
@@ -34,7 +34,23 @@ type AdminUser = {
 };
 type KeyRow = { name: string; label: string; source: "panel" | "env" | "none"; last4: string | null; updated_at: string | null; env_set: boolean };
 type AuditEntry = { id: number; admin_email: string | null; action: string; target: string | null; detail: string | null; ip: string | null; created_at: string | null };
-type Tab = "overview" | "users" | "keys" | "audit";
+type SourceRow = {
+  name: string;
+  label: string;
+  enabled: boolean;
+  key_name: string | null;
+  key_source: "panel" | "env" | "none" | null;
+  key_required: boolean;
+  calls: number;
+  failures: number;
+  results: number;
+  avg_ms: number | null;
+  last_ok_at: string | null;
+  last_error: string | null;
+  last_error_at: string | null;
+  needs_email: boolean;
+};
+type Tab = "overview" | "users" | "sources" | "keys" | "audit";
 type Phase = "loading" | "signed-out" | "not-admin" | "locked" | "unlocked" | "error";
 
 class ApiError extends Error {
@@ -108,6 +124,7 @@ export default function AdminPage() {
   const [keyValue, setKeyValue] = useState("");
   const [keyCode, setKeyCode] = useState("");
   const [audit, setAudit] = useState<AuditEntry[]>([]);
+  const [sources, setSources] = useState<SourceRow[]>([]);
 
   function handleLocked(err: unknown) {
     if (err instanceof ApiError && err.status === 401) {
@@ -137,6 +154,7 @@ export default function AdminPage() {
         setKeysEditable(data.editable);
       }
       if (which === "audit") setAudit((await api<{ entries: AuditEntry[] }>("/admin/audit")).entries);
+      if (which === "sources") setSources((await api<{ sources: SourceRow[] }>("/admin/sources")).sources);
     } catch (err) {
       if (!handleLocked(err)) setMessage({ kind: "error", text: err instanceof Error ? err.message : "Could not load." });
     }
@@ -233,6 +251,20 @@ export default function AdminPage() {
     }
   }
 
+  async function toggleSource(row: SourceRow) {
+    setBusy(true);
+    setMessage(null);
+    try {
+      await api(`/admin/sources/${row.name}`, { method: "POST", body: JSON.stringify({ enabled: !row.enabled }) });
+      setMessage({ kind: "ok", text: `${row.label} switched ${row.enabled ? "off" : "on"}.` });
+      await loadTab("sources");
+    } catch (err) {
+      if (!handleLocked(err)) setMessage({ kind: "error", text: err instanceof Error ? err.message : "Could not change the source." });
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function saveKey(e: React.FormEvent) {
     e.preventDefault();
     if (!editingKey) return;
@@ -277,6 +309,7 @@ export default function AdminPage() {
   const tabs: { id: Tab; label: string; icon: React.ReactNode }[] = [
     { id: "overview", label: "Overview", icon: <BarChart3 className="w-4 h-4" /> },
     { id: "users", label: "Users", icon: <Users className="w-4 h-4" /> },
+    { id: "sources", label: "Sources", icon: <Database className="w-4 h-4" /> },
     { id: "keys", label: "API keys", icon: <KeyRound className="w-4 h-4" /> },
     { id: "audit", label: "Audit log", icon: <ScrollText className="w-4 h-4" /> },
   ];
@@ -461,7 +494,42 @@ export default function AdminPage() {
                   />
                   <button type="submit" className={buttonClass}>Search</button>
                 </form>
-                <div className="overflow-x-auto rounded-xl border border-[var(--border-color)] bg-[var(--bg-surface)]">
+                <div className="sm:hidden space-y-2">
+                  {users.map((u) => (
+                    <div key={u.id} className="p-3 rounded-xl border border-[var(--border-color)] bg-[var(--bg-surface)] text-xs space-y-2">
+                      <div>
+                        <div className="font-semibold text-sm text-[var(--text-primary)] break-all">{u.email}</div>
+                        {u.full_name && <div className="text-[var(--text-muted)]">{u.full_name}</div>}
+                      </div>
+                      <div className="flex flex-wrap gap-1">
+                        {u.is_admin && <span className="px-1.5 py-0.5 rounded bg-[var(--accent-light)] text-[var(--accent)] font-semibold">Admin</span>}
+                        {u.is_disabled && <span className="px-1.5 py-0.5 rounded bg-red-600 text-white font-semibold">Disabled</span>}
+                        <span className={u.is_verified ? "text-emerald-600" : "text-amber-600"}>{u.is_verified ? "Verified" : "Unverified"}</span>
+                      </div>
+                      <div className="grid grid-cols-2 gap-1 text-[var(--text-secondary)]">
+                        <span>Joined: {when(u.created_at)}</span>
+                        <span>Last sign-in: {when(u.last_login_at)}</span>
+                        <span>Answers: {u.answers}</span>
+                      </div>
+                      <div className="flex flex-wrap gap-1">
+                        {!u.is_admin &&
+                          (u.is_disabled ? (
+                            <button type="button" disabled={busy} onClick={() => userAction(u, "enable")} className={ghostClass}>Enable</button>
+                          ) : (
+                            <button type="button" disabled={busy} onClick={() => userAction(u, "disable")} className={ghostClass}>Disable</button>
+                          ))}
+                        {!u.is_admin && (
+                          <button type="button" disabled={busy} onClick={() => userAction(u, "logout-all")} className={ghostClass}>Sign out everywhere</button>
+                        )}
+                        {!u.is_verified && (
+                          <button type="button" disabled={busy} onClick={() => userAction(u, "resend-verification")} className={ghostClass}>Resend verification</button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                  {users.length === 0 && <p className="p-4 text-center text-xs text-[var(--text-muted)]">No users found.</p>}
+                </div>
+                <div className="hidden sm:block overflow-x-auto rounded-xl border border-[var(--border-color)] bg-[var(--bg-surface)]">
                   <table className="w-full min-w-[820px] text-xs text-left">
                     <thead className="bg-[var(--bg-surface-elevated)] text-[var(--text-secondary)]">
                       <tr>
@@ -551,6 +619,82 @@ export default function AdminPage() {
               </div>
             )}
 
+            {tab === "sources" && (
+              <div className="space-y-3">
+                <p className="text-xs text-[var(--text-secondary)] max-w-3xl">
+                  Switch a source off to stop searching it (for example while it is slow or failing). Changes apply at once,
+                  with no restart. Numbers are counted since the API last restarted.
+                </p>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  {sources.map((src) => {
+                    const failRate = src.calls > 0 ? Math.round((src.failures / src.calls) * 100) : 0;
+                    const health =
+                      !src.enabled
+                        ? { text: "Off", cls: "text-[var(--text-muted)]" }
+                        : src.key_required && src.key_source === "none"
+                          ? { text: "Needs a key", cls: "text-amber-600" }
+                          : src.needs_email
+                            ? { text: "Needs a contact email", cls: "text-amber-600" }
+                            : src.calls === 0
+                              ? { text: "No searches yet", cls: "text-[var(--text-muted)]" }
+                              : failRate >= 50
+                                ? { text: "Failing", cls: "text-red-600" }
+                                : failRate > 0
+                                  ? { text: "Some errors", cls: "text-amber-600" }
+                                  : { text: "Working", cls: "text-emerald-600" };
+                    return (
+                      <div key={src.name} className="p-3 sm:p-4 rounded-xl border border-[var(--border-color)] bg-[var(--bg-surface)] text-xs">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="text-sm font-semibold text-[var(--text-primary)]">{src.label}</div>
+                            <div className={`mt-0.5 font-medium ${health.cls}`}>{health.text}</div>
+                          </div>
+                          <button
+                            type="button"
+                            role="switch"
+                            aria-checked={src.enabled}
+                            aria-label={`${src.label} ${src.enabled ? "on" : "off"}`}
+                            disabled={busy}
+                            onClick={() => toggleSource(src)}
+                            className={`relative shrink-0 w-11 h-6 rounded-full transition disabled:opacity-60 ${
+                              src.enabled ? "bg-emerald-500" : "bg-[var(--border-color)]"
+                            }`}
+                          >
+                            <span
+                              className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform ${
+                                src.enabled ? "translate-x-5" : ""
+                              }`}
+                            />
+                          </button>
+                        </div>
+                        <div className="mt-3 grid grid-cols-2 sm:grid-cols-4 gap-2 text-[var(--text-secondary)]">
+                          <div><div className="text-[var(--text-muted)]">Searches</div><div className="font-semibold tabular-nums">{src.calls}</div></div>
+                          <div><div className="text-[var(--text-muted)]">Errors</div><div className="font-semibold tabular-nums">{src.failures}</div></div>
+                          <div><div className="text-[var(--text-muted)]">{src.name === "unpaywall" ? "PDF links" : "Papers"}</div><div className="font-semibold tabular-nums">{src.results}</div></div>
+                          <div><div className="text-[var(--text-muted)]">Avg time</div><div className="font-semibold tabular-nums">{src.avg_ms !== null ? `${(src.avg_ms / 1000).toFixed(1)} s` : "-"}</div></div>
+                        </div>
+                        {src.key_name && (
+                          <div className="mt-2 text-[var(--text-muted)]">
+                            Key ({src.key_required ? "required" : "optional"}):{" "}
+                            {src.key_source === "panel" ? "set in this panel" : src.key_source === "env" ? "from server configuration" : "not set"}
+                            {" · "}
+                            <button type="button" onClick={() => openTab("keys")} className="text-[var(--accent)] hover:underline">
+                              Manage keys
+                            </button>
+                          </div>
+                        )}
+                        {src.last_error && (
+                          <div className="mt-1 text-[var(--text-muted)]">
+                            Last error: {src.last_error} ({when(src.last_error_at)})
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
             {tab === "keys" && (
               <div className="space-y-3">
                 <p className="text-xs text-[var(--text-secondary)] max-w-3xl">
@@ -627,7 +771,32 @@ export default function AdminPage() {
             )}
 
             {tab === "audit" && (
-              <div className="overflow-x-auto rounded-xl border border-[var(--border-color)] bg-[var(--bg-surface)]">
+              <div className="sm:hidden space-y-2">
+                {audit.map((a) => (
+                  <div key={a.id} className="p-3 rounded-xl border border-[var(--border-color)] bg-[var(--bg-surface)] text-xs space-y-1">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-mono font-semibold">{a.action}</span>
+                      <span className="text-[var(--text-muted)]">{when(a.created_at)}</span>
+                    </div>
+                    <div className="text-[var(--text-secondary)] break-all">
+                      {a.admin_email || "server command"}
+                      {a.target ? ` → ${a.target}` : ""}
+                    </div>
+                    {(a.detail || a.ip) && (
+                      <div className="text-[var(--text-muted)]">
+                        {a.detail || ""}
+                        {a.detail && a.ip ? " · " : ""}
+                        {a.ip ? <span className="font-mono">{a.ip}</span> : null}
+                      </div>
+                    )}
+                  </div>
+                ))}
+                {audit.length === 0 && <p className="p-4 text-center text-xs text-[var(--text-muted)]">No entries yet.</p>}
+              </div>
+            )}
+
+            {tab === "audit" && (
+              <div className="hidden sm:block overflow-x-auto rounded-xl border border-[var(--border-color)] bg-[var(--bg-surface)]">
                 <table className="w-full min-w-[720px] text-xs text-left">
                   <thead className="bg-[var(--bg-surface-elevated)] text-[var(--text-secondary)]">
                     <tr>

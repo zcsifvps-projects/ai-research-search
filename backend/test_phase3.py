@@ -145,7 +145,7 @@ def test_search_medical_flag_ranks_evidence(monkeypatch):
         return []
 
     for name in ("search_semantic_scholar", "search_arxiv", "search_core", "search_crossref", "search_pubmed",
-                 "search_europepmc"):
+                 "search_europepmc", "search_doaj", "search_eric", "search_openaire", "search_ajol"):
         monkeypatch.setattr(main, name, empty)
     monkeypatch.setattr(main, "search_openalex", fake)
     plain = client().get("/search", params={"q": "drug x"}).json()["results"]

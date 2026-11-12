@@ -22,7 +22,7 @@ const newsreader = Newsreader({
 export const metadata: Metadata = {
   metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL as string),
   title: `${APP_NAME}: ${APP_TAGLINE}`,
-  description: "Federated academic discovery across OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed, and Europe PMC with multi-turn AI literature synthesis.",
+  description: "Federated academic discovery across OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed, Europe PMC, DOAJ, ERIC, OpenAIRE, and African Journals Online with multi-turn AI literature synthesis.",
   keywords: [
     "academic search engine",
     "research papers",
@@ -48,7 +48,7 @@ export const metadata: Metadata = {
   },
   openGraph: {
     title: `${APP_NAME}: ${APP_TAGLINE}`,
-    description: "Federated academic discovery across OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed, and Europe PMC with multi-turn AI literature synthesis.",
+    description: "Federated academic discovery across OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed, Europe PMC, DOAJ, ERIC, OpenAIRE, and African Journals Online with multi-turn AI literature synthesis.",
     url: "/",
     siteName: APP_NAME,
     type: "website",
@@ -57,7 +57,7 @@ export const metadata: Metadata = {
   twitter: {
     card: "summary_large_image",
     title: `${APP_NAME}: ${APP_TAGLINE}`,
-    description: "Federated academic discovery across OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed, and Europe PMC with multi-turn AI literature synthesis.",
+    description: "Federated academic discovery across OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed, Europe PMC, DOAJ, ERIC, OpenAIRE, and African Journals Online with multi-turn AI literature synthesis.",
   },
   robots: {
     index: true,

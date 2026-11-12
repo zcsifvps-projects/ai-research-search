@@ -21,6 +21,7 @@ os.environ.update(
         "TRUSTED_PROXY_COUNT": "0",
         "GEMINI_API_KEY": "",
         "GROQ_API_KEY": "",
+        "UNPAYWALL_ENABLED": "false",  # tests never call Unpaywall; its own tests switch it on with fakes
     }
 )
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

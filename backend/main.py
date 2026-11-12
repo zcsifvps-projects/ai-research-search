@@ -549,7 +549,7 @@ def send_welcome_email(to_email: str, full_name: str | None = None):
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #E4DCCB; border-radius: 12px; background-color: #FAF6EF;">
       <h2 style="color: #7C2A2A; margin-top: 0;">{greeting}</h2>
       <p style="color: #221D18; font-size: 14px; line-height: 1.6;">Your email is verified and your account is active.</p>
-      <p style="color: #221D18; font-size: 14px; line-height: 1.6;">Search seven academic databases at once: OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed and Europe PMC.</p>
+      <p style="color: #221D18; font-size: 14px; line-height: 1.6;">Search eleven academic databases at once, including OpenAlex, PubMed, DOAJ and African Journals Online.</p>
       <div style="text-align: center; margin: 30px 0;">
         <a href="{APP_URL}" style="background-color: #7C2A2A; color: #ffffff; padding: 12px 28px; text-decoration: none; border-radius: 8px; font-weight: bold; font-size: 14px; display: inline-block;">Start Researching</a>
       </div>
@@ -753,7 +753,7 @@ EXAMPLE_BOOKMARK = {
 }
 
 API_DESCRIPTION = """
-__APP_NAME__ searches seven academic databases at once (**OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed, Europe PMC**) and
+__APP_NAME__ searches eleven academic databases at once (**OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed, Europe PMC, DOAJ, ERIC, OpenAIRE, AJOL**) and
 writes a short answer **only from the abstracts of the papers it found**, with citations back to those papers.
 
 ## Typical flow
@@ -815,7 +815,7 @@ More: see `docs/api.md` in the repository for copy-paste examples in curl, JavaS
 TAGS_METADATA = [
     {"name": "System", "description": "Liveness and root."},
     {"name": "Auth", "description": "Accounts and sessions. Sets or clears the `access_token` cookie."},
-    {"name": "Search", "description": "Federated search across seven academic databases."},
+    {"name": "Search", "description": "Federated search across eleven academic databases."},
     {"name": "AI", "description": "Answers and paper analysis grounded in abstracts. Open to guests, rate limited."},
     {"name": "History", "description": "Past questions and answers, per signed-in user or per guest `session_id`."},
     {"name": "Library", "description": "Saved papers. Requires a verified account."},
@@ -2153,7 +2153,7 @@ def openalex_filter_parts(year_min=None, year_max=None, oa_only=False, filters=N
     return parts
 
 
-def parse_openalex_work(work: dict) -> dict:
+def parse_openalex_work(work: dict, database: str = "OpenAlex") -> dict:
     primary_location = work.get("primary_location") or {}
     source = primary_location.get("source") or {}
     authors = [
@@ -2171,7 +2171,7 @@ def parse_openalex_work(work: dict) -> dict:
         source=source.get("display_name") or "OpenAlex",
         doi=work.get("doi"),
         is_open_access=bool((work.get("open_access") or {}).get("is_oa")),
-        database="OpenAlex",
+        database=database,
         cited_by_count=work.get("cited_by_count"),
         study_types=["review"] if work_type == "review" else [],
         is_preprint=(work_type == "preprint") if work_type else None,
@@ -2180,13 +2180,16 @@ def parse_openalex_work(work: dict) -> dict:
     )
 
 
-async def search_openalex(client, q, year_min=None, year_max=None, oa_only=False, filters=None, mode="topic"):
+async def search_openalex(client, q, year_min=None, year_max=None, oa_only=False, filters=None, mode="topic",
+                          extra_filter=None, database_label="OpenAlex", health_name="openalex"):
     url = "https://api.openalex.org/works"
     params = {
         "per-page": 15,
         "mailto": CONTACT_EMAIL,
     }
     filter_parts = openalex_filter_parts(year_min, year_max, oa_only, filters)
+    if extra_filter:
+        filter_parts.append(extra_filter)
     if mode == "title":
         # Commas separate OpenAlex filters, so they are removed from the title text.
         filter_parts.append("title.search:" + q.rstrip("?").replace(",", " "))
@@ -2201,13 +2204,15 @@ async def search_openalex(client, q, year_min=None, year_max=None, oa_only=False
     try:
         response = await client.get(url, params=params, headers=headers, timeout=10.0)
         if response.status_code == 429:
-            print("OpenAlex rate limited (429). Skipping.")
+            source_failed(health_name, "rate limited")
+            print(f"{database_label} (OpenAlex) rate limited (429). Skipping.")
             return []
         response.raise_for_status()
         data = response.json()
-        return [parse_openalex_work(work) for work in data.get("results", [])]
+        return [parse_openalex_work(work, database_label) for work in data.get("results", [])]
     except Exception as error:
-        print("OpenAlex search note:", error)
+        source_failed(health_name, type(error).__name__)
+        print(f"{database_label} (OpenAlex) search note:", error)
         return []
 
 
@@ -2222,6 +2227,7 @@ async def search_openalex_by_author(client, name, year_min=None, year_max=None, 
             timeout=10.0,
         )
         if response.status_code == 429:
+            source_failed("openalex", "rate limited")
             print("OpenAlex rate limited (429). Skipping.")
             return []
         response.raise_for_status()
@@ -2240,11 +2246,13 @@ async def search_openalex_by_author(client, name, year_min=None, year_max=None, 
             timeout=10.0,
         )
         if response.status_code == 429:
+            source_failed("openalex", "rate limited")
             print("OpenAlex rate limited (429). Skipping.")
             return []
         response.raise_for_status()
         return [parse_openalex_work(work) for work in response.json().get("results", [])]
     except Exception as error:
+        source_failed("openalex", type(error).__name__)
         print("OpenAlex author search note:", error)
         return []
 
@@ -2295,6 +2303,7 @@ async def search_semantic_scholar(client, q, year_min=None, year_max=None, oa_on
     try:
         response = await client.get(url, params=params, headers=headers)
         if response.status_code == 429:
+            source_failed("semantic_scholar", "rate limited")
             print("Semantic Scholar rate limit reached (429). Skipping.")
             return []
         response.raise_for_status()
@@ -2330,6 +2339,7 @@ async def search_semantic_scholar(client, q, year_min=None, year_max=None, oa_on
         return results
 
     except Exception as error:
+        source_failed("semantic_scholar", type(error).__name__)
         print(f"Semantic Scholar search failed: {error}")
         return []
 
@@ -2359,6 +2369,7 @@ async def search_arxiv(client, q, year_min=None, year_max=None, oa_only=False, f
     try:
         response = await client.get(url, params=params, headers=headers, timeout=8.0)
         if response.status_code != 200:
+            source_failed("arxiv", f"HTTP {response.status_code}")
             return []
         root = ET.fromstring(response.text)
         namespace = {"atom": "http://www.w3.org/2005/Atom"}
@@ -2396,6 +2407,7 @@ async def search_arxiv(client, q, year_min=None, year_max=None, oa_only=False, f
             )
         return results
     except Exception as error:
+        source_failed("arxiv", type(error).__name__)
         print("arXiv search note:", error)
         return []
 
@@ -2455,6 +2467,7 @@ async def search_crossref(client, q, year_min=None, year_max=None, oa_only=False
     try:
         response = await client.get(url, params=params)
         if response.status_code == 429:
+            source_failed("crossref", "rate limited")
             print("Crossref rate limit reached (429). Skipping.")
             return []
         response.raise_for_status()
@@ -2462,6 +2475,7 @@ async def search_crossref(client, q, year_min=None, year_max=None, oa_only=False
         items = data.get("message", {}).get("items", [])
         return [p for p in (parse_crossref_work(work) for work in items) if p]
     except Exception as error:
+        source_failed("crossref", type(error).__name__)
         print(f"Crossref search failed: {error}")
         return []
 
@@ -2485,6 +2499,8 @@ async def search_core(client, q, year_min=None, year_max=None, oa_only=False, fi
     params = {"q": query, "limit": 10}
     try:
         response = await client.get(url, params=params, headers=headers)
+        if response.status_code in (401, 403):
+            source_failed("core", "key rejected")
         response.raise_for_status()
         data = response.json()
         results = []
@@ -2512,6 +2528,7 @@ async def search_core(client, q, year_min=None, year_max=None, oa_only=False, fi
             )
         return results
     except Exception as error:
+        source_failed("core", type(error).__name__)
         print(f"CORE search failed: {error}")
         return []
 
@@ -2611,6 +2628,7 @@ async def search_pubmed(client, q, year_min=None, year_max=None, oa_only=False, 
     try:
         response = await client.get(f"{NCBI_EUTILS}/esearch.fcgi", params=params, timeout=10.0)
         if response.status_code == 429:
+            source_failed("pubmed", "rate limited")
             print("PubMed rate limit reached (429). Skipping.")
             return []
         response.raise_for_status()
@@ -2623,12 +2641,14 @@ async def search_pubmed(client, q, year_min=None, year_max=None, oa_only=False, 
             timeout=15.0,
         )
         if response.status_code == 429:
+            source_failed("pubmed", "rate limited")
             print("PubMed rate limit reached (429). Skipping.")
             return []
         response.raise_for_status()
         root = ET.fromstring(response.text)
         return [p for p in (parse_pubmed_article(a) for a in root.findall(".//PubmedArticle")) if p]
     except Exception as error:
+        source_failed("pubmed", type(error).__name__)
         print(f"PubMed search failed: {error}")
         return []
 
@@ -2694,12 +2714,14 @@ async def search_europepmc(client, q, year_min=None, year_max=None, oa_only=Fals
         response = await client.get("https://www.ebi.ac.uk/europepmc/webservices/rest/search",
                                     params=params, timeout=10.0)
         if response.status_code == 429:
+            source_failed("europepmc", "rate limited")
             print("Europe PMC rate limit reached (429). Skipping.")
             return []
         response.raise_for_status()
         records = (response.json().get("resultList") or {}).get("result") or []
         return [p for p in (parse_europepmc_record(r) for r in records) if p]
     except Exception as error:
+        source_failed("europepmc", type(error).__name__)
         print(f"Europe PMC search failed: {error}")
         return []
 
@@ -2944,6 +2966,389 @@ def takeaway_cache_key(title: str, abstract: str) -> str:
 
 
 # ============================================================
+# SOURCE REGISTRY, ON/OFF SWITCHES AND HEALTH (Phase 6b)
+# Every paper source is listed here. Admins can switch a source off from the admin panel (saved in the database,
+# no redeploy). Health numbers (calls, failures, speed, results) are kept in memory since the last restart.
+# ============================================================
+
+SOURCE_REGISTRY = {
+    "openalex": {"label": "OpenAlex", "key": None, "key_required": False},
+    "semantic_scholar": {"label": "Semantic Scholar", "key": "SEMANTIC_SCHOLAR_API_KEY", "key_required": False},
+    "arxiv": {"label": "arXiv", "key": None, "key_required": False},
+    "crossref": {"label": "Crossref", "key": None, "key_required": False},
+    "core": {"label": "CORE", "key": "CORE_API_KEY", "key_required": True},
+    "pubmed": {"label": "PubMed", "key": "NCBI_API_KEY", "key_required": False},
+    "europepmc": {"label": "Europe PMC", "key": None, "key_required": False},
+    "doaj": {"label": "DOAJ (open-access journals)", "key": None, "key_required": False},
+    "eric": {"label": "ERIC (education research)", "key": None, "key_required": False},
+    "openaire": {"label": "OpenAIRE (European research)", "key": None, "key_required": False},
+    "ajol": {"label": "AJOL (African Journals Online)", "key": None, "key_required": False},
+    "unpaywall": {"label": "Unpaywall (free PDF links)", "key": None, "key_required": False},
+}
+SEARCH_SOURCES = [name for name in SOURCE_REGISTRY if name != "unpaywall"]
+
+
+class SourceSetting(Base):
+    """A row means an admin changed the default (every source is on by default)."""
+    __tablename__ = "source_settings"
+
+    name = Column(String(40), primary_key=True)
+    enabled = Column(Boolean, nullable=False, default=True)
+    updated_at = Column(DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    updated_by = Column(Integer, nullable=True)
+
+
+try:
+    Base.metadata.create_all(bind=engine, tables=[SourceSetting.__table__])
+except Exception as _source_table_error:
+    print("Source settings table note:", _source_table_error)
+
+_SOURCE_SWITCHES: dict[str, bool] | None = None
+_SOURCE_SWITCHES_LOCK = threading.Lock()
+_SOURCE_HEALTH: dict[str, dict] = {}
+_SOURCE_HEALTH_LOCK = threading.Lock()
+
+
+def _load_source_switches() -> dict[str, bool]:
+    global _SOURCE_SWITCHES
+    with _SOURCE_SWITCHES_LOCK:
+        if _SOURCE_SWITCHES is None:
+            switches = {}
+            db = SessionLocal()
+            try:
+                for row in db.query(SourceSetting).all():
+                    switches[row.name] = bool(row.enabled)
+            except Exception as error:
+                print("Source switches note:", type(error).__name__)
+            finally:
+                db.close()
+            _SOURCE_SWITCHES = switches
+        return _SOURCE_SWITCHES
+
+
+def reset_source_switch_cache():
+    global _SOURCE_SWITCHES
+    with _SOURCE_SWITCHES_LOCK:
+        _SOURCE_SWITCHES = None
+
+
+def source_enabled(name: str) -> bool:
+    return _load_source_switches().get(name, True)
+
+
+def _health(name: str) -> dict:
+    return _SOURCE_HEALTH.setdefault(name, {"calls": 0, "failures": 0, "results": 0, "total_ms": 0,
+                                            "last_ok_at": None, "last_error": None, "last_error_at": None})
+
+
+def source_failed(name: str, reason: str):
+    """Called by a source when a request fails (rate limit, timeout, bad response). Never includes keys or URLs."""
+    with _SOURCE_HEALTH_LOCK:
+        h = _health(name)
+        h["failures"] += 1
+        h["last_error"] = str(reason)[:120]
+        h["last_error_at"] = _utcnow().isoformat()
+
+
+async def tracked(name: str, coro):
+    """Run one source call and record how long it took and how many papers it returned."""
+    started = time.perf_counter()
+    try:
+        result = await coro
+    except Exception as error:
+        source_failed(name, type(error).__name__)
+        result = []
+    elapsed = int((time.perf_counter() - started) * 1000)
+    with _SOURCE_HEALTH_LOCK:
+        h = _health(name)
+        h["calls"] += 1
+        h["total_ms"] += elapsed
+        count = len(result) if isinstance(result, list) else 0
+        h["results"] += count
+        if count:
+            h["last_ok_at"] = _utcnow().isoformat()
+    return result
+
+
+_QUERY_SYNTAX = re.compile(r'[\\/:\[\](){}"^~*?!<>=|&+]')
+
+
+def plain_query(q: str) -> str:
+    """Keywords only: removes query-language characters so user text cannot change a source's search syntax."""
+    text = _QUERY_SYNTAX.sub(" ", q or "")
+    text = re.sub(r"\b(AND|OR|NOT|TO)\b", " ", text)
+    return re.sub(r"\s+", " ", text).strip()[:300]
+
+
+# ============================================================
+# DOAJ (Directory of Open Access Journals; every article is open access)
+# ============================================================
+
+async def search_doaj(client, q, year_min=None, year_max=None, oa_only=False, filters=None):
+    from urllib.parse import quote
+
+    query = plain_query(q)
+    if not query:
+        return []
+    if year_min is not None or year_max is not None:
+        query = f"({query}) AND bibjson.year:[{year_min if year_min is not None else 1000} TO {year_max if year_max is not None else 3000}]"
+    try:
+        response = await client.get(f"https://doaj.org/api/search/articles/{quote(query, safe='')}",
+                                    params={"pageSize": 10}, timeout=10.0)
+        if response.status_code == 429:
+            source_failed("doaj", "rate limited")
+            return []
+        response.raise_for_status()
+        results = []
+        for item in (response.json().get("results") or []):
+            bib = item.get("bibjson") or {}
+            abstract = re.sub(r"<[^>]+>", " ", bib.get("abstract") or "")
+            abstract = re.sub(r"\s+", " ", abstract).strip()
+            if not abstract:
+                continue
+            doi = next((i.get("id") for i in (bib.get("identifier") or []) if (i.get("type") or "").lower() == "doi"), None)
+            year = bib.get("year")
+            results.append(normalize_result(
+                title=bib.get("title"),
+                authors=[a.get("name") for a in (bib.get("author") or []) if a.get("name")][:50],
+                abstract=abstract,
+                year=int(year) if str(year or "").isdigit() else None,
+                source=(bib.get("journal") or {}).get("title") or "DOAJ",
+                doi=doi,
+                is_open_access=True,
+                database="DOAJ",
+                is_preprint=False,
+            ))
+        return results
+    except Exception as error:
+        source_failed("doaj", type(error).__name__)
+        print("DOAJ search failed:", type(error).__name__)
+        return []
+
+
+# ============================================================
+# ERIC (US Department of Education research database)
+# ============================================================
+
+async def search_eric(client, q, year_min=None, year_max=None, oa_only=False, filters=None):
+    query = plain_query(q)
+    if not query:
+        return []
+    if year_min is not None or year_max is not None:
+        query = f"({query}) AND publicationdateyear:[{year_min if year_min is not None else 1000} TO {year_max if year_max is not None else 3000}]"
+    params = {"search": query, "rows": 10, "format": "json",
+              "fields": "id,title,author,description,publicationdateyear,source,peerreviewed,url,e_fulltextauth"}
+    try:
+        response = await client.get("https://api.ies.ed.gov/eric/", params=params, timeout=10.0)
+        if response.status_code == 429:
+            source_failed("eric", "rate limited")
+            return []
+        response.raise_for_status()
+        results = []
+        for doc in ((response.json().get("response") or {}).get("docs") or []):
+            abstract = (doc.get("description") or "").strip()
+            if not abstract:
+                continue
+            year = doc.get("publicationdateyear")
+            results.append(normalize_result(
+                title=doc.get("title"),
+                authors=[str(a) for a in (doc.get("author") or [])][:50],
+                abstract=abstract,
+                year=int(year) if str(year or "").isdigit() else None,
+                source=doc.get("source") or "ERIC",
+                doi=None,
+                # ERIC full text hosted by ERIC (e_fulltextauth = 1) is free to read; otherwise unknown.
+                is_open_access=True if str(doc.get("e_fulltextauth")) == "1" else None,
+                database="ERIC",
+            ))
+        return results
+    except Exception as error:
+        source_failed("eric", type(error).__name__)
+        print("ERIC search failed:", type(error).__name__)
+        return []
+
+
+# ============================================================
+# OPENAIRE (European research graph: publications from repositories and EU-funded projects)
+# ============================================================
+
+async def search_openaire(client, q, year_min=None, year_max=None, oa_only=False, filters=None):
+    query = plain_query(q)
+    if not query:
+        return []
+    params = {"search": query, "type": "publication", "pageSize": 10}
+    if year_min is not None:
+        params["fromPublicationDate"] = f"{year_min}-01-01"
+    if year_max is not None:
+        params["toPublicationDate"] = f"{year_max}-12-31"
+    try:
+        response = await client.get("https://api.openaire.eu/graph/v1/researchProducts", params=params, timeout=12.0)
+        if response.status_code == 429:
+            source_failed("openaire", "rate limited")
+            return []
+        response.raise_for_status()
+        results = []
+        for item in (response.json().get("results") or []):
+            descriptions = item.get("descriptions") or []
+            abstract = re.sub(r"<[^>]+>", " ", descriptions[0] if descriptions else "")
+            abstract = re.sub(r"\s+", " ", abstract).strip()
+            if not abstract:
+                continue
+            doi = next((p.get("value") for p in (item.get("pids") or []) if (p.get("scheme") or "").lower() == "doi"), None)
+            access = ((item.get("bestAccessRight") or {}).get("label") or "").upper()
+            date = str(item.get("publicationDate") or "")
+            container = (item.get("container") or {}).get("name") if isinstance(item.get("container"), dict) else None
+            results.append(normalize_result(
+                title=item.get("mainTitle"),
+                authors=[a.get("fullName") for a in (item.get("authors") or []) if a.get("fullName")][:50],
+                abstract=abstract,
+                year=int(date[:4]) if date[:4].isdigit() else None,
+                source=container or item.get("publisher") or "OpenAIRE",
+                doi=doi,
+                is_open_access=True if access == "OPEN" else (False if access in ("CLOSED", "RESTRICTED") else None),
+                database="OpenAIRE",
+            ))
+        return results
+    except Exception as error:
+        source_failed("openaire", type(error).__name__)
+        print("OpenAIRE search failed:", type(error).__name__)
+        return []
+
+
+# ============================================================
+# AJOL (African Journals Online), searched through OpenAlex's index of AJOL-hosted journals
+# ============================================================
+
+AJOL_OPENALEX_PUBLISHER = "P4310321518"
+
+
+async def search_ajol(client, q, year_min=None, year_max=None, oa_only=False, filters=None):
+    return await search_openalex(
+        client, q, year_min, year_max, oa_only, filters,
+        extra_filter=f"primary_location.source.host_organization_lineage:{AJOL_OPENALEX_PUBLISHER}",
+        database_label="AJOL", health_name="ajol",
+    )
+
+
+# ============================================================
+# UNPAYWALL: a free, legal PDF link for papers that have a DOI
+# ============================================================
+
+UNPAYWALL_MAX_PAPERS = 15
+UNPAYWALL_ENABLED = os.getenv("UNPAYWALL_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+
+
+async def add_free_pdf_links(results: list[dict]) -> None:
+    """Adds `pdf_url` (and marks open access) for up to 15 top papers with a DOI. Results are cached for 7 days.
+    Skipped when the source is switched off or no contact email is configured (Unpaywall requires one)."""
+    email = NCBI_EMAIL or CONTACT_EMAIL
+    if not UNPAYWALL_ENABLED or not email or not source_enabled("unpaywall"):
+        return
+    targets = [p for p in results[:UNPAYWALL_MAX_PAPERS] if p.get("doi") and not p.get("pdf_url")]
+    if not targets:
+        return
+    semaphore = asyncio.Semaphore(5)
+
+    async def one(client, paper):
+        doi = normalize_doi(paper["doi"])
+        if not doi:
+            return False
+        cache_key = "upw:" + hashlib.sha256(doi.encode("utf-8")).hexdigest()
+        cached = get_from_search_cache(cache_key)
+        if cached is None:
+            async with semaphore:
+                try:
+                    from urllib.parse import quote
+
+                    response = await client.get(f"https://api.unpaywall.org/v2/{quote(doi, safe='/')}",
+                                                params={"email": email}, timeout=6.0)
+                    if response.status_code == 404:
+                        cached = {"pdf": None, "oa": False}
+                    else:
+                        response.raise_for_status()
+                        data = response.json()
+                        best = data.get("best_oa_location") or {}
+                        cached = {"pdf": best.get("url_for_pdf") or best.get("url"), "oa": bool(data.get("is_oa"))}
+                except Exception as error:
+                    source_failed("unpaywall", type(error).__name__)
+                    return False
+            set_in_search_cache(cache_key, cached, ttl=7 * 86400)
+        pdf = cached.get("pdf")
+        if isinstance(pdf, str) and pdf.startswith("https://") and len(pdf) <= 500:
+            paper["pdf_url"] = pdf
+        if cached.get("oa"):
+            paper["is_open_access"] = True
+        return bool(paper.get("pdf_url"))
+
+    async def run_all(client):
+        # The Sources tab counts free PDF links found, not papers checked.
+        found = await asyncio.gather(*(one(client, p) for p in targets))
+        return [hit for hit in found if hit]
+
+    async with httpx.AsyncClient(follow_redirects=True,
+                                 headers={"User-Agent": f"{APP_UA_NAME}/1.0 (mailto:{email})"}) as client:
+        await tracked("unpaywall", run_all(client))
+
+
+# ---------------------------------------------------------------- admin: sources tab
+
+class SourceSwitchRequest(BaseModel):
+    enabled: bool
+
+
+@app.get("/admin/sources", tags=["Admin"], include_in_schema=False, summary="Paper sources",
+         description="Every source with its on/off switch, key status and health since the last restart.")
+def admin_sources(request: Request, authorization: str | None = Header(None)):
+    require_admin(request, authorization)
+    panel = _load_panel_keys()
+    out = []
+    for name, meta in SOURCE_REGISTRY.items():
+        key_name = meta["key"]
+        key_source = None
+        if key_name:
+            key_source = "panel" if key_name in panel else ("env" if globals().get(key_name) else "none")
+        with _SOURCE_HEALTH_LOCK:
+            h = dict(_health(name))
+        calls = h["calls"]
+        out.append({
+            "name": name, "label": meta["label"], "enabled": source_enabled(name),
+            "key_name": key_name, "key_source": key_source, "key_required": meta["key_required"],
+            "calls": calls, "failures": h["failures"], "results": h["results"],
+            "avg_ms": int(h["total_ms"] / calls) if calls else None,
+            "last_ok_at": h["last_ok_at"], "last_error": h["last_error"], "last_error_at": h["last_error_at"],
+            "needs_email": name == "unpaywall" and not (NCBI_EMAIL or CONTACT_EMAIL),
+        })
+    return {"sources": out}
+
+
+@app.post("/admin/sources/{name}", tags=["Admin"], include_in_schema=False, summary="Switch a source on or off",
+          description="Saved in the database and applied at once. At least one search source must stay on.")
+def admin_switch_source(name: str, body: SourceSwitchRequest, request: Request, authorization: str | None = Header(None)):
+    admin = require_admin(request, authorization)
+    if name not in SOURCE_REGISTRY:
+        raise HTTPException(status_code=404, detail="Unknown source.")
+    if not body.enabled and name in SEARCH_SOURCES:
+        others_on = [s for s in SEARCH_SOURCES if s != name and source_enabled(s)]
+        if not others_on:
+            raise HTTPException(status_code=400, detail="At least one search source must stay on.")
+    db = SessionLocal()
+    try:
+        row = db.query(SourceSetting).filter(SourceSetting.name == name).first()
+        if row is None:
+            row = SourceSetting(name=name)
+            db.add(row)
+        row.enabled = body.enabled
+        row.updated_at = _utcnow().replace(tzinfo=None)
+        row.updated_by = admin.id
+        db.commit()
+    finally:
+        db.close()
+    reset_source_switch_cache()
+    audit(admin, "source_on" if body.enabled else "source_off", request, target=name)
+    return {"name": name, "enabled": body.enabled}
+
+
+# ============================================================
 # RESEARCH MODE (rules, no AI call): quick, deep or medical
 # ============================================================
 
@@ -3011,8 +3416,9 @@ async def suggest_mode(q: str = Query(..., max_length=2000)):
 @app.get(
     "/search",
     tags=["Search"],
-    summary="Search seven academic databases",
-    description="Searches OpenAlex, Semantic Scholar, arXiv, Crossref, CORE (CORE needs a server-side key), PubMed and Europe PMC, "
+    summary="Search eleven academic databases",
+    description="Searches OpenAlex, Semantic Scholar, arXiv, Crossref, CORE (CORE needs a server-side key), PubMed, Europe PMC, "
+                "DOAJ, ERIC, OpenAIRE and AJOL (sources an admin switched off are skipped), adds free PDF links from Unpaywall, "
                 "merges duplicates by DOI or title, and ranks by semantic similarity when the embedding model is enabled. "
                 "Open to guests.\n\n"
                 "`year_min` / `year_max` restrict the publication year (inclusive). `open_access_only=true` returns only papers a "
@@ -3107,37 +3513,41 @@ async def search(
             # Filters are sent to each source so its result slots go to matching papers.
             f = {"year_min": year_min, "year_max": year_max, "oa_only": open_access_only, "filters": filters}
 
+            def add(name, make):
+                # Only sources an admin has not switched off; each call is timed for the Sources tab.
+                if source_enabled(name):
+                    tasks.append(tracked(name, make()))
+
+            tasks = []
             if mode == "doi":
                 tasks = [lookup_doi(client, term)]
             elif mode == "author":
-                tasks = [search_openalex_by_author(client, term, **f)]
+                add("openalex", lambda: search_openalex_by_author(client, term, **f))
             elif mode == "title":
-                tasks = [
-                    search_openalex(client, term, mode="title", **f),
-                    search_semantic_scholar(client, term, **f),
-                ]
+                add("openalex", lambda: search_openalex(client, term, mode="title", **f))
+                add("semantic_scholar", lambda: search_semantic_scholar(client, term, **f))
             else:
                 academic_keyword = clean_academic_query(term)
-                tasks = [
-                    search_openalex(client, academic_keyword, **f),
-                    search_semantic_scholar(client, academic_keyword, **f),
-                    search_arxiv(client, academic_keyword, **f),
-                    search_core(client, academic_keyword, **f),
-                    search_europepmc(client, academic_keyword, **f),
-                ]
+                add("openalex", lambda: search_openalex(client, academic_keyword, **f))
+                add("semantic_scholar", lambda: search_semantic_scholar(client, academic_keyword, **f))
+                add("arxiv", lambda: search_arxiv(client, academic_keyword, **f))
+                add("core", lambda: search_core(client, academic_keyword, **f))
+                add("europepmc", lambda: search_europepmc(client, academic_keyword, **f))
+                add("doaj", lambda: search_doaj(client, academic_keyword, **f))
+                add("openaire", lambda: search_openaire(client, academic_keyword, **f))
+                add("ajol", lambda: search_ajol(client, academic_keyword, **f))
                 if not open_access_only:
-                    # Crossref and PubMed cannot tell us whether a paper is open access, so they are skipped
+                    # Crossref, PubMed and ERIC rarely say whether a paper is open access, so they are skipped
                     # for OA-only searches.
-                    tasks.append(search_crossref(client, academic_keyword, **f))
-                    tasks.append(search_pubmed(client, academic_keyword, **f))
+                    add("crossref", lambda: search_crossref(client, academic_keyword, **f))
+                    add("pubmed", lambda: search_pubmed(client, academic_keyword, **f))
+                    add("eric", lambda: search_eric(client, academic_keyword, **f))
 
                 # If user query has distinct keywords, also search raw query
                 if academic_keyword != term:
-                    tasks.extend([
-                        search_semantic_scholar(client, term, **f),
-                        search_openalex(client, term, **f),
-                        search_arxiv(client, term, **f),
-                    ])
+                    add("semantic_scholar", lambda: search_semantic_scholar(client, term, **f))
+                    add("openalex", lambda: search_openalex(client, term, **f))
+                    add("arxiv", lambda: search_arxiv(client, term, **f))
 
             gathered = await asyncio.gather(*tasks, return_exceptions=True)
             all_results = []
@@ -3178,6 +3588,7 @@ async def search(
     if medical and sort == "relevance" and mode in ("topic", "title"):
         results = rank_by_evidence(results)
     results = sort_results(results, sort)
+    await add_free_pdf_links(results)
 
     # Papers per database (not per journal).
     source_counts = {}
@@ -3638,6 +4049,8 @@ def sanitize_paper_for_storage(paper: dict) -> dict:
         "is_preprint": paper["is_preprint"] if isinstance(paper.get("is_preprint"), bool) else None,
         "is_retracted": paper.get("is_retracted") is True,
         "field": paper["field"] if paper.get("field") in FIELDS_OF_STUDY else None,
+        "pdf_url": paper["pdf_url"] if isinstance(paper.get("pdf_url"), str) and paper["pdf_url"].startswith("https://")
+        and len(paper["pdf_url"]) <= 500 else None,
     }
 
 

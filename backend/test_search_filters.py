@@ -148,6 +148,10 @@ def fake_sources(monkeypatch):
     monkeypatch.setattr(main, "search_openalex_by_author", fake_author)
     monkeypatch.setattr(main, "search_pubmed", make("pubmed", []))
     monkeypatch.setattr(main, "search_europepmc", make("europepmc", []))
+    monkeypatch.setattr(main, "search_doaj", make("doaj", []))
+    monkeypatch.setattr(main, "search_eric", make("eric", []))
+    monkeypatch.setattr(main, "search_openaire", make("openaire", []))
+    monkeypatch.setattr(main, "search_ajol", make("ajol", []))
 
     monkeypatch.setattr(main, "search_openalex", make("openalex", [
         paper("Old open", 2015, True, "10.1/old"), paper("New open", 2025, True, "10.1/new"),

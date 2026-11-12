@@ -1,6 +1,6 @@
 # ImoSmart API guide
 
-A REST API over JSON. Search seven academic databases at once, then get an answer written **only from the papers' abstracts**, with citations.
+A REST API over JSON. Search eleven academic databases at once, then get an answer written **only from the papers' abstracts**, with citations.
 
 - **Reference (interactive):** `/docs` (Swagger UI, "Try it out") and `/redoc` (searchable reference with a side menu).
   They are served when `ENABLE_DOCS=true` (always on with `DEV_MODE=true`). The raw schema is at `/openapi.json`.
@@ -130,6 +130,10 @@ Full request and response shapes, with examples for every status code, are in th
 - `sort`: `relevance` (default), `newest` or `most_cited`. Papers with an unknown year or citation count go last.
 - `search_by`: `topic` (default), `title` or `author`. The prefixes `author:` and `title:` in `q` do the same. A `q` that is only a DOI
   (bare, `doi:` or a doi.org link) is looked up directly and filters are not applied.
+- Sources: OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed, Europe PMC, DOAJ, ERIC, OpenAIRE and AJOL (AJOL is searched
+  through OpenAlex's index of African Journals Online). Sources an admin switched off are skipped. Crossref, PubMed and ERIC are
+  skipped for open-access-only searches. Text sent to DOAJ and ERIC is reduced to plain keywords.
+- Up to 15 top papers with a DOI get `pdf_url`, a free legal copy found by Unpaywall (https links only, cached 7 days).
 - The response has `search_mode` (`topic`, `title`, `author` or `doi`) and `source_counts` (papers per database).
 - Each result has `is_open_access` (`true`, `false` or `null` when the source did not say), `database`, `cited_by_count` (`null` when
   unknown), `study_types` (list), `is_preprint` (`true`, `false` or `null`), `is_retracted` and `field` (`null` when unknown).
