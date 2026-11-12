@@ -19,6 +19,7 @@ type Overview = {
   answers: { today: number; last_7_days: number };
   ai: { calls_today: number; daily_cap: number; guest_cap: number; user_cap: number };
   deep: { runs_today: number; daily_cap: number; guest_cap: number; user_cap: number };
+  uploads?: { documents: number; text_mb: number };
   counters_shared: boolean;
 };
 type AdminUser = {
@@ -444,6 +445,9 @@ export default function AdminPage() {
                   <Stat label="Signed in today" value={overview.users.active_today} />
                   <Stat label="Disabled" value={overview.users.disabled} sub={`${overview.users.admins} admin(s)`} />
                   <Stat label="Answers today" value={overview.answers.today} sub={`${overview.answers.last_7_days} this week`} />
+                  {overview.uploads && (
+                    <Stat label="Uploaded PDFs" value={overview.uploads.documents} sub={`${overview.uploads.text_mb} MB of text stored`} />
+                  )}
                 </div>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                   <div className="p-4 rounded-xl border border-[var(--border-color)] bg-[var(--bg-surface)]">

@@ -20,6 +20,8 @@ import { ModalPanel, ModalShell, SPRING, SlideUp, projectMomentum, useIsDesktop 
 import { buildCsv, downloadCsv } from "./csv";
 import type { ComparisonRow, Glance } from "./pdf";
 import {
+  Upload,
+  Network,
   Quote,
   Folder,
   FolderPlus,
@@ -352,6 +354,15 @@ type ThreadSummary = {
 
 type ThreadTurn = { question: string; answer: string; citations: Citation[]; mode?: AnswerMode | null };
 
+type DocumentInfo = { id: number; title: string; filename: string | null; pages: number; words: number; created_at: string | null };
+type DocCitation = { n: number; document_id: number; title: string; page: number };
+type DocMessage = { id: string; role: "user" | "assistant"; content: string; citations?: DocCitation[] };
+type GraphNode = { id: string; title: string; year: number | null; cited_by_count: number | null; doi: string | null; kind: "seed" | "reference" | "citing" };
+type GraphData = { seed: GraphNode; nodes: GraphNode[]; reference_total: number; citing_total: number };
+
+const MAX_UPLOAD_MB = 20;
+const MAX_DOCS_PER_CHAT = 5;
+
 const GUEST_SEARCH_LIMIT = 5;
 
 export default function Home() {
@@ -438,6 +449,21 @@ export default function Home() {
   const [shareTarget, setShareTarget] = useState<ThreadSummary | null>(null);
   const [shareBusy, setShareBusy] = useState(false);
   const [shareCopied, setShareCopied] = useState(false);
+
+  // Phase 8: uploaded PDFs (text only), document chat, citation map
+  const [documents, setDocuments] = useState<DocumentInfo[]>([]);
+  const [docsSectionOpen, setDocsSectionOpen] = useState(true);
+  const [docUploading, setDocUploading] = useState(false);
+  const [docNotice, setDocNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
+  const [docSelection, setDocSelection] = useState<number[]>([]);
+  const [docChatIds, setDocChatIds] = useState<number[] | null>(null);
+  const [docMessages, setDocMessages] = useState<DocMessage[]>([]);
+  const [docQuestion, setDocQuestion] = useState("");
+  const [docAsking, setDocAsking] = useState(false);
+  const [docChatError, setDocChatError] = useState("");
+  const [graphPaper, setGraphPaper] = useState<Result | null>(null);
+  const [graphData, setGraphData] = useState<GraphData | null>(null);
+  const [graphError, setGraphError] = useState("");
 
   // Theme mode: 'light' or 'dark'
   const [theme, setTheme] = useState<"light" | "dark">("light");
@@ -818,6 +844,9 @@ export default function Home() {
     setCollections([]);
     setActiveCollection(null);
     setThreads([]);
+    setDocuments([]);
+    setDocSelection([]);
+    setDocChatIds(null);
     setCurrentThreadId(null);
     setSavedTurnCount(0);
     loadHistory();
@@ -991,6 +1020,7 @@ export default function Home() {
     }
     loadCollections();
     loadThreads();
+    loadDocuments();
   }
 
   // ============================================================
@@ -1220,6 +1250,136 @@ export default function Home() {
     } catch {
       window.prompt("Copy this link:", shareUrl(token));
     }
+  }
+
+  // ============================================================
+  // UPLOADED DOCUMENTS (Phase 8): only the extracted text is kept on the server
+  // ============================================================
+
+  async function loadDocuments() {
+    try {
+      const res = await fetch(`${apiBaseUrl}/documents`, { credentials: "include" });
+      if (res.ok) setDocuments((await res.json()).documents || []);
+    } catch {
+      // ignore
+    }
+  }
+
+  async function uploadDocument(file: File) {
+    if (!user) {
+      openAuthModal("register", "Create a free account to upload PDFs and chat with them.");
+      return;
+    }
+    if (!user.is_verified) {
+      setDocNotice({ kind: "error", text: "Verify your email to upload PDFs." });
+      return;
+    }
+    if (!/\.pdf$/i.test(file.name) && file.type !== "application/pdf") {
+      setDocNotice({ kind: "error", text: "Choose a PDF file." });
+      return;
+    }
+    if (file.size > MAX_UPLOAD_MB * 1024 * 1024) {
+      setDocNotice({ kind: "error", text: `This PDF is larger than ${MAX_UPLOAD_MB} MB.` });
+      return;
+    }
+    setDocUploading(true);
+    setDocNotice(null);
+    try {
+      const res = await fetch(`${apiBaseUrl}/documents`, {
+        method: "POST",
+        credentials: "include",
+        // Header values must be plain ASCII, so accented file names are simplified.
+        headers: { "Content-Type": "application/pdf", "X-Filename": file.name.normalize("NFD").replace(/[^\x20-\x7e]/g, "").slice(0, 200) },
+        body: file,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : "The upload failed.");
+      setDocNotice({ kind: "ok", text: `Read ${data.pages} page${data.pages === 1 ? "" : "s"}, about ${Number(data.words).toLocaleString()} words.` });
+      loadDocuments();
+    } catch (err) {
+      setDocNotice({ kind: "error", text: errorMessage(err, "The upload failed.") });
+    } finally {
+      setDocUploading(false);
+    }
+  }
+
+  async function deleteDocument(doc: DocumentInfo) {
+    if (!window.confirm(`Delete "${doc.title}"? Its text is removed from the server.`)) return;
+    await fetch(`${apiBaseUrl}/documents/${doc.id}`, { method: "DELETE", credentials: "include" }).catch(() => null);
+    setDocSelection((prev) => prev.filter((id) => id !== doc.id));
+    loadDocuments();
+  }
+
+  function toggleDocSelection(id: number) {
+    setDocSelection((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : prev.length >= MAX_DOCS_PER_CHAT ? prev : [...prev, id]));
+  }
+
+  function openDocChat(ids: number[]) {
+    setDocChatIds(ids);
+    setDocMessages([]);
+    setDocQuestion("");
+    setDocChatError("");
+    if (window.innerWidth < 768) setSidebarOpen(false);
+  }
+
+  async function askDocuments(e: React.FormEvent) {
+    e.preventDefault();
+    const question = docQuestion.trim();
+    if (!question || !docChatIds || docAsking) return;
+    const history: { question: string; answer: string }[] = [];
+    for (let i = 0; i < docMessages.length - 1; i += 1) {
+      if (docMessages[i].role === "user" && docMessages[i + 1].role === "assistant") {
+        history.push({ question: docMessages[i].content.slice(0, 2000), answer: docMessages[i + 1].content.slice(0, 20000) });
+      }
+    }
+    setDocMessages((prev) => [...prev, { id: newMessageId("doc-q"), role: "user", content: question }]);
+    setDocQuestion("");
+    setDocAsking(true);
+    setDocChatError("");
+    try {
+      const res = await fetch(`${apiBaseUrl}/documents/ask`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ question: question.slice(0, 2000), document_ids: docChatIds, conversation_history: history.slice(-20) }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : "Could not answer from the documents.");
+      setDocMessages((prev) => [
+        ...prev,
+        { id: newMessageId("doc-a"), role: "assistant", content: data.answer || "", citations: data.citations || [] },
+      ]);
+    } catch (err) {
+      setDocChatError(errorMessage(err, "Could not answer from the documents."));
+    } finally {
+      setDocAsking(false);
+    }
+  }
+
+  // ============================================================
+  // CITATION MAP (Phase 8)
+  // ============================================================
+
+  async function openCitationMap(paper: Result) {
+    if (!paper.doi) return;
+    setGraphPaper(paper);
+    setGraphData(null);
+    setGraphError("");
+    try {
+      const res = await fetch(`${apiBaseUrl}/graph?${new URLSearchParams({ doi: paper.doi }).toString()}`, { credentials: "include" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : "The citation map could not be loaded.");
+      setGraphData(data);
+    } catch (err) {
+      setGraphError(errorMessage(err, "The citation map could not be loaded."));
+    }
+  }
+
+  function exploreGraphNode(node: GraphNode) {
+    if (!node.doi) return;
+    setGraphPaper(null);
+    setQuery(node.doi);
+    executeSearch(node.doi, "quick");
   }
 
   const visibleBookmarks =
@@ -2310,6 +2470,106 @@ export default function Home() {
                       </button>
                     )}
                   </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* My Documents Accordion */}
+          <div>
+            <button
+              onClick={() => setDocsSectionOpen(!docsSectionOpen)}
+              className="flex items-center justify-between w-full px-2 py-1.5 text-xs font-semibold uppercase tracking-wider text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition"
+            >
+              <div className="flex items-center gap-2">
+                <FileText className="w-3.5 h-3.5 text-[var(--accent)]" />
+                <span>My Documents</span>
+                <span className="text-[10px] bg-[var(--bg-surface-elevated)] px-1.5 py-0.5 rounded-full text-[var(--text-secondary)]">
+                  {documents.length}
+                </span>
+              </div>
+              <ChevronDown className={`w-3.5 h-3.5 transition-transform duration-200 ${docsSectionOpen ? "" : "-rotate-90"}`} />
+            </button>
+            {docsSectionOpen && (
+              <div className="mt-2 space-y-1">
+                <div className="px-2 flex flex-wrap items-center gap-2">
+                  <label
+                    className={`px-2.5 py-1.5 rounded-lg border border-[var(--border-color)] text-[11px] font-medium flex items-center gap-1.5 transition cursor-pointer ${
+                      docUploading ? "opacity-60 pointer-events-none" : "hover:bg-[var(--bg-surface-elevated)] text-[var(--text-secondary)]"
+                    }`}
+                  >
+                    <Upload className="w-3.5 h-3.5" />
+                    <span>{docUploading ? "Reading PDF..." : "Upload PDF"}</span>
+                    <input
+                      type="file"
+                      accept="application/pdf,.pdf"
+                      className="sr-only"
+                      disabled={docUploading}
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        e.target.value = "";
+                        if (file) uploadDocument(file);
+                      }}
+                    />
+                  </label>
+                  {docSelection.length > 0 && (
+                    <button
+                      onClick={() => openDocChat(docSelection)}
+                      className="px-2.5 py-1.5 rounded-lg bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-[11px] font-semibold"
+                    >
+                      Chat with {docSelection.length}
+                    </button>
+                  )}
+                </div>
+                {docNotice && (
+                  <div className={`px-2 text-[11px] ${docNotice.kind === "ok" ? "text-emerald-600" : "text-red-600"}`}>{docNotice.text}</div>
+                )}
+                {documents.length === 0 ? (
+                  <div className="text-xs text-[var(--text-muted)] px-2 py-1 italic">
+                    {user ? `Upload a PDF (up to ${MAX_UPLOAD_MB} MB) to chat with its full text.` : "Sign in to upload PDFs."}
+                  </div>
+                ) : (
+                  documents.map((doc) => {
+                    const ticked = docSelection.includes(doc.id);
+                    return (
+                      <div
+                        key={doc.id}
+                        onClick={() => openDocChat([doc.id])}
+                        className="group flex items-center justify-between gap-1 px-2.5 py-2 rounded-lg text-xs cursor-pointer hover:bg-[var(--bg-surface-elevated)] text-[var(--text-primary)] transition"
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              toggleDocSelection(doc.id);
+                            }}
+                            className="text-[var(--accent)] shrink-0"
+                            aria-label={ticked ? `Unselect ${doc.title}` : `Select ${doc.title}`}
+                            title={`Tick up to ${MAX_DOCS_PER_CHAT} to chat with several at once`}
+                          >
+                            {ticked ? <CheckSquare className="w-3.5 h-3.5" /> : <Square className="w-3.5 h-3.5 text-[var(--text-muted)]" />}
+                          </button>
+                          <div className="min-w-0">
+                            <div className="truncate">{doc.title}</div>
+                            <div className="text-[10px] text-[var(--text-muted)]">
+                              {doc.pages} pages · {doc.words.toLocaleString()} words
+                            </div>
+                          </div>
+                        </div>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            deleteDocument(doc);
+                          }}
+                          className="opacity-100 md:opacity-0 md:group-hover:opacity-100 p-1 hover:text-red-600 transition shrink-0"
+                          aria-label={`Delete ${doc.title}`}
+                          title="Delete"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      </div>
+                    );
+                  })
                 )}
               </div>
             )}
@@ -3484,6 +3744,17 @@ export default function Home() {
                               <span>Cite</span>
                             </button>
 
+                            {selectedPaperForDetail.paper.doi && (
+                              <button
+                                onClick={() => openCitationMap(selectedPaperForDetail.paper)}
+                                className="flex items-center gap-1.5 px-3 py-2 bg-[var(--bg-surface-elevated)] hover:bg-[var(--border-color)] text-[var(--text-primary)] text-xs font-medium rounded-lg border border-[var(--border-color)] transition"
+                                title="What this paper cites, and what cites it"
+                              >
+                                <Network className="w-3.5 h-3.5" />
+                                <span>Citation map</span>
+                              </button>
+                            )}
+
                             <button
                               onClick={() =>
                                 handleExportPaperPDF(
@@ -3848,6 +4119,213 @@ export default function Home() {
           )}
         </div>
       </main>
+
+      {/* ======================================================== */}
+      {/* 2z. DOCUMENT CHAT (Phase 8) */}
+      {/* ======================================================== */}
+      <AnimatePresence>
+      {docChatIds && (
+        <ModalShell
+          key="docChat"
+          className="fixed inset-0 z-[65] flex items-stretch sm:items-center justify-center bg-black/50 backdrop-blur-xs p-0 sm:p-4"
+          onClick={() => setDocChatIds(null)}
+        >
+          <ModalPanel
+            role="dialog"
+            aria-modal="true"
+            aria-label="Chat with documents"
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-3xl h-full sm:h-[85vh] bg-[var(--bg-surface)] border border-[var(--border-color)] sm:rounded-2xl shadow-2xl flex flex-col overflow-hidden"
+          >
+            <div className="p-3 sm:p-4 border-b border-[var(--border-color)] flex items-start gap-2 shrink-0">
+              <FileText className="w-5 h-5 text-[var(--accent)] shrink-0 mt-0.5" />
+              <div className="min-w-0 mr-auto">
+                <h3 className="font-serif-heading text-base font-bold text-[var(--text-primary)]">Chat with your documents</h3>
+                <div className="text-[11px] text-[var(--text-muted)] truncate">
+                  {documents.filter((d) => docChatIds.includes(d.id)).map((d) => d.title).join(" · ")}
+                </div>
+              </div>
+              <button
+                onClick={() => setDocChatIds(null)}
+                aria-label="Close"
+                className="p-1.5 rounded-lg hover:bg-[var(--bg-surface-elevated)] text-[var(--text-secondary)]"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-3 sm:p-5 space-y-4">
+              {docMessages.length === 0 && (
+                <p className="text-sm text-[var(--text-secondary)]">
+                  Ask anything about the full text, for example &quot;What methods did they use?&quot; or &quot;Summarise the
+                  limitations.&quot; Answers quote the matching pages.
+                </p>
+              )}
+              {docMessages.map((m) => (
+                <div key={m.id} className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}>
+                  <div
+                    className={`max-w-[90%] rounded-2xl px-4 py-3 text-sm leading-relaxed ${
+                      m.role === "user" ? "bg-[var(--accent)] text-white whitespace-pre-wrap" : "bg-[var(--bg-primary)] border border-[var(--border-color)]"
+                    }`}
+                  >
+                    {m.role === "assistant" ? <Markdown text={m.content} /> : m.content}
+                    {m.citations && m.citations.length > 0 && (
+                      <div className="mt-3 pt-2 border-t border-[var(--border-color)] flex flex-wrap gap-1.5">
+                        {m.citations.map((c) => (
+                          <span key={c.n} className="text-[11px] px-2 py-0.5 rounded-md bg-[var(--bg-surface-elevated)] border border-[var(--border-color)]">
+                            <span className="font-semibold text-[var(--accent)]">[{c.n}]</span> {c.title.slice(0, 40)}
+                            {c.title.length > 40 ? "…" : ""}, p. {c.page}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+              {docAsking && <p className="text-xs text-[var(--text-muted)]">Reading the matching pages...</p>}
+              {docChatError && <p className="text-xs text-red-600">{docChatError}</p>}
+            </div>
+            <form onSubmit={askDocuments} className="p-3 border-t border-[var(--border-color)] flex gap-2 shrink-0">
+              <input
+                value={docQuestion}
+                onChange={(e) => setDocQuestion(e.target.value)}
+                placeholder="Ask about these documents..."
+                maxLength={2000}
+                className="flex-1 min-w-0 px-3 py-2 rounded-lg border border-[var(--border-color)] bg-[var(--bg-primary)] text-sm text-[var(--text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--accent)]"
+                aria-label="Question about the documents"
+              />
+              <button
+                type="submit"
+                disabled={docAsking || !docQuestion.trim()}
+                className="px-3 py-2 rounded-lg bg-[var(--accent)] hover:bg-[var(--accent-hover)] disabled:opacity-50 text-white text-xs font-semibold flex items-center gap-1"
+              >
+                <Send className="w-3.5 h-3.5" /> Ask
+              </button>
+            </form>
+          </ModalPanel>
+        </ModalShell>
+      )}
+      </AnimatePresence>
+
+      {/* ======================================================== */}
+      {/* 2y. CITATION MAP (Phase 8) */}
+      {/* ======================================================== */}
+      <AnimatePresence>
+      {graphPaper && (
+        <ModalShell
+          key="graph"
+          className="fixed inset-0 z-[65] flex items-stretch sm:items-center justify-center bg-black/50 backdrop-blur-xs p-0 sm:p-4"
+          onClick={() => setGraphPaper(null)}
+        >
+          <ModalPanel
+            role="dialog"
+            aria-modal="true"
+            aria-label="Citation map"
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-6xl h-full sm:h-[88vh] bg-[var(--bg-surface)] border border-[var(--border-color)] sm:rounded-2xl shadow-2xl flex flex-col overflow-hidden"
+          >
+            <div className="p-3 sm:p-4 border-b border-[var(--border-color)] flex items-start gap-2 shrink-0">
+              <Network className="w-5 h-5 text-[var(--accent)] shrink-0 mt-0.5" />
+              <div className="min-w-0 mr-auto">
+                <h3 className="font-serif-heading text-base font-bold text-[var(--text-primary)]">Citation map</h3>
+                <div className="text-[11px] text-[var(--text-muted)] truncate">{graphPaper.title}</div>
+              </div>
+              <button
+                onClick={() => setGraphPaper(null)}
+                aria-label="Close"
+                className="p-1.5 rounded-lg hover:bg-[var(--bg-surface-elevated)] text-[var(--text-secondary)]"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-3 sm:p-5">
+              {!graphData && !graphError && <p className="text-sm text-[var(--text-secondary)]">Loading citations from OpenAlex...</p>}
+              {graphError && <p className="text-sm text-red-600">{graphError}</p>}
+              {graphData && (() => {
+                const refs = graphData.nodes.filter((n) => n.kind === "reference");
+                const citing = graphData.nodes.filter((n) => n.kind === "citing");
+                const W = 1000;
+                const rowH = 34;
+                const H = Math.max(refs.length, citing.length, 3) * rowH + 40;
+                const radius = (n: GraphNode) => 4 + Math.min(10, Math.log10((n.cited_by_count || 0) + 1) * 3);
+                const label = (t: string) => (t.length > 46 ? `${t.slice(0, 45)}…` : t);
+                const y = (i: number, count: number) => 20 + (H - 40) * ((i + 0.5) / Math.max(count, 1));
+                const column = (title: string, list: GraphNode[], total: number, empty: string) => (
+                  <div className="min-w-0">
+                    <div className="text-xs font-semibold text-[var(--text-secondary)] mb-2">
+                      {title} ({list.length}
+                      {total > list.length ? ` of ${total.toLocaleString()}` : ""})
+                    </div>
+                    {list.length === 0 && <p className="text-xs text-[var(--text-muted)]">{empty}</p>}
+                    <ul className="space-y-1.5">
+                      {list.map((n) => (
+                        <li key={n.id}>
+                          <button
+                            onClick={() => exploreGraphNode(n)}
+                            disabled={!n.doi}
+                            className="w-full text-left text-xs p-2 rounded-lg border border-[var(--border-color)] hover:bg-[var(--bg-surface-elevated)] disabled:opacity-70 disabled:cursor-default"
+                            title={n.doi ? "Search for this paper" : "No DOI"}
+                          >
+                            <span className="font-medium text-[var(--text-primary)]">{n.title}</span>
+                            <span className="block text-[10px] text-[var(--text-muted)]">
+                              {n.year || "n.d."}
+                              {typeof n.cited_by_count === "number" ? ` · ${n.cited_by_count.toLocaleString()} citations` : ""}
+                            </span>
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                );
+                return (
+                  <div className="space-y-5">
+                    <svg viewBox={`0 0 ${W} ${H}`} className="hidden md:block w-full h-auto" role="img"
+                      aria-label={`${refs.length} papers this paper cites on the left, ${citing.length} papers citing it on the right`}>
+                      {refs.map((n, i) => (
+                        <line key={`l-${n.id}`} x1={300} y1={y(i, refs.length)} x2={W / 2} y2={H / 2} stroke="var(--border-color)" />
+                      ))}
+                      {citing.map((n, i) => (
+                        <line key={`r-${n.id}`} x1={W - 300} y1={y(i, citing.length)} x2={W / 2} y2={H / 2} stroke="var(--border-color)" />
+                      ))}
+                      {refs.map((n, i) => (
+                        <g key={n.id} className="cursor-pointer" onClick={() => exploreGraphNode(n)}>
+                          <title>{`${n.title} (${n.year || "n.d."})`}</title>
+                          <circle cx={300} cy={y(i, refs.length)} r={radius(n)} fill="#64748b" />
+                          <text x={288 - radius(n)} y={y(i, refs.length) + 4} textAnchor="end" fontSize="11" fill="var(--text-secondary)">
+                            {label(n.title)}
+                          </text>
+                        </g>
+                      ))}
+                      {citing.map((n, i) => (
+                        <g key={n.id} className="cursor-pointer" onClick={() => exploreGraphNode(n)}>
+                          <title>{`${n.title} (${n.year || "n.d."})`}</title>
+                          <circle cx={W - 300} cy={y(i, citing.length)} r={radius(n)} fill="#059669" />
+                          <text x={W - 288 + radius(n)} y={y(i, citing.length) + 4} fontSize="11" fill="var(--text-secondary)">
+                            {label(n.title)}
+                          </text>
+                        </g>
+                      ))}
+                      <circle cx={W / 2} cy={H / 2} r={16} fill="var(--accent)" />
+                      <text x={W / 2} y={H / 2 + 34} textAnchor="middle" fontSize="12" fontWeight="bold" fill="var(--text-primary)">
+                        This paper{graphData.seed.year ? ` (${graphData.seed.year})` : ""}
+                      </text>
+                      <text x={300} y={14} textAnchor="middle" fontSize="11" fill="var(--text-muted)">It cites ←</text>
+                      <text x={W - 300} y={14} textAnchor="middle" fontSize="11" fill="var(--text-muted)">→ Cited by</text>
+                    </svg>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      {column("This paper cites", refs, graphData.reference_total, "No references listed in OpenAlex.")}
+                      {column("Cited by (most cited first)", citing, graphData.citing_total, "No citing papers found yet.")}
+                    </div>
+                    <p className="text-[11px] text-[var(--text-muted)]">
+                      From OpenAlex. Dot size follows citation count. Choose a paper to search for it.
+                    </p>
+                  </div>
+                );
+              })()}
+            </div>
+          </ModalPanel>
+        </ModalShell>
+      )}
+      </AnimatePresence>
 
       {/* ======================================================== */}
       {/* 2a0. CITE DIALOG (Phase 7) */}

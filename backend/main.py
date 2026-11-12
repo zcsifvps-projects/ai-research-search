@@ -639,6 +639,8 @@ class RateLimiterMiddleware(BaseHTTPMiddleware):
             "/auth/": (30, 60),
             "/bookmarks": (60, 60),
             "/collections": (60, 60),
+            "/documents": (20, 60),
+            "/graph": (30, 60),
             "/threads": (60, 60),
             "/share/": (60, 60),
             "default": (150, 60),
@@ -691,7 +693,9 @@ class RequestGuardMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         length = request.headers.get("content-length")
-        if length and length.isdigit() and int(length) > MAX_BODY_BYTES:
+        # PDF uploads have their own, larger limit (checked again while reading the body).
+        limit = MAX_UPLOAD_BYTES if request.method == "POST" and request.url.path.rstrip("/") == "/documents" else MAX_BODY_BYTES
+        if length and length.isdigit() and int(length) > limit:
             return JSONResponse(status_code=413, content={"detail": "Request body too large."})
         response = await call_next(request)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -874,7 +878,7 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_headers=["Content-Type", "Authorization", "X-Filename"],
 )
 
 
@@ -5128,6 +5132,14 @@ def admin_overview(request: Request, authorization: str | None = Header(None)):
         "runs_today": counter_get(f"deep:g:{day}"), "daily_cap": DEEP_DAILY_LIMIT_GLOBAL,
         "guest_cap": DEEP_DAILY_LIMIT_GUEST, "user_cap": DEEP_DAILY_LIMIT_USER,
     }
+    db = SessionLocal()
+    try:
+        from sqlalchemy import func
+
+        count, chars = db.query(func.count(UploadedDocument.id), func.coalesce(func.sum(UploadedDocument.chars), 0)).one()
+        data["uploads"] = {"documents": int(count or 0), "text_mb": round(int(chars or 0) / 1_000_000, 2)}
+    finally:
+        db.close()
     data["counters_shared"] = redis_client is not None
     return data
 
@@ -5744,3 +5756,478 @@ def open_shared_thread(token: str, response: Response):
                 "updated_at": t.updated_at.isoformat() if t.updated_at else None}
     finally:
         db.close()
+
+
+# ============================================================
+# PDF UPLOADS AND FULL-TEXT CHAT (Phase 8)
+#
+# Only the extracted TEXT is kept: the PDF is read in memory and thrown away, never written to disk.
+# Text is split into ~1,200 character sections with page numbers. Questions are answered from the best-matching
+# sections (keyword ranking, optionally re-ranked by the local embedding model). Verified accounts only.
+# PDFs are processed one at a time with page and size limits, to keep memory use low on a shared server.
+# Scanned PDFs (pictures of pages, no text inside) are refused with a clear message instead of running OCR.
+# ============================================================
+
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "20"))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+MAX_DOCUMENTS_PER_USER = int(os.getenv("MAX_DOCUMENTS_PER_USER", "50"))
+MAX_UPLOADS_PER_DAY = int(os.getenv("MAX_UPLOADS_PER_DAY", "20"))
+MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "300"))
+MAX_DOCUMENT_CHARS = 1_000_000
+CHUNK_CHARS = 1200
+MIN_WORDS_PER_PAGE = 25   # below this on average the PDF is treated as scanned
+_PDF_SEMAPHORE = asyncio.Semaphore(1)
+
+
+class UploadedDocument(Base):
+    __tablename__ = "uploaded_documents"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    title = Column(String(300), nullable=False)
+    filename = Column(String(255), nullable=True)
+    pages = Column(Integer, nullable=False, default=0)
+    words = Column(Integer, nullable=False, default=0)
+    chars = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+
+
+class DocumentChunk(Base):
+    __tablename__ = "document_chunks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    document_id = Column(Integer, nullable=False, index=True)
+    seq = Column(Integer, nullable=False)
+    page = Column(Integer, nullable=False)
+    text = Column(Text, nullable=False)
+
+
+try:
+    Base.metadata.create_all(bind=engine, tables=[UploadedDocument.__table__, DocumentChunk.__table__])
+except Exception as _phase8_tables_error:
+    print("Phase 8 tables note:", _phase8_tables_error)
+
+
+class PdfRejected(Exception):
+    """A user-facing reason the PDF cannot be used."""
+
+
+_HYPHEN_BREAK = re.compile(r"(\w)-\n(\w)")
+
+
+def _clean_page_text(raw: str) -> str:
+    text = (raw or "").replace("\x00", " ")
+    text = _HYPHEN_BREAK.sub(r"\1\2", text)          # re-join words split across lines
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def extract_pdf(data: bytes) -> dict:
+    """Read a PDF in memory. Returns title, pages (list of (page number, text)), words and chars.
+    Raises PdfRejected with a plain reason when the file cannot be used."""
+    import io
+
+    from pypdf import PdfReader
+    from pypdf.errors import PdfReadError
+
+    if not data.startswith(b"%PDF-"):
+        raise PdfRejected("This file is not a PDF.")
+    try:
+        reader = PdfReader(io.BytesIO(data), strict=False)
+        if reader.is_encrypted:
+            try:
+                if not reader.decrypt(""):
+                    raise PdfRejected("This PDF is password protected. Remove the password and upload it again.")
+            except PdfRejected:
+                raise
+            except Exception:
+                raise PdfRejected("This PDF is password protected. Remove the password and upload it again.")
+        total = len(reader.pages)
+    except PdfRejected:
+        raise
+    except (PdfReadError, Exception):
+        raise PdfRejected("This PDF could not be read. It may be damaged.")
+    if total == 0:
+        raise PdfRejected("This PDF has no pages.")
+    if total > MAX_PDF_PAGES:
+        raise PdfRejected(f"This PDF has {total} pages. The limit is {MAX_PDF_PAGES}.")
+
+    pages, chars = [], 0
+    for number, page in enumerate(reader.pages, start=1):
+        try:
+            text = _clean_page_text(page.extract_text() or "")
+        except Exception:
+            text = ""
+        if text:
+            room = MAX_DOCUMENT_CHARS - chars
+            if room <= 0:
+                break
+            text = text[:room]
+            pages.append((number, text))
+            chars += len(text)
+
+    words = sum(len(t.split()) for _, t in pages)
+    if words / total < MIN_WORDS_PER_PAGE:
+        raise PdfRejected("This looks like a scanned PDF (pictures of pages), so there is no text to read yet.")
+
+    title = ""
+    try:
+        meta_title = (reader.metadata or {}).get("/Title")
+        if isinstance(meta_title, str) and 8 <= len(meta_title.strip()) <= 300 and not meta_title.lower().endswith((".doc", ".docx", ".pdf", ".tex")):
+            title = meta_title.strip()
+    except Exception:
+        pass
+    if not title and pages:
+        first_line = next((line.strip() for line in pages[0][1].split("\n") if len(line.strip()) >= 12), "")
+        title = first_line[:200]
+    return {"title": title, "pages": pages, "page_count": total, "words": words, "chars": chars}
+
+
+def chunk_pages(pages: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    """Split page text into ~CHUNK_CHARS sections at paragraph or sentence breaks, keeping the page number."""
+    chunks = []
+    for number, text in pages:
+        buffer = ""
+        for part in re.split(r"(?<=[.!?])\s+|\n\n", text):
+            part = part.strip()
+            if not part:
+                continue
+            if buffer and len(buffer) + len(part) + 1 > CHUNK_CHARS:
+                chunks.append((number, buffer))
+                buffer = ""
+            while len(part) > CHUNK_CHARS:            # a very long sentence or table row
+                chunks.append((number, part[:CHUNK_CHARS]))
+                part = part[CHUNK_CHARS:]
+            buffer = f"{buffer} {part}".strip()
+        if buffer:
+            chunks.append((number, buffer))
+    return chunks
+
+
+_WORD = re.compile(r"[a-z0-9]+")
+_STOP = set("the a an and or of to in on for with by from is are was were be been this that these those it its as at "
+            "what which who how why does do did can could should would about into than then there their they we our "
+            "you your i me my not no yes".split())
+
+
+def _terms(text: str) -> list[str]:
+    return [w for w in _WORD.findall((text or "").lower()) if w not in _STOP and len(w) > 1]
+
+
+def rank_chunks(question: str, chunks: list[dict], top: int = 8) -> list[dict]:
+    """BM25 keyword ranking over the selected documents' sections. Falls back to the first sections when the
+    question shares no words with the text (for "summarise this paper" style questions)."""
+    q = list(dict.fromkeys(_terms(question)))
+    if not chunks:
+        return []
+    docs = [_terms(c["text"]) for c in chunks]
+    n = len(docs)
+    avg = sum(len(d) for d in docs) / n or 1.0
+    df = {t: sum(1 for d in docs if t in d) for t in q}
+    scored = []
+    for chunk, words in zip(chunks, docs):
+        counts = {}
+        for w in words:
+            if w in df:
+                counts[w] = counts.get(w, 0) + 1
+        score = 0.0
+        for t in q:
+            tf = counts.get(t, 0)
+            if tf:
+                idf = math.log(1 + (n - df[t] + 0.5) / (df[t] + 0.5))
+                score += idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * len(words) / avg))
+        scored.append((score, chunk))
+    if not any(score > 0 for score, _ in scored):
+        return chunks[:top]
+    best = [c for score, c in sorted(scored, key=lambda x: x[0], reverse=True) if score > 0][: top * 3]
+    if embedding_model and len(best) > top:
+        try:
+            q_vec = list(embedding_model.embed([question]))[0]
+            vecs = list(embedding_model.embed([c["text"][:800] for c in best]))
+            best = [c for _, c in sorted(zip([compute_cosine_similarity(q_vec, v) for v in vecs], best),
+                                         key=lambda x: x[0], reverse=True)]
+        except Exception as error:
+            print("Section re-ranking note:", type(error).__name__)
+    return best[:top]
+
+
+def _document_row(d: "UploadedDocument") -> dict:
+    return {"id": d.id, "title": d.title, "filename": d.filename, "pages": d.pages, "words": d.words,
+            "created_at": d.created_at.isoformat() if d.created_at else None}
+
+
+@app.post("/documents", tags=["Library"], summary="Upload a PDF",
+          description=f"Send the PDF itself as the request body (`Content-Type: application/pdf`, at most {MAX_UPLOAD_MB} MB "
+                      f"and {MAX_PDF_PAGES} pages); an optional `X-Filename` header names it. Only the extracted text is "
+                      "kept; the file is discarded. Scanned PDFs (no text inside) and password-protected PDFs are refused. "
+                      f"At most {MAX_DOCUMENTS_PER_USER} documents per account and {MAX_UPLOADS_PER_DAY} uploads a day. "
+                      "Verified accounts only.",
+          responses={**_ok({"id": 1, "title": "Sleep and memory", "pages": 12, "words": 8400}),
+                     **_err(413, "File larger than the upload limit.", "This PDF is larger than 20 MB."),
+                     **_err(422, "Not a usable PDF (scanned, damaged, password protected, too many pages).",
+                            "This looks like a scanned PDF (pictures of pages), so there is no text to read yet."),
+                     **E_401, **E_403, **E_RATE})
+async def upload_document(request: Request, authorization: str | None = Header(None),
+                          x_filename: str | None = Header(default=None, max_length=255)):
+    uid = resolve_user_id(request, authorization, require_verified=True)
+    content_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if content_type not in ("application/pdf", "application/octet-stream"):
+        raise HTTPException(status_code=415, detail="Upload the PDF file itself (Content-Type: application/pdf).")
+    db = SessionLocal()
+    try:
+        if db.query(UploadedDocument).filter(UploadedDocument.user_id == uid).count() >= MAX_DOCUMENTS_PER_USER:
+            raise HTTPException(status_code=400, detail=f"You can keep up to {MAX_DOCUMENTS_PER_USER} documents. "
+                                                        "Delete some to upload more.")
+    finally:
+        db.close()
+    day = _utcnow().strftime("%Y%m%d")
+    if counter_get(f"upload:u:{uid}:{day}") >= MAX_UPLOADS_PER_DAY:
+        raise HTTPException(status_code=429, detail=f"You can upload up to {MAX_UPLOADS_PER_DAY} PDFs a day.")
+
+    data = bytearray()
+    async for piece in request.stream():
+        data.extend(piece)
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"This PDF is larger than {MAX_UPLOAD_MB} MB.")
+    if not data:
+        raise HTTPException(status_code=400, detail="The file is empty.")
+    counter_incr(f"upload:u:{uid}:{day}", _seconds_until_utc_midnight())
+
+    async with _PDF_SEMAPHORE:  # one PDF at a time keeps memory use predictable
+        try:
+            result = await asyncio.wait_for(asyncio.to_thread(extract_pdf, bytes(data)), timeout=90)
+        except PdfRejected as reason:
+            raise HTTPException(status_code=422, detail=str(reason))
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=422, detail="This PDF took too long to read. Try a smaller file.")
+        finally:
+            del data
+
+    filename = re.sub(r"[^\w .()-]", "", (x_filename or "")).strip()[:255] or None
+    title = re.sub(r"\s+", " ", result["title"] or (filename or "Untitled document").rsplit(".", 1)[0]).strip()[:300]
+    db = SessionLocal()
+    try:
+        document = UploadedDocument(user_id=uid, title=title or "Untitled document", filename=filename,
+                                    pages=result["page_count"], words=result["words"], chars=result["chars"])
+        db.add(document)
+        db.flush()
+        for seq, (page, text_part) in enumerate(chunk_pages(result["pages"])):
+            db.add(DocumentChunk(document_id=document.id, seq=seq, page=page, text=text_part))
+        db.commit()
+        db.refresh(document)
+        return _document_row(document)
+    finally:
+        db.close()
+
+
+@app.get("/documents", tags=["Library"], summary="List your uploaded documents",
+         description="Newest first, with page and word counts. Verified accounts only.",
+         responses={**_ok({"documents": [{"id": 1, "title": "Sleep and memory", "pages": 12, "words": 8400}],
+                           "limit": MAX_DOCUMENTS_PER_USER}), **E_401, **E_403})
+def list_documents(request: Request, authorization: str | None = Header(None)):
+    uid = resolve_user_id(request, authorization, require_verified=True)
+    db = SessionLocal()
+    try:
+        rows = db.query(UploadedDocument).filter(UploadedDocument.user_id == uid).order_by(UploadedDocument.id.desc()).all()
+        return {"documents": [_document_row(d) for d in rows], "limit": MAX_DOCUMENTS_PER_USER}
+    finally:
+        db.close()
+
+
+@app.get("/documents/{document_id}", tags=["Library"], summary="One uploaded document",
+         description="Details plus the start of the extracted text, so you can check it was read correctly. "
+                     "Someone else's document returns 404. Verified accounts only.",
+         responses={**_ok({"id": 1, "title": "Sleep and memory", "preview": "Abstract. We studied..."}), **E_401, **E_403})
+def get_document(document_id: int, request: Request, authorization: str | None = Header(None)):
+    uid = resolve_user_id(request, authorization, require_verified=True)
+    db = SessionLocal()
+    try:
+        d = db.query(UploadedDocument).filter(UploadedDocument.id == document_id, UploadedDocument.user_id == uid).first()
+        if not d:
+            raise HTTPException(status_code=404, detail="Document not found.")
+        first = (db.query(DocumentChunk).filter(DocumentChunk.document_id == d.id)
+                 .order_by(DocumentChunk.seq).limit(3).all())
+        return {**_document_row(d), "preview": " ".join(c.text for c in first)[:1500]}
+    finally:
+        db.close()
+
+
+@app.delete("/documents/{document_id}", tags=["Library"], summary="Delete an uploaded document",
+            description="Deletes the document and all its text at once. Verified accounts only.",
+            responses={**_ok({"message": "Document deleted."}), **E_401, **E_403})
+def delete_document(document_id: int, request: Request, authorization: str | None = Header(None)):
+    uid = resolve_user_id(request, authorization, require_verified=True)
+    db = SessionLocal()
+    try:
+        d = db.query(UploadedDocument).filter(UploadedDocument.id == document_id, UploadedDocument.user_id == uid).first()
+        if not d:
+            raise HTTPException(status_code=404, detail="Document not found.")
+        db.query(DocumentChunk).filter(DocumentChunk.document_id == d.id).delete(synchronize_session=False)
+        db.delete(d)
+        db.commit()
+        return {"message": "Document deleted."}
+    finally:
+        db.close()
+
+
+class DocumentAskRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=2000)
+    document_ids: list[int] = Field(min_length=1, max_length=5)
+    conversation_history: list[ConversationTurn] = Field(default_factory=list, max_length=20)
+
+
+DOCUMENT_ASK_PROMPT = (
+    "You answer questions about the user's uploaded documents using ONLY the numbered excerpts supplied. "
+    "Cite excerpts as [1], [2] matching their excerpt_id. If the excerpts do not contain the answer, say so plainly and "
+    "suggest what to ask instead; never invent content, numbers or references. Excerpts are partial: do not claim a "
+    "document says nothing about a topic unless the excerpts make that clear. Write the 'answer' in markdown. "
+    "Return a valid JSON object with 'answer' and 'citations' (list of excerpt_id integers)."
+)
+
+DOCUMENT_ASK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answer": {"type": "string"},
+        "citations": {"type": "array", "items": {"type": "integer"}},
+    },
+    "required": ["answer", "citations"],
+    "additionalProperties": False,
+}
+
+
+@app.post("/documents/ask", tags=["AI"], summary="Ask about your uploaded documents",
+          description="Answers from the full text of 1 to 5 of your uploaded documents. The best-matching sections (up to 8) "
+                      "are sent to the AI; the answer cites them as `[n]`, and `citations` gives each one's document and "
+                      "page. One AI call, counted toward the daily AI caps. Verified accounts only.",
+          responses={**_ok({"answer": "The trial found faster sleep onset [1].",
+                            "citations": [{"n": 1, "document_id": 1, "title": "Sleep and memory", "page": 4}]}),
+                     **E_401, **E_403, **E_RATE, **E_AI})
+async def ask_documents(body: DocumentAskRequest, request: Request, authorization: str | None = Header(None)):
+    uid = resolve_user_id(request, authorization, require_verified=True)
+    ids = list(dict.fromkeys(body.document_ids))
+    db = SessionLocal()
+    try:
+        docs = {d.id: d for d in db.query(UploadedDocument).filter(UploadedDocument.user_id == uid,
+                                                                   UploadedDocument.id.in_(ids)).all()}
+        if len(docs) != len(ids):
+            raise HTTPException(status_code=404, detail="Document not found.")
+        chunks = [{"document_id": c.document_id, "page": c.page, "text": c.text}
+                  for c in db.query(DocumentChunk).filter(DocumentChunk.document_id.in_(ids))
+                  .order_by(DocumentChunk.document_id, DocumentChunk.seq).all()]
+    finally:
+        db.close()
+    if not chunks:
+        raise HTTPException(status_code=400, detail="These documents have no readable text.")
+
+    selected = rank_chunks(body.question, chunks)
+    excerpts = [{"excerpt_id": i, "document": docs[c["document_id"]].title[:200], "page": c["page"], "text": c["text"]}
+                for i, c in enumerate(selected, start=1)]
+    history = [turn.model_dump() for turn in body.conversation_history[-2:]]
+    cache_key = "docask:" + hashlib.sha256(json.dumps(
+        [uid, body.question.strip().lower(), [(e["document"], e["page"], e["text"][:200]) for e in excerpts], history]
+    ).encode("utf-8")).hexdigest()
+    cached = get_from_search_cache(cache_key)
+    if cached is not None:
+        return cached
+
+    gemini_client, groq_client = get_ai_clients()
+    enforce_ai_quota(request, uid)
+    prefix = ""
+    if history:
+        prefix = "Previous conversation:\n" + "\n".join(f"Q: {t['question'][:150]}\nA: {t['answer'][:250]}" for t in history) + "\n\n"
+    user_prompt = f"{prefix}Question: {body.question}\n\nExcerpts:\n{json.dumps(excerpts, indent=2)}"
+    retry_prompt = (f"Question: {body.question}\n\nExcerpts:\n"
+                    + json.dumps([{**e, "text": e["text"][:500]} for e in excerpts[:4]]) + "\n\nKeep the answer short.")
+    try:
+        result = await asyncio.to_thread(generate_structured_ai, gemini_client, groq_client, DOCUMENT_ASK_PROMPT,
+                                         user_prompt, retry_prompt, DOCUMENT_ASK_SCHEMA, "answer")
+    except Exception as error:
+        print("Document question failed:", error)
+        raise HTTPException(status_code=502, detail=GENERIC_AI_ERROR)
+
+    by_id = {e["excerpt_id"]: e for e in excerpts}
+    cited, seen = [], set()
+    for n in result.get("citations") or []:
+        if isinstance(n, int) and not isinstance(n, bool) and n in by_id and n not in seen:
+            seen.add(n)
+            chunk = selected[n - 1]
+            cited.append({"n": n, "document_id": chunk["document_id"], "title": docs[chunk["document_id"]].title,
+                          "page": chunk["page"]})
+    response = {"answer": result["answer"].strip(), "citations": sorted(cited, key=lambda c: c["n"]),
+                "sections_used": len(excerpts)}
+    set_in_search_cache(cache_key, response, ttl=7200)
+    return response
+
+
+# ============================================================
+# CITATION MAP (Phase 8): what a paper cites and what cites it, from OpenAlex
+# ============================================================
+
+GRAPH_SIDE_LIMIT = 15
+
+
+def _graph_node(work: dict, kind: str) -> dict:
+    wid = str(work.get("id") or "").rstrip("/").rsplit("/", 1)[-1]
+    return {
+        "id": wid,
+        "title": (work.get("title") or work.get("display_name") or "Untitled")[:300],
+        "year": work.get("publication_year"),
+        "cited_by_count": work.get("cited_by_count") if isinstance(work.get("cited_by_count"), int) else None,
+        "doi": work.get("doi"),
+        "kind": kind,
+    }
+
+
+@app.get("/graph", tags=["Search"], summary="Citation map for a paper",
+         description=f"Give a `doi`. Returns the paper, up to {GRAPH_SIDE_LIMIT} papers it cites (`reference`) and up to "
+                     f"{GRAPH_SIDE_LIMIT} most-cited papers that cite it (`citing`), from OpenAlex. Cached for 24 hours. "
+                     "Open to guests.",
+         responses={**_ok({"seed": {"id": "W1", "title": "Paper", "kind": "seed"}, "nodes": [], "edges": [],
+                           "reference_total": 40, "citing_total": 120}),
+                    **_err(404, "Unknown DOI.", "This paper was not found in OpenAlex.")})
+async def citation_graph(doi: str = Query(..., max_length=255)):
+    from urllib.parse import quote
+
+    bare = normalize_doi(doi)
+    if not bare or not DOI_PATTERN.fullmatch(bare):
+        raise HTTPException(status_code=400, detail="That does not look like a valid DOI.")
+    cache_key = "graph:" + hashlib.sha256(bare.encode("utf-8")).hexdigest()
+    cached = get_from_search_cache(cache_key)
+    if cached is not None:
+        return cached
+    headers = {"User-Agent": f"{APP_UA_NAME}/1.0 (mailto:{CONTACT_EMAIL})"}
+    select = "id,title,display_name,publication_year,cited_by_count,doi,referenced_works"
+    async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
+        response = await client.get(f"https://api.openalex.org/works/doi:{quote(bare, safe='/()._-;:')}",
+                                    params={"select": select, "mailto": CONTACT_EMAIL})
+        if response.status_code == 404:
+            raise HTTPException(status_code=404, detail="This paper was not found in OpenAlex.")
+        if response.status_code != 200:
+            raise HTTPException(status_code=502, detail="The citation data could not be loaded. Please try again.")
+        seed_work = response.json()
+        seed = _graph_node(seed_work, "seed")
+        ref_ids = [str(r).rstrip("/").rsplit("/", 1)[-1] for r in (seed_work.get("referenced_works") or [])]
+        ref_ids = [r for r in ref_ids if re.fullmatch(r"W\d+", r)]
+
+        async def fetch(params):
+            try:
+                r = await client.get("https://api.openalex.org/works", params={**params, "select": select.replace(",referenced_works", ""),
+                                                                                "mailto": CONTACT_EMAIL})
+                return r.json() if r.status_code == 200 else {}
+            except Exception:
+                return {}
+
+        refs_data, citing_data = await asyncio.gather(
+            fetch({"filter": "openalex_id:" + "|".join(ref_ids[:50]), "per-page": 50}) if ref_ids else asyncio.sleep(0, result={}),
+            fetch({"filter": f"cites:{seed['id']}", "sort": "cited_by_count:desc", "per-page": GRAPH_SIDE_LIMIT}),
+        )
+    references = sorted((_graph_node(w, "reference") for w in refs_data.get("results") or []),
+                        key=lambda n: n["cited_by_count"] or 0, reverse=True)[:GRAPH_SIDE_LIMIT]
+    citing = [_graph_node(w, "citing") for w in (citing_data.get("results") or [])][:GRAPH_SIDE_LIMIT]
+    nodes = [seed] + references + citing
+    edges = [{"from": seed["id"], "to": n["id"]} for n in references] + [{"from": n["id"], "to": seed["id"]} for n in citing]
+    data = {"seed": seed, "nodes": nodes, "edges": edges, "reference_total": len(ref_ids),
+            "citing_total": (citing_data.get("meta") or {}).get("count", len(citing))}
+    set_in_search_cache(cache_key, data, ttl=86400)
+    return data

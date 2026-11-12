@@ -102,6 +102,9 @@ Shorter or guessable values are rejected with `422`, because the `session_id` is
 | `GET/POST /threads`, `GET/POST/DELETE /threads/{id}`, `POST /threads/{id}/rename` | verified | Saved conversations |
 | `POST /threads/{id}/share`, `POST /threads/{id}/unshare` | verified | Turn a read-only share link on or off |
 | `GET /share/{token}` | none | Open a shared conversation (read-only, nothing about the owner) |
+| `POST /documents`, `GET /documents`, `GET/DELETE /documents/{id}` | verified | Upload a PDF (text only is kept), list, preview, delete |
+| `POST /documents/ask` | verified | Ask about the full text of 1 to 5 uploaded documents |
+| `GET /graph?doi=` | none | Citation map: what a paper cites and what cites it |
 | `POST /auth/register` | none | Start sign-up; emails a link (never signs in, never reveals existing accounts) |
 | `POST /auth/login`, `/auth/logout` | none | Sign in; sign out (revokes this session) |
 | `POST /auth/logout-all` | signed in | Revoke every session |
@@ -187,6 +190,20 @@ Full request and response shapes, with examples for every status code, are in th
 - Share links use a 256-bit random token. `GET /share/{token}` returns only `title`, `turns`, `papers`, `shared_at` and `updated_at`,
   with `X-Robots-Tag: noindex`. Unsharing or deleting stops the link at once; sharing again makes a new link.
 - Someone else's folder or conversation always returns 404.
+
+### Uploaded PDFs and full-text chat
+
+- `POST /documents`: the request body is the PDF itself (`Content-Type: application/pdf`), with an optional `X-Filename` header.
+  Limits: `MAX_UPLOAD_MB` (20), `MAX_PDF_PAGES` (300), `MAX_DOCUMENTS_PER_USER` (50), `MAX_UPLOADS_PER_DAY` (20). The PDF is
+  read in memory and discarded; only its text is stored, in sections of about 1,200 characters with page numbers (at most
+  1,000,000 characters per document). One PDF is processed at a time.
+- Refused with 422 and a plain message: not a PDF, damaged, password protected, too many pages, or scanned (fewer than 25
+  words per page on average, meaning the pages are pictures).
+- `POST /documents/ask` body: `question`, `document_ids` (1 to 5 of yours), optional `conversation_history`. The best-matching
+  sections (keyword ranking, re-ranked by the local model when it is on; up to 8) go to the AI. Response: `answer` citing
+  `[n]`, `citations` (`n`, `document_id`, `title`, `page`), `sections_used`. One AI call, counted toward the daily caps.
+- `GET /graph?doi=`: from OpenAlex, the paper (`seed`), up to 15 papers it cites (most cited first) and the 15 most-cited
+  papers citing it, with `reference_total` and `citing_total`. Cached 24 hours.
 
 ### Admin
 

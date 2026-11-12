@@ -11,3 +11,5 @@ fastembed==0.9.0
 redis==8.1.0
 # Encrypts API keys saved in the admin panel (AES-256-GCM). Already installed with google-genai; pinned here.
 cryptography==50.0.2
+# Reads text from uploaded PDFs (pure Python, BSD licence). The PDF itself is never stored.
+pypdf==6.21.4

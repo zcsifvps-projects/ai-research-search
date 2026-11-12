@@ -45,6 +45,8 @@ The AI synthesis feature is deliberately constrained: only papers with abstracts
 |---|---|
 | Academic search | Federated search across OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed, Europe PMC, DOAJ, ERIC, OpenAIRE, and African Journals Online, free PDF links from Unpaywall, with study type, citation, preprint and field filters, sorting, and author, title and DOI search |
 | Citations | APA 7, MLA 9, Chicago, Harvard, Vancouver and BibTeX for any paper; RIS and BibTeX export of results, the library or a folder |
+| PDF uploads | Upload PDFs (text only is stored) and chat with their full text, with page-level citations |
+| Citation map | What a paper cites and what cites it, from OpenAlex |
 | Filtering | Publication-year range and confirmed open-access filtering |
 | AI question answering | Synthesize a concise response from retrieved paper abstracts |
 | Paper deep dive | Generate a structured analysis from a paper title and abstract |
