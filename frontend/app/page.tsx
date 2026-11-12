@@ -2,12 +2,25 @@
 
 import { APP_NAME } from "./brand";
 import { buildBibtex, doiUrl } from "./bibtex";
+import {
+  CITATION_STYLES,
+  buildBibtexFile,
+  buildRisFile,
+  citationHtml,
+  citationText,
+  downloadTextFile,
+  fileSlug,
+  formatCitation,
+  type CitablePaper,
+  type CitationStyle,
+} from "./citations";
 import { Markdown } from "./markdown";
 import { AnimatePresence, animate, motion, useMotionValue, useReducedMotion } from "motion/react";
 import { ModalPanel, ModalShell, SPRING, SlideUp, projectMomentum, useIsDesktop } from "./motion";
 import { buildCsv, downloadCsv } from "./csv";
 import type { ComparisonRow, Glance } from "./pdf";
 import {
+  Quote,
   Folder,
   FolderPlus,
   Link2,
@@ -370,7 +383,10 @@ export default function Home() {
     (excludePreprints ? 1 : 0) +
     (sortBy !== "relevance" ? 1 : 0) +
     (searchBy !== "topic" ? 1 : 0);
-  const [copiedBibtexIndex, setCopiedBibtexIndex] = useState<number | null>(null);
+  // Phase 7: the Cite dialog (formatted references, BibTeX, RIS)
+  const [citeTarget, setCiteTarget] = useState<Result | null>(null);
+  const [citeStyle, setCiteStyle] = useState<CitationStyle | "bibtex">("apa");
+  const [citeCopied, setCiteCopied] = useState(false);
   const [copiedAnswerId, setCopiedAnswerId] = useState<string | null>(null);
 
   // Deep dive states
@@ -1830,10 +1846,49 @@ export default function Home() {
     }
   }
 
-  function handleCopyBibtex(index: number, paper: Result) {
-    navigator.clipboard.writeText(buildBibtex(paper));
-    setCopiedBibtexIndex(index);
-    setTimeout(() => setCopiedBibtexIndex(null), 2500);
+  // ------------------------------------------------------------
+  // Citations: copy one reference, or download RIS / BibTeX files
+  // ------------------------------------------------------------
+
+  async function copyCitation(paper: Result, style: CitationStyle | "bibtex") {
+    const plain = style === "bibtex" ? buildBibtex(paper) : citationText(paper, style);
+    try {
+      // Rich text keeps the journal name in italics when pasted into Word or Google Docs.
+      if (style !== "bibtex" && typeof ClipboardItem !== "undefined" && navigator.clipboard.write) {
+        await navigator.clipboard.write([
+          new ClipboardItem({
+            "text/plain": new Blob([plain], { type: "text/plain" }),
+            "text/html": new Blob([citationHtml(paper, style)], { type: "text/html" }),
+          }),
+        ]);
+      } else {
+        await navigator.clipboard.writeText(plain);
+      }
+      setCiteCopied(true);
+      setTimeout(() => setCiteCopied(false), 2000);
+    } catch {
+      window.prompt("Copy this reference:", plain);
+    }
+  }
+
+  function exportReferences(papers: CitablePaper[], format: "ris" | "bibtex", name: string) {
+    if (papers.length === 0) return;
+    if (format === "ris") {
+      downloadTextFile(`${fileSlug(name, "references")}.ris`, buildRisFile(papers), "application/x-research-info-systems");
+    } else {
+      downloadTextFile(`${fileSlug(name, "references")}.bib`, buildBibtexFile(papers), "application/x-bibtex");
+    }
+  }
+
+  function bookmarkAsPaper(b: BookmarkItem): CitablePaper {
+    return {
+      title: b.title,
+      authors: b.authors || [],
+      description: b.source || "",
+      publication_year: b.publication_year,
+      doi: b.doi,
+      abstract: b.abstract,
+    };
   }
 
   function handleCopyAnswer(message: Message) {
@@ -2510,6 +2565,37 @@ export default function Home() {
                       </button>
                     </div>
                   ))
+                )}
+                {user && visibleBookmarks.length > 0 && (
+                  <div className="px-2 pt-2 flex flex-wrap items-center gap-2 text-[11px] text-[var(--text-muted)]">
+                    <span>Export {activeCollection === null ? "library" : "folder"}:</span>
+                    <button
+                      onClick={() =>
+                        exportReferences(
+                          visibleBookmarks.map(bookmarkAsPaper),
+                          "ris",
+                          collections.find((c) => c.id === activeCollection)?.name || "library",
+                        )
+                      }
+                      className="hover:text-[var(--accent)] underline-offset-2 hover:underline"
+                      title="For Zotero, Mendeley and EndNote"
+                    >
+                      RIS
+                    </button>
+                    <button
+                      onClick={() =>
+                        exportReferences(
+                          visibleBookmarks.map(bookmarkAsPaper),
+                          "bibtex",
+                          collections.find((c) => c.id === activeCollection)?.name || "library",
+                        )
+                      }
+                      className="hover:text-[var(--accent)] underline-offset-2 hover:underline"
+                      title="For LaTeX"
+                    >
+                      BibTeX
+                    </button>
+                  </div>
                 )}
               </div>
             )}
@@ -3387,25 +3473,15 @@ export default function Home() {
                             </button>
 
                             <button
-                              onClick={() =>
-                                handleCopyBibtex(
-                                  selectedPaperForDetail.index,
-                                  selectedPaperForDetail.paper
-                                )
-                              }
+                              onClick={() => {
+                                setCiteCopied(false);
+                                setCiteTarget(selectedPaperForDetail.paper);
+                              }}
                               className="flex items-center gap-1.5 px-3 py-2 bg-[var(--bg-surface-elevated)] hover:bg-[var(--border-color)] text-[var(--text-primary)] text-xs font-medium rounded-lg border border-[var(--border-color)] transition"
+                              title="APA, MLA, Chicago, Harvard, Vancouver, BibTeX or RIS"
                             >
-                              {copiedBibtexIndex === selectedPaperForDetail.index ? (
-                                <>
-                                  <Check className="w-3.5 h-3.5 text-emerald-600" />
-                                  <span className="text-emerald-600">Copied BibTeX</span>
-                                </>
-                              ) : (
-                                <>
-                                  <Copy className="w-3.5 h-3.5" />
-                                  <span>Copy BibTeX</span>
-                                </>
-                              )}
+                              <Quote className="w-3.5 h-3.5" />
+                              <span>Cite</span>
                             </button>
 
                             <button
@@ -3774,6 +3850,94 @@ export default function Home() {
       </main>
 
       {/* ======================================================== */}
+      {/* 2a0. CITE DIALOG (Phase 7) */}
+      {/* ======================================================== */}
+      <AnimatePresence>
+      {citeTarget && (
+        <ModalShell
+          key="citeTarget"
+          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 backdrop-blur-xs p-4"
+          onClick={() => setCiteTarget(null)}
+        >
+          <ModalPanel
+            role="dialog"
+            aria-modal="true"
+            aria-label="Cite this paper"
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-lg bg-[var(--bg-surface)] border border-[var(--border-color)] rounded-2xl shadow-2xl p-5 space-y-4"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="font-serif-heading text-base font-bold text-[var(--text-primary)] flex items-center gap-2">
+                <Quote className="w-5 h-5 text-[var(--accent)]" /> Cite this paper
+              </h3>
+              <button
+                onClick={() => setCiteTarget(null)}
+                aria-label="Close"
+                className="p-1 rounded-lg hover:bg-[var(--bg-surface-elevated)] text-[var(--text-secondary)]"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div role="tablist" aria-label="Citation style" className="flex flex-wrap gap-1.5">
+              {[...CITATION_STYLES, { id: "bibtex" as const, label: "BibTeX" }].map((style) => (
+                <button
+                  key={style.id}
+                  role="tab"
+                  aria-selected={citeStyle === style.id}
+                  onClick={() => {
+                    setCiteStyle(style.id);
+                    setCiteCopied(false);
+                  }}
+                  className={`px-2.5 py-1 rounded-full border text-xs transition ${
+                    citeStyle === style.id
+                      ? "bg-[var(--accent)] text-white border-[var(--accent)]"
+                      : "border-[var(--border-color)] text-[var(--text-secondary)] hover:bg-[var(--bg-surface-elevated)]"
+                  }`}
+                >
+                  {style.label}
+                </button>
+              ))}
+            </div>
+            <div className="p-3 rounded-xl bg-[var(--bg-primary)] border border-[var(--border-color)] text-sm text-[var(--text-primary)] leading-relaxed break-words select-all">
+              {citeStyle === "bibtex" ? (
+                <pre className="text-xs whitespace-pre-wrap font-mono">{buildBibtex(citeTarget)}</pre>
+              ) : (
+                formatCitation(citeTarget, citeStyle).map((segment, i) =>
+                  segment.italic ? <i key={i}>{segment.text}</i> : <span key={i}>{segment.text}</span>,
+                )
+              )}
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button
+                onClick={() => copyCitation(citeTarget, citeStyle)}
+                className="px-3 py-2 rounded-lg bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-xs font-semibold flex items-center gap-1.5"
+              >
+                {citeCopied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                {citeCopied ? "Copied" : "Copy"}
+              </button>
+              <button
+                onClick={() => exportReferences([citeTarget], "ris", citeTarget.title)}
+                className="px-3 py-2 rounded-lg border border-[var(--border-color)] hover:bg-[var(--bg-surface-elevated)] text-xs font-medium text-[var(--text-secondary)] flex items-center gap-1.5"
+                title="Opens in Zotero, Mendeley and EndNote"
+              >
+                <Download className="w-3.5 h-3.5" /> RIS file
+              </button>
+              <button
+                onClick={() => exportReferences([citeTarget], "bibtex", citeTarget.title)}
+                className="px-3 py-2 rounded-lg border border-[var(--border-color)] hover:bg-[var(--bg-surface-elevated)] text-xs font-medium text-[var(--text-secondary)] flex items-center gap-1.5"
+              >
+                <Download className="w-3.5 h-3.5" /> BibTeX file
+              </button>
+            </div>
+            <p className="text-[11px] text-[var(--text-muted)]">
+              Volume, issue and page numbers are not available from the search sources, so check them before submitting.
+            </p>
+          </ModalPanel>
+        </ModalShell>
+      )}
+      </AnimatePresence>
+
+      {/* ======================================================== */}
       {/* 2a. SHARE DIALOG (Phase 6) */}
       {/* ======================================================== */}
       <AnimatePresence>
@@ -3905,6 +4069,24 @@ export default function Home() {
                 <Download className="w-3.5 h-3.5" />
                 <span>Export CSV</span>
               </button>
+              {(["ris", "bibtex"] as const).map((format) => {
+                const chosen = selectedForCompare.length > 0 ? selectedForCompare.map((id) => results[id - 1]) : sortedTableRows.map((r) => r.paper);
+                return (
+                  <button
+                    key={format}
+                    type="button"
+                    onClick={() => exportReferences(chosen, format, query || "papers")}
+                    className="px-2.5 py-1.5 rounded-lg border border-[var(--border-color)] hover:bg-[var(--bg-surface-elevated)] text-xs font-medium text-[var(--text-secondary)] flex items-center gap-1 transition"
+                    title={`${selectedForCompare.length > 0 ? "Ticked papers" : "All papers"} as ${format === "ris" ? "RIS (Zotero, Mendeley, EndNote)" : "BibTeX (LaTeX)"}`}
+                  >
+                    <Quote className="w-3.5 h-3.5" />
+                    <span>
+                      {format === "ris" ? "RIS" : "BibTeX"}
+                      {selectedForCompare.length > 0 ? ` (${selectedForCompare.length})` : ""}
+                    </span>
+                  </button>
+                );
+              })}
               <button
                 type="button"
                 onClick={() => setTableOpen(false)}
