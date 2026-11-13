@@ -4972,7 +4972,7 @@ export default function Home() {
                     Delete Account Permanently
                   </div>
                   <p className="text-[var(--text-secondary)] leading-relaxed">
-                    Deleting your account will permanently delete your profile, saved library bookmarks, and all associated search history. This action cannot be undone.
+                    Deleting your account permanently removes your profile, search history, saved papers, folders, saved conversations (their share links stop working) and uploaded documents. This cannot be undone.
                   </p>
                   <button
                     onClick={() => setDeleteAccountModalOpen(true)}
@@ -5061,41 +5061,78 @@ export default function Home() {
             <div className="p-6 flex-1 overflow-y-auto space-y-4 text-xs text-[var(--text-secondary)] leading-relaxed">
               {activePolicyModal === "privacy" && (
                 <>
-                  <p className="font-semibold text-[var(--text-primary)]">Last updated: September 2026</p>
+                  <p className="font-semibold text-[var(--text-primary)]">Last updated: November 2026</p>
                   <p>
-                    {APP_NAME} is committed to protecting your academic research privacy. We process query metadata strictly to provide federated academic search, citation generation, and synthesized literature insights.
+                    {APP_NAME} helps you search academic literature and understand it with AI. This notice explains what we
+                    store, who else receives data to make the service work, and how long we keep it.
                   </p>
-                  <h4 className="font-bold text-[var(--text-primary)]">Data Collection & Use</h4>
+                  <h4 className="font-bold text-[var(--text-primary)]">What we store</h4>
+                  <ul className="list-disc pl-5 space-y-1">
+                    <li><span className="font-semibold">Your account:</span> email, optional name, a hashed password (never the password itself) and when you last signed in.</li>
+                    <li><span className="font-semibold">Your research:</span> questions, AI answers and the papers found, so you can see your history. Without an account this is linked to a random ID in your browser.</li>
+                    <li><span className="font-semibold">What you save:</span> saved papers, folders and saved conversations.</li>
+                    <li><span className="font-semibold">Uploaded PDFs:</span> we read the file, keep only its text, and discard the file itself straight away. Please do not upload documents containing other people&apos;s personal information.</li>
+                    <li><span className="font-semibold">Share links:</span> a conversation you share can be read by anyone who has the link. It never shows your name or email, and you can switch the link off at any time.</li>
+                  </ul>
+                  <h4 className="font-bold text-[var(--text-primary)]">Who else receives data</h4>
+                  <ul className="list-disc pl-5 space-y-1">
+                    <li><span className="font-semibold">AI providers:</span> to write answers, your question and the paper abstracts (or, when you chat with your documents, the matching parts of their text) are sent to Google Gemini, or to Groq if Gemini is unavailable.</li>
+                    <li><span className="font-semibold">Academic databases:</span> your search terms are sent to OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed, Europe PMC, DOAJ, ERIC and OpenAIRE (African Journals Online is searched through OpenAlex). Paper DOIs are sent to Unpaywall to find free PDF copies.</li>
+                    <li>We do not sell your data and do not use advertising or tracking services.</li>
+                  </ul>
+                  <h4 className="font-bold text-[var(--text-primary)]">How long we keep it</h4>
+                  <ul className="list-disc pl-5 space-y-1">
+                    <li>History without an account is deleted automatically after 90 days.</li>
+                    <li>Your account&apos;s history and saved items stay until you delete them.</li>
+                    <li>Deleting your account (Account Settings) removes everything it owns: history, saved papers, folders, saved conversations (their share links stop working) and uploaded documents.</li>
+                    <li>Database backups are kept for 14 days, then deleted.</li>
+                  </ul>
+                  <h4 className="font-bold text-[var(--text-primary)]">Security</h4>
                   <p>
-                    When you sign up, we securely store your email and hashed password. We do not sell your personal data or search queries to third-party advertisers.
-                  </p>
-                  <h4 className="font-bold text-[var(--text-primary)]">Third-Party Academic APIs</h4>
-                  <p>
-                    Queries are dispatched to public academic APIs (OpenAlex, Semantic Scholar, arXiv, Crossref, CORE, PubMed, Europe PMC, DOAJ, ERIC, OpenAIRE, and African Journals Online, plus Unpaywall for free PDF links) to retrieve research metadata.
+                    Connections use HTTPS, passwords are hashed, sessions can be ended on every device, and API keys are stored
+                    encrypted. No system is perfectly secure, so use a password you do not use anywhere else.
                   </p>
                 </>
               )}
 
               {activePolicyModal === "terms" && (
                 <>
-                  <p className="font-semibold text-[var(--text-primary)]">Last updated: September 2026</p>
+                  <p className="font-semibold text-[var(--text-primary)]">Last updated: November 2026</p>
                   <p>
-                    By using {APP_NAME}, you agree to comply with standard academic integrity and acceptable use guidelines.
+                    By using {APP_NAME}, you agree to these terms and to follow academic integrity and acceptable use guidelines.
                   </p>
-                  <h4 className="font-bold text-[var(--text-primary)]">Academic Synthesis Disclaimer</h4>
+                  <h4 className="font-bold text-[var(--text-primary)]">AI answers can be wrong</h4>
                   <p>
-                    AI-synthesized research summaries and citations are generated for academic acceleration and exploratory discovery. Users are advised to review original publication DOIs before formal publication.
+                    Summaries, takeaways, comparisons, evidence meters and citations are written by AI from abstracts or from the
+                    text you upload. They can be incomplete or wrong. Check the original papers before relying on them or citing
+                    them. Answers about health are research summaries, not medical advice.
+                  </p>
+                  <h4 className="font-bold text-[var(--text-primary)]">Your uploads and shares</h4>
+                  <p>
+                    Only upload documents you have the right to use, and do not upload other people&apos;s personal information.
+                    You are responsible for what you share through share links.
+                  </p>
+                  <h4 className="font-bold text-[var(--text-primary)]">Fair use</h4>
+                  <p>
+                    Daily limits keep the service available to everyone. Do not try to get around them, overload the service, or
+                    access other people&apos;s accounts or data. We may suspend accounts that break these terms.
+                  </p>
+                  <h4 className="font-bold text-[var(--text-primary)]">Availability</h4>
+                  <p>
+                    The service relies on outside databases and AI providers and is offered as is. Features may change, and we
+                    cannot guarantee it will always be available or error-free.
                   </p>
                 </>
               )}
 
               {activePolicyModal === "cookie_policy" && (
                 <>
-                  <p className="font-semibold text-[var(--text-primary)]">Last updated: September 2026</p>
+                  <p className="font-semibold text-[var(--text-primary)]">Last updated: November 2026</p>
                   <p>
                     <span className="font-semibold text-[var(--text-primary)]">Strictly necessary (always on).</span>{" "}
                     A secure, httpOnly, SameSite session cookie that keeps you signed in, plus a random anonymous session ID and a
-                    guest search counter stored in your browser so guest history and usage limits work.
+                    guest search counter stored in your browser so guest history and usage limits work. Administrators also get a
+                    short-lived admin session cookie while the admin area is unlocked.
                   </p>
                   <p>
                     <span className="font-semibold text-[var(--text-primary)]">Preferences (optional).</span>{" "}
@@ -5112,7 +5149,7 @@ export default function Home() {
                   <div className="flex items-center justify-between p-3 rounded-xl bg-[var(--bg-primary)] border border-[var(--border-color)]">
                     <div>
                       <div className="font-semibold text-[var(--text-primary)]">Strictly Necessary Cookies</div>
-                      <div className="text-[11px] text-[var(--text-muted)]">Essential httpOnly authentication and CSRF security tokens.</div>
+                      <div className="text-[11px] text-[var(--text-muted)]">The httpOnly sign-in cookie and the anonymous session ID.</div>
                     </div>
                     <span className="font-semibold text-[var(--accent)] text-xs">Always Active</span>
                   </div>

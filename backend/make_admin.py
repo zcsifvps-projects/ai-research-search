@@ -5,6 +5,7 @@
     scholarpulse-env/bin/python make_admin.py reset-code you@example.com
     scholarpulse-env/bin/python make_admin.py revoke you@example.com
     scholarpulse-env/bin/python make_admin.py list
+    scholarpulse-env/bin/python make_admin.py housekeeping         # run the daily clean-up now
 
 Admin rights can only be given here, never from the website. "grant" and "reset-code" print a setup key for an
 authenticator app (Google Authenticator, Microsoft Authenticator, Authy). Anyone with that key can create admin
@@ -17,6 +18,7 @@ import sys
 
 # The admin tool never needs the search re-ranking model; skip loading it (saves memory and time).
 os.environ.setdefault("ENABLE_RERANKING", "false")
+os.environ.setdefault("HOUSEKEEPING_ENABLED", "false")  # no background thread in a one-off command
 
 import main  # noqa: E402  (after the environment tweak above)
 
@@ -102,6 +104,9 @@ def cli(argv: list[str]) -> int:
     command = argv[1]
     if command == "new-encryption-key":
         print(new_encryption_key())
+        return 0
+    if command == "housekeeping":
+        print(main.run_housekeeping())
         return 0
     if command == "list":
         admins = list_admins()

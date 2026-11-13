@@ -159,8 +159,9 @@ def test_deleted_thread_link_stops_working_and_bad_tokens_404():
     c.delete(f"/threads/{tid}")
     guest = TestClient(main.app)
     assert guest.get(f"/share/{token}").status_code == 404
-    for bad in ("short", "x" * 65, "has.dots.in.it.and.more.chars", "%27%20OR%201%3D1%20--aaaaaaaaaaa"):
-        assert guest.get(f"/share/{bad}").status_code == 404
+    for bad in ("short", "x" * 65, "has.dots.in.it.and.more.chars", "%27%20OR%201%3D1%20--aaaaaaaaaaa", "x" * 43):
+        r = guest.get(f"/share/{bad}")
+        assert r.status_code == 404 and r.headers.get("x-robots-tag") == "noindex, nofollow"
 
 
 def test_shared_link_shows_updates():

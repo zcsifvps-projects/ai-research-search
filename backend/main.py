@@ -135,7 +135,8 @@ DEEP_DAILY_LIMIT_USER = int(os.getenv("DEEP_DAILY_LIMIT_USER", "20"))
 DEEP_DAILY_LIMIT_GLOBAL = int(os.getenv("DEEP_DAILY_LIMIT_GLOBAL", "300"))
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+# "gemini-flash-latest" always points at Google's current Flash model, so a missing setting never selects a retired one.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip() or "gemini-flash-latest"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
 SEMANTIC_SCHOLAR_API_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "").strip()
@@ -1627,8 +1628,7 @@ def delete_account(
         if not verify_password(req.password, user.hashed_password):
             raise HTTPException(status_code=400, detail="Password confirmation incorrect.")
 
-        db.query(Bookmark).filter(Bookmark.user_id == uid).delete(synchronize_session=False)
-        db.query(SearchHistory).filter(SearchHistory.user_id == uid).delete(synchronize_session=False)
+        delete_user_content(db, uid)
         db.delete(user)
         db.commit()
         clear_auth_cookie(response)
@@ -5141,6 +5141,8 @@ def admin_overview(request: Request, authorization: str | None = Header(None)):
     finally:
         db.close()
     data["counters_shared"] = redis_client is not None
+    data["housekeeping"] = dict(LAST_HOUSEKEEPING) or None
+    data["backups"] = backup_status()
     return data
 
 
@@ -5737,6 +5739,9 @@ def unshare_thread(thread_id: int, request: Request, authorization: str | None =
         db.close()
 
 
+_NOINDEX = {"X-Robots-Tag": "noindex, nofollow"}
+
+
 @app.get("/share/{token}", tags=["Library"], summary="Open a shared conversation",
          description="Public, read-only. Returns the title, questions, answers and papers of a shared conversation, and nothing "
                      "about who shared it. Unknown or switched-off links return 404.",
@@ -5745,12 +5750,12 @@ def unshare_thread(thread_id: int, request: Request, authorization: str | None =
 def open_shared_thread(token: str, response: Response):
     response.headers["X-Robots-Tag"] = "noindex, nofollow"
     if not SHARE_TOKEN_RE.fullmatch(token or ""):
-        raise HTTPException(status_code=404, detail="This shared conversation is not available.")
+        raise HTTPException(status_code=404, detail="This shared conversation is not available.", headers=_NOINDEX)
     db = SessionLocal()
     try:
         t = db.query(Thread).filter(Thread.share_token == token).first()
         if not t:
-            raise HTTPException(status_code=404, detail="This shared conversation is not available.")
+            raise HTTPException(status_code=404, detail="This shared conversation is not available.", headers=_NOINDEX)
         return {"title": t.title, "turns": t.turns or [], "papers": t.papers or [],
                 "shared_at": t.shared_at.isoformat() if t.shared_at else None,
                 "updated_at": t.updated_at.isoformat() if t.updated_at else None}
@@ -6231,3 +6236,117 @@ async def citation_graph(doi: str = Query(..., max_length=255)):
             "citing_total": (citing_data.get("meta") or {}).get("count", len(citing))}
     set_in_search_cache(cache_key, data, ttl=86400)
     return data
+
+
+# ============================================================
+# HOUSEKEEPING: keeps the database from growing forever
+# Runs once a day in the background (and on demand: `python make_admin.py housekeeping`).
+#   - sign-out records (revoked_tokens) whose session would have expired anyway
+#   - guest history older than GUEST_HISTORY_DAYS (signed-in users' history is kept until they delete it)
+#   - expired email verification and password reset tokens
+#   - admin audit log entries older than AUDIT_LOG_DAYS
+# ============================================================
+
+GUEST_HISTORY_DAYS = int(os.getenv("GUEST_HISTORY_DAYS", "90"))
+AUDIT_LOG_DAYS = int(os.getenv("AUDIT_LOG_DAYS", "365"))
+HOUSEKEEPING_ENABLED = os.getenv("HOUSEKEEPING_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+LAST_HOUSEKEEPING: dict = {}
+
+
+def run_housekeeping() -> dict:
+    now = _utcnow().replace(tzinfo=None)
+    db = SessionLocal()
+    try:
+        counts = {
+            "revoked_tokens": db.query(RevokedToken).filter(RevokedToken.expires_at < now).delete(synchronize_session=False),
+            "guest_history": db.query(SearchHistory).filter(
+                SearchHistory.user_id.is_(None),
+                SearchHistory.created_at < now - timedelta(days=GUEST_HISTORY_DAYS),
+            ).delete(synchronize_session=False),
+            "audit_log": db.query(AdminAuditLog).filter(
+                AdminAuditLog.created_at < now - timedelta(days=AUDIT_LOG_DAYS)
+            ).delete(synchronize_session=False),
+        }
+        expired_verify = db.query(User).filter(User.verification_token.isnot(None),
+                                               User.verification_token_expires_at < now).all()
+        for user in expired_verify:
+            user.verification_token = None
+            user.verification_token_expires_at = None
+        expired_reset = db.query(User).filter(User.reset_token.isnot(None), User.reset_token_expires_at < now).all()
+        for user in expired_reset:
+            user.reset_token = None
+            user.reset_token_expires_at = None
+        counts["expired_tokens"] = len(expired_verify) + len(expired_reset)
+        db.commit()
+    except Exception as error:
+        db.rollback()
+        print("Housekeeping note:", type(error).__name__)
+        counts = {"error": type(error).__name__}
+    finally:
+        db.close()
+    LAST_HOUSEKEEPING.clear()
+    LAST_HOUSEKEEPING.update({"at": _utcnow().isoformat(), **counts})
+    print("Housekeeping:", LAST_HOUSEKEEPING)
+    return counts
+
+
+def _housekeeping_loop():
+    time.sleep(120)  # let the API finish starting first
+    while True:
+        try:
+            run_housekeeping()
+        except Exception as error:  # never let the background thread die
+            print("Housekeeping loop note:", type(error).__name__)
+        time.sleep(24 * 3600)
+
+
+if HOUSEKEEPING_ENABLED:
+    threading.Thread(target=_housekeeping_loop, name="housekeeping", daemon=True).start()
+
+
+def delete_user_content(db, uid: int) -> None:
+    """Everything an account owns. Used by account deletion, so nothing (including share links) is left behind."""
+    db.query(Bookmark).filter(Bookmark.user_id == uid).delete(synchronize_session=False)
+    db.query(SearchHistory).filter(SearchHistory.user_id == uid).delete(synchronize_session=False)
+    folder_ids = [row[0] for row in db.query(Collection.id).filter(Collection.user_id == uid).all()]
+    if folder_ids:
+        db.query(CollectionItem).filter(CollectionItem.collection_id.in_(folder_ids)).delete(synchronize_session=False)
+    db.query(Collection).filter(Collection.user_id == uid).delete(synchronize_session=False)
+    db.query(Thread).filter(Thread.user_id == uid).delete(synchronize_session=False)  # share links stop working
+    document_ids = [row[0] for row in db.query(UploadedDocument.id).filter(UploadedDocument.user_id == uid).all()]
+    if document_ids:
+        db.query(DocumentChunk).filter(DocumentChunk.document_id.in_(document_ids)).delete(synchronize_session=False)
+    db.query(UploadedDocument).filter(UploadedDocument.user_id == uid).delete(synchronize_session=False)
+
+
+# ============================================================
+# BACKUP STATUS (read-only): what scripts/backup-db.sh has written. The API never creates, downloads or deletes
+# backups; it only looks at the folder so the admin Overview can warn when the nightly job stops.
+# ============================================================
+
+# Default matches scripts/backup-db.sh (~/backups/<app name in lower case>); set BACKUP_DIR if you moved it.
+BACKUP_DIR = os.path.expanduser(os.getenv("BACKUP_DIR", "").strip() or f"~/backups/{APP_UA_NAME.lower()}")
+BACKUP_STALE_HOURS = 26
+
+
+def backup_status() -> dict:
+    import glob
+
+    try:
+        # Finished dumps only: the script writes "<name>.dump.part" first and renames it when complete.
+        files = [f for f in glob.glob(os.path.join(BACKUP_DIR, "*.dump")) if os.path.isfile(f)]
+    except Exception:
+        files = []
+    if not files:
+        return {"configured": os.path.isdir(BACKUP_DIR), "count": 0, "latest_at": None, "latest_mb": None,
+                "total_mb": 0, "stale": True}
+    newest = max(files, key=os.path.getmtime)
+    newest_time = os.path.getmtime(newest)
+    return {
+        "configured": True,
+        "count": len(files),
+        "latest_at": datetime.fromtimestamp(newest_time, tz=timezone.utc).isoformat(),
+        "latest_mb": round(os.path.getsize(newest) / 1_000_000, 2),
+        "total_mb": round(sum(os.path.getsize(f) for f in files) / 1_000_000, 2),
+        "stale": time.time() - newest_time > BACKUP_STALE_HOURS * 3600,
+    }

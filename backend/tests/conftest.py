@@ -22,6 +22,7 @@ os.environ.update(
         "GEMINI_API_KEY": "",
         "GROQ_API_KEY": "",
         "UNPAYWALL_ENABLED": "false",  # tests never call Unpaywall; its own tests switch it on with fakes
+        "HOUSEKEEPING_ENABLED": "false",  # no background thread; tests call run_housekeeping() directly
     }
 )
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))

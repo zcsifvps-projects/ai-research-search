@@ -20,6 +20,8 @@ type Overview = {
   ai: { calls_today: number; daily_cap: number; guest_cap: number; user_cap: number };
   deep: { runs_today: number; daily_cap: number; guest_cap: number; user_cap: number };
   uploads?: { documents: number; text_mb: number };
+  backups?: { configured: boolean; count: number; latest_at: string | null; latest_mb: number | null; total_mb: number; stale: boolean };
+  housekeeping?: { at?: string; guest_history?: number; revoked_tokens?: number; expired_tokens?: number; audit_log?: number; error?: string } | null;
   counters_shared: boolean;
 };
 type AdminUser = {
@@ -471,6 +473,42 @@ export default function AdminPage() {
                     </div>
                   </div>
                 </div>
+                {overview.backups && (
+                  <div
+                    className={`p-4 rounded-xl border ${
+                      overview.backups.stale ? "border-amber-500/40 bg-amber-500/10" : "border-[var(--border-color)] bg-[var(--bg-surface)]"
+                    }`}
+                  >
+                    <div className="text-sm font-semibold">Database backups</div>
+                    {overview.backups.count === 0 ? (
+                      <p className="mt-1 text-xs text-amber-700">
+                        No backups found yet. Run scripts/backup-db.sh on the server and schedule it with cron (see docs/operations.md).
+                      </p>
+                    ) : (
+                      <>
+                        <div className="mt-1 text-xs text-[var(--text-secondary)]">
+                          Last backup {when(overview.backups.latest_at)} ({overview.backups.latest_mb} MB) · {overview.backups.count} kept,{" "}
+                          {overview.backups.total_mb} MB in total
+                        </div>
+                        {overview.backups.stale && (
+                          <p className="mt-1 text-xs text-amber-700">
+                            The newest backup is more than a day old. Check the cron job and ~/backups/imosmart/backup.log on the server.
+                          </p>
+                        )}
+                      </>
+                    )}
+                    <p className="mt-1 text-[11px] text-[var(--text-muted)]">
+                      Read-only. Backups are made by the server, not this page. Keep a copy off the server too.
+                    </p>
+                  </div>
+                )}
+                <p className="text-[11px] text-[var(--text-muted)]">
+                  {overview.housekeeping?.at
+                    ? overview.housekeeping.error
+                      ? `Last clean-up failed (${overview.housekeeping.error}) at ${when(overview.housekeeping.at)}.`
+                      : `Last clean-up ${when(overview.housekeeping.at)}: removed ${overview.housekeeping.guest_history ?? 0} old guest searches and ${(overview.housekeeping.revoked_tokens ?? 0) + (overview.housekeeping.expired_tokens ?? 0)} expired sign-in records.`
+                    : "The daily clean-up has not run since the API last restarted (it starts about 2 minutes after a restart)."}
+                </p>
                 {!overview.counters_shared && (
                   <p className="text-[11px] text-[var(--text-muted)]">
                     Redis is not connected, so today&apos;s counters reset when the API restarts.
